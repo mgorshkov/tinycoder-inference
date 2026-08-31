@@ -94,10 +94,15 @@ namespace tinycoder {
         uint32_t neededPos = pos + std::max(qSeqLen, kSeqLen);
         ensureRoPETables(neededPos);
 
-        // Apply to Q using the precomputed cos/sin tables. The rotation
-        // formula is bit-identical to the original (same std::cos/std::sin of the
-        // same angle, same freq definition); only the redundant per-(pos,dim,head)
-        // trig recomputation is removed.
+        // NEOX (rotate-half) pairing, matching llama.cpp for qwen2/qwen3:
+        // ggml's rotate_pairs(n_dims, n_dims/2) rotates the pair
+        // (head[j], head[j + headDim/2]) with the angle index j
+        // (theta = pos * freq_base^(-2j/headDim)). The previous interleaved
+        // pairing (head[2j], head[2j+1]) is the WRONG transform for the
+        // NEOX RoPE that Qwen models are trained with — it is identity at
+        // pos 0 so single-token dumps never caught it, but every pos>0 Q/K
+        // projection was rotated incorrectly, corrupting multi-token
+        // attention (garbage generations on all qwen2 sample questions).
         for (uint32_t s = 0; s < qSeqLen; ++s) {
             uint32_t p = pos + s;
             const float *cosRow = ropeCosTable_.data() +
@@ -109,10 +114,10 @@ namespace tinycoder {
                 for (uint32_t j = 0; j < pairs; ++j) {
                     float c = cosRow[j];
                     float sn = sinRow[j];
-                    float x0 = head[2 * j];
-                    float x1 = head[2 * j + 1];
-                    head[2 * j] = x0 * c - x1 * sn;
-                    head[2 * j + 1] = x0 * sn + x1 * c;
+                    float x0 = head[j];
+                    float x1 = head[j + pairs];
+                    head[j] = x0 * c - x1 * sn;
+                    head[j + pairs] = x0 * sn + x1 * c;
                 }
             }
         }
@@ -133,10 +138,10 @@ namespace tinycoder {
                 for (uint32_t j = 0; j < pairs; ++j) {
                     float c = cosRow[j];
                     float sn = sinRow[j];
-                    float x0 = head[2 * j];
-                    float x1 = head[2 * j + 1];
-                    head[2 * j] = x0 * c - x1 * sn;
-                    head[2 * j + 1] = x0 * sn + x1 * c;
+                    float x0 = head[j];
+                    float x1 = head[j + pairs];
+                    head[j] = x0 * c - x1 * sn;
+                    head[j + pairs] = x0 * sn + x1 * c;
                 }
             }
         }
@@ -158,16 +163,19 @@ namespace tinycoder {
             const float *vs = vSrc + static_cast<size_t>(s) * kvSize;
             float *kd = kDst + static_cast<size_t>(cachePos + s) * kvSize;
             float *vd = vDst + static_cast<size_t>(cachePos + s) * kvSize;
+            // NEOX (rotate-half) pairing: rotate the pair (kh[j], kh[j+pairs])
+            // with angle index j — matches llama's rotate_pairs(n_dims/2) used
+            // for qwen2/qwen3. (Interleaved (2j,2j+1) was wrong for pos>0.)
             for (uint32_t h = 0; h < kHeads; ++h) {
                 const float *kh = ks + static_cast<size_t>(h) * headDim;
                 float *kdh = kd + static_cast<size_t>(h) * headDim;
                 for (uint32_t j = 0; j < pairs; ++j) {
                     float c = cosRow[j];
                     float sn = sinRow[j];
-                    float x0 = kh[2 * j];
-                    float x1 = kh[2 * j + 1];
-                    kdh[2 * j] = x0 * c - x1 * sn;
-                    kdh[2 * j + 1] = x0 * sn + x1 * c;
+                    float x0 = kh[j];
+                    float x1 = kh[j + pairs];
+                    kdh[j] = x0 * c - x1 * sn;
+                    kdh[j + pairs] = x0 * sn + x1 * c;
                 }
             }
             std::memcpy(vd, vs, kvSize * sizeof(float));

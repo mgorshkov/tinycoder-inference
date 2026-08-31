@@ -25,8 +25,18 @@ SOFTWARE.
 #include "GGUFLoader.hpp"
 #include "MemHints.hpp"
 #include <algorithm>
+#include <cerrno>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <iostream>
+#if defined(__linux__)
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
 
 namespace tinycoder {
 
@@ -75,6 +85,8 @@ namespace tinycoder {
                 return 24;// 32 weights: d(fp16,2) + m(fp16,2) + qh(4) + ql(16) = 24 bytes
             case GGML_TYPE_Q8_0:
                 return 34;// 32 weights: d(fp16,2) + qs(32) = 34 bytes
+            case GGML_TYPE_Q8_1:
+                return 36;// 32 weights: d(fp16,2) + s(fp16,2) + qs(32) = 36 bytes (block_q8_1)
             case GGML_TYPE_Q2_K:
                 return 84;// 256 weights in 84 bytes (block_q2_K)
             case GGML_TYPE_Q3_K:
@@ -85,8 +97,10 @@ namespace tinycoder {
                 return 176;// 256 weights in 176 bytes (block_q5_K)
             case GGML_TYPE_Q6_K:
                 return 210;// 256 weights in 210 bytes (block_q6_K)
+            case GGML_TYPE_Q8_K:
+                return 292;// 256 weights: d(float,4) + qs(256) + bsums(32) = 292 bytes (block_q8_K)
             case GGML_TYPE_IQ2_XXS:
-                return 36;// 256 weights in 36 bytes
+                return 66;// 256 weights in 66 bytes (block_iq2_xxs: d(fp16,2) + qs[32×uint16])
             case GGML_TYPE_IQ2_XS:
                 return 74;// 256 weights in 74 bytes (d:2 + qs:64 + scales:8)
             case GGML_TYPE_IQ3_XXS:
@@ -94,13 +108,13 @@ namespace tinycoder {
             case GGML_TYPE_IQ1_S:
                 return 34;// 256 weights in 34 bytes
             case GGML_TYPE_IQ4_NL:
-                return 72;// 256 weights in 72 bytes
+                return 18;// 32 weights: d(fp16,2) + qs(16) = 18 bytes (block_iq4_nl)
             case GGML_TYPE_IQ3_S:
                 return 110;// 256 weights in 110 bytes (block_iq3_s)
             case GGML_TYPE_IQ2_S:
                 return 82;// 256 weights in 82 bytes (block_iq2_s)
             case GGML_TYPE_IQ4_XS:
-                return 72;// 256 weights in 72 bytes
+                return 136;// 256 weights: d(fp16,2) + scales_h(2) + scales_l(4) + qs(128) = 136 bytes (block_iq4_xs)
             default:
                 return 0;
         }
@@ -124,11 +138,12 @@ namespace tinycoder {
             case GGML_TYPE_IQ2_XXS:
             case GGML_TYPE_IQ2_XS:
             case GGML_TYPE_IQ1_S:
-            case GGML_TYPE_IQ4_NL:
             case GGML_TYPE_IQ3_S:
             case GGML_TYPE_IQ2_S:
             case GGML_TYPE_IQ4_XS:
                 return 256;
+            case GGML_TYPE_IQ4_NL:
+                return 32;// 32 weights per block (block_iq4_nl)
             case GGML_TYPE_IQ3_XXS:
                 return 256;
             default:
@@ -151,9 +166,37 @@ namespace tinycoder {
             file_.close();
             return false;
         }
+        // Also enumerate the tensor records (name/type/shape/offset) so that
+        // metadata-only consumers (e.g. the type census tool) can inspect them
+        // without mapping the tensor payloads.
+        if (!readTensorInfos()) {
+            file_.close();
+            return false;
+        }
 
         file_.close();
         return true;
+    }
+
+    GGUFLoader::~GGUFLoader() {
+        unmapTensorData();
+    }
+
+    void GGUFLoader::unmapTensorData() {
+#if defined(__linux__)
+        if (mmapPtr_ != nullptr) {
+            ::munmap(mmapPtr_, mmapLen_);
+            mmapPtr_ = nullptr;
+            mmapLen_ = 0;
+            tensorData_ = nullptr;
+        }
+        if (mmapFd_ >= 0) {
+            ::close(mmapFd_);
+            mmapFd_ = -1;
+        }
+#else
+        // Heap fallback: the vector releases itself.
+#endif
     }
 
     bool GGUFLoader::load(const std::string &path) {
@@ -170,8 +213,13 @@ namespace tinycoder {
             return false;
         if (!readTensorInfos())
             return false;
+#if defined(__linux__)
+        if (!mapTensorData())
+            return false;
+#else
         if (!readTensorData())
             return false;
+#endif
 
         file_.close();
         std::cout << "[TinyCoder] Model loaded: " << config_.numLayers
@@ -363,20 +411,57 @@ namespace tinycoder {
                                 break;
                             }
                             case GGUF_TYPE_UINT32: {
-                                uint32_t val;
-                                file_.read(reinterpret_cast<char *>(&val), sizeof(uint32_t));
-                                metadata_[key] = std::to_string(val);
-                                for (uint64_t j = 1; j < arrayLen; ++j) {
-                                    file_.seekg(4, std::ios::cur);
+                                // MRoPE sections array (e.g. <qwen35|qwen35moe>.rope.dimension_sections
+                                // = [11, 11, 10, 0]) is stored as a UINT32 array. Preserve all
+                                // elements (comma-separated) so parseArchKey can read all four.
+                                static const std::string SECTIONS_SUFFIX = ".rope.dimension_sections";
+                                if (key.size() > SECTIONS_SUFFIX.size() &&
+                                    key.compare(key.size() - SECTIONS_SUFFIX.size(),
+                                                SECTIONS_SUFFIX.size(),
+                                                SECTIONS_SUFFIX) == 0) {
+                                    std::string joined;
+                                    for (uint64_t j = 0; j < arrayLen; ++j) {
+                                        uint32_t v;
+                                        file_.read(reinterpret_cast<char *>(&v), sizeof(uint32_t));
+                                        if (j > 0) joined += ",";
+                                        joined += std::to_string(v);
+                                    }
+                                    metadata_[key] = joined;
+                                } else {
+                                    uint32_t val;
+                                    file_.read(reinterpret_cast<char *>(&val), sizeof(uint32_t));
+                                    metadata_[key] = std::to_string(val);
+                                    for (uint64_t j = 1; j < arrayLen; ++j) {
+                                        file_.seekg(4, std::ios::cur);
+                                    }
                                 }
                                 break;
                             }
                             case GGUF_TYPE_INT32: {
-                                int32_t val;
-                                file_.read(reinterpret_cast<char *>(&val), sizeof(int32_t));
-                                metadata_[key] = std::to_string(val);
-                                for (uint64_t j = 1; j < arrayLen; ++j) {
-                                    file_.seekg(4, std::ios::cur);
+                                // MRoPE sections array may also be stored as INT32
+                                // (e.g. <qwen35>.rope.dimension_sections = [11,11,10,0]
+                                // in Qwen3.8-27B-UD). Preserve all elements.
+                                static const std::string SECTIONS_SUFFIX_I32 =
+                                        ".rope.dimension_sections";
+                                if (key.size() > SECTIONS_SUFFIX_I32.size() &&
+                                    key.compare(key.size() - SECTIONS_SUFFIX_I32.size(),
+                                                SECTIONS_SUFFIX_I32.size(),
+                                                SECTIONS_SUFFIX_I32) == 0) {
+                                    std::string joined;
+                                    for (uint64_t j = 0; j < arrayLen; ++j) {
+                                        int32_t v;
+                                        file_.read(reinterpret_cast<char *>(&v), sizeof(int32_t));
+                                        if (j > 0) joined += ",";
+                                        joined += std::to_string(v);
+                                    }
+                                    metadata_[key] = joined;
+                                } else {
+                                    int32_t val;
+                                    file_.read(reinterpret_cast<char *>(&val), sizeof(int32_t));
+                                    metadata_[key] = std::to_string(val);
+                                    for (uint64_t j = 1; j < arrayLen; ++j) {
+                                        file_.seekg(4, std::ios::cur);
+                                    }
                                 }
                                 break;
                             }
@@ -496,6 +581,26 @@ namespace tinycoder {
                     config_.expertSharedFeedForwardLength = std::stoul(metadata_[key]);
                 } else if (key == prefix + ".rope.dimension_count") {
                     config_.ropeDimensionCount = std::stoul(metadata_[key]);
+                } else if (key == prefix + ".rope.dimension_sections") {
+                    // MRoPE sections array (e.g. "11,11,10,0") — preserved in full by
+                    // the GGUF_TYPE_UINT32 array handling above.
+                    std::string secs = metadata_[key];
+                    size_t start = 0;
+                    uint32_t si = 0;
+                    while (si < 4) {
+                        size_t comma = secs.find(',', start);
+                        std::string tok =
+                                comma == std::string::npos ? secs.substr(start)
+                                                           : secs.substr(start, comma - start);
+                        config_.ropeDimensionSections[si++] =
+                                tok.empty() ? 0 : static_cast<uint32_t>(std::stoul(tok));
+                        if (comma == std::string::npos) break;
+                        start = comma + 1;
+                    }
+                } else if (key == prefix + ".attention.key_length") {
+                    config_.attentionKeyLength = std::stoul(metadata_[key]);
+                } else if (key == prefix + ".attention.value_length") {
+                    config_.attentionValueLength = std::stoul(metadata_[key]);
                 } else if (key == prefix + ".full_attention_interval") {
                     config_.fullAttentionInterval = std::stoul(metadata_[key]);
                 } else if (key == prefix + ".ssm.inner_size") {
@@ -517,9 +622,21 @@ namespace tinycoder {
             parseArchKey("qwen2");
             parseArchKey("gemma4");
             parseArchKey("qwen35moe");
+            parseArchKey("qwen35");
         }
 
-        config_.headDim = config_.hiddenSize / config_.numAttentionHeads;
+        // Qwen35 (dense/gated-delta-net) and Qwen35MoE models declare the
+        // attention head dimensions explicitly (attention.key_length /
+        // attention.value_length = 256 for Qwen3.6-27B / Qwen3.6-35B-A3B).
+        // Using hiddenSize/numAttentionHeads (5120/24 = 213, 2048/16 = 128)
+        // would be wrong, so honor the explicit lengths when present.
+        if ((config_.architecture == ARCH_QWEN35 ||
+             config_.architecture == ARCH_QWEN35MOE) &&
+            config_.attentionKeyLength > 0) {
+            config_.headDim = config_.attentionKeyLength;
+        } else {
+            config_.headDim = config_.hiddenSize / config_.numAttentionHeads;
+        }
 
         return true;
     }
@@ -558,6 +675,7 @@ namespace tinycoder {
             tensorInfos_.push_back(info);
             tensorNameIndex_[info.name] = tensorInfos_.size() - 1;
         }
+        tensorRecordCacheValid_ = false;// invalidate any prior public view
 
         // Align to 32 bytes (GGUF alignment requirement)
         uint64_t pos = file_.tellg();
@@ -568,6 +686,169 @@ namespace tinycoder {
         return true;
     }
 
+#if defined(__linux__)
+    bool GGUFLoader::mapTensorData() {
+        // Calculate the actual total tensor data size from the file.
+        // GGUF v3 stores tensors sequentially with 32-byte alignment padding
+        // between them. The tensor offsets in the file are absolute positions
+        // within the tensor data section, so the offsets are relative to the
+        // mapped section base (which starts at tensorDataOffset_ in the file).
+        uint64_t totalSize = 0;
+        for (const auto &info: tensorInfos_) {
+            uint64_t tensorSize = ggmlTypeSize(info.type);
+            uint32_t blockSize = ggmlBlockSize(info.type);
+
+            // Calculate number of elements
+            uint64_t numElements = 1;
+            for (auto dim: info.shape) {
+                numElements *= dim;
+            }
+
+            // For quantized types, calculate block count
+            if (blockSize > 1) {
+                uint64_t numBlocks = (numElements + blockSize - 1) / blockSize;
+                tensorSize = numBlocks * tensorSize;
+            } else {
+                tensorSize = numElements * tensorSize;
+            }
+
+            // The end of this tensor (offset + size), which may include
+            // padding before the next tensor
+            uint64_t tensorEnd = info.offset + tensorSize;
+            if (tensorEnd > totalSize) {
+                totalSize = tensorEnd;
+            }
+        }
+
+        if (totalSize == 0) {
+            std::cerr << "[TinyCoder] No tensor data to map" << std::endl;
+            return false;
+        }
+
+        // Map the tensor data section from the file. File-backed pages are
+        // shared with the page cache and reclaimable, so the loader holds no
+        // private heap copy of the 16.4 GB weight section. Without this the
+        // load path peaked near 41 GB (heap read + per-layer weight copies +
+        // pre-dequantized embeddings) and was OOM-killed on 32 GB hosts.
+        mmapFd_ = ::open(filePath_.c_str(), O_RDONLY);
+        if (mmapFd_ < 0) {
+            std::cerr << "[TinyCoder] Failed to open model file for mmap: "
+                      << std::strerror(errno) << std::endl;
+            return false;
+        }
+
+        // mmap() requires the file offset to be page-aligned. The GGUF tensor
+        // section starts at tensorDataOffset_ which is only 32-byte aligned, so
+        // round down to the page boundary and map a bit extra up front.
+        constexpr uint64_t kPageSize = 4096;
+        const uint64_t pageOffset = tensorDataOffset_ & (kPageSize - 1);
+        const uint64_t mapOffset = tensorDataOffset_ - pageOffset;
+        const uint64_t mapLength = totalSize + pageOffset;
+
+        void *mapResult = ::mmap(nullptr, mapLength, PROT_READ, MAP_PRIVATE,
+                                 mmapFd_, static_cast<off_t>(mapOffset));
+        if (mapResult == MAP_FAILED) {
+            std::cerr << "[TinyCoder] Failed to mmap tensor data: "
+                      << std::strerror(errno) << std::endl;
+            mmapPtr_ = nullptr;
+            ::close(mmapFd_);
+            mmapFd_ = -1;
+            return false;
+        }
+        mmapPtr_ = mapResult;
+        mmapLen_ = mapLength;
+        tensorData_ = static_cast<const uint8_t *>(mapResult) + pageOffset;
+
+        // The mapped weights are already file-backed on PMD (2 MB) pages via the
+        // page-cache readahead path — exactly the huge-page layout llama.cpp gets
+        // from its own mmap loader (see MemHints.hpp). No additional hint needed;
+        // MADV_HUGEPAGE would only hand khugepaged a ~16 GB range to collapse
+        // during load/inference (MemHints.hpp §6.10 measured regression).
+
+        // ---- Load-time page-cache prefetch (2026-09-16) ----
+        // The mmap is faulted in lazily: pages are read from disk only on first
+        // touch.  On a model larger than RAM that first-touch cost lands inside
+        // the FIRST inference pass (measured on the 35 GB Ornith Q8_0 in 29 GB
+        // usable RAM: the question harness "warm-up" prefill took 140 s and
+        // question decode crawled at 0.6-1.7 tok/s).  Pulling the whole tensor
+        // section into the page cache at LOAD time moves that cost out of the
+        // timed work whenever the section can stay resident.
+        //
+        // ADAPTIVE GATE (measured 2026-09-16): an eager whole-file prefetch
+        // only pays when the section FITS in RAM.  For an over-RAM file (35 GB
+        // section vs 32 GB physical) the eager read (a) wastes ~4 min of load
+        // time and (b) perturbs the LRU: the prefetch reads layer-0..k pages
+        // FIRST, so by the time inference starts they are the OLDEST cache
+        // entries and get evicted in favour of later-layer pages — the layer
+        // that runs at EVERY position refaults from disk, making the first
+        // passes SLOWER than natural lazy streaming (0.22-0.51 tok/s vs
+        // 0.62-1.76 tok/s without prefetch).  So: prefetch eagerly only when
+        // the section comfortably fits (<= 3/4 of physical RAM, the point where
+        // the 21-22 GB Q4 models stay resident in 32 GB but the 35 GB Q8_0 does
+        // not); otherwise skip (lazy streaming + the kernel's own readahead
+        // win).  Override:
+        //   TINYCODER_PREFETCH=0  never prefetch
+        //   TINYCODER_PREFETCH=1  force eager prefetch regardless of size
+        //   unset                adaptive (default)
+        {
+            const long pages = ::sysconf(_SC_PHYS_PAGES);
+            const uint64_t phys =
+                    (pages > 0) ? static_cast<uint64_t>(pages) * 4096ull : 0ull;
+            const bool forced =
+                    ([] {
+                        const char *e = std::getenv("TINYCODER_PREFETCH");
+                        return e != nullptr && e[0] == '1';
+                    })();
+            const bool disabled =
+                    ([] {
+                        const char *e = std::getenv("TINYCODER_PREFETCH");
+                        return e != nullptr && e[0] == '0';
+                    })();
+            const bool fits = (phys == 0ull) ||
+                              (mapLength <= phys * 3ull / 4ull);
+            const bool doPrefetch = !disabled && (forced || fits);
+            if (disabled) {
+                std::fprintf(stderr,
+                             "[loader] page-cache prefetch disabled "
+                             "(TINYCODER_PREFETCH=0)\n");
+            } else if (!fits && !forced) {
+                std::fprintf(stderr,
+                             "[loader] tensor section (%llu MB) > 3/4 physical "
+                             "RAM (%llu MB); skipping eager prefetch (lazy "
+                             "streaming; force with TINYCODER_PREFETCH=1)\n",
+                             static_cast<unsigned long long>(mapLength >> 20),
+                             static_cast<unsigned long long>(phys >> 20));
+            }
+            if (doPrefetch) {
+                auto t0 = std::chrono::steady_clock::now();
+                // Kick kernel readahead for the whole section (asynchronous;
+                // populates the page cache without faulting the mapping).
+                ::posix_fadvise(mmapFd_, static_cast<off_t>(mapOffset),
+                                static_cast<off_t>(mapLength),
+                                POSIX_FADV_WILLNEED);
+                // Completion barrier: touch one byte of every page so the
+                // prefetch has finished before load() returns.  Pages stay
+                // file-backed (reclaimable); RSS does not grow.
+                volatile uint8_t sink = 0;
+                const uint8_t *pfBase = static_cast<const uint8_t *>(mapResult);
+                for (uint64_t off = 0; off < mapLength; off += 4096ull) {
+                    sink ^= pfBase[off];
+                }
+                (void) sink;
+                const double sec = std::chrono::duration<double>(
+                                           std::chrono::steady_clock::now() - t0)
+                                           .count();
+                std::fprintf(stderr,
+                             "[loader] prefetched %llu MB (tensor section) into "
+                             "page cache in %.1f s\n",
+                             static_cast<unsigned long long>(mapLength >> 20),
+                             sec);
+            }
+        }
+
+        return true;
+    }
+#else
     bool GGUFLoader::readTensorData() {
         // Calculate the actual total tensor data size from the file.
         // GGUF v3 stores tensors sequentially with 32-byte alignment padding
@@ -608,15 +889,6 @@ namespace tinycoder {
 
         tensorData_.resize(totalSize);
         file_.read(reinterpret_cast<char *>(tensorData_.data()), totalSize);
-        // Hint the kernel to back this (potentially multi-hundred-MB) tensorbase
-        // with 2 MB pages — collapses the dTLB working set of the per-token
-        // weight streaming (see plans/generation_optimizations.md §6.10,
-        // measured 4.65x dTLB misses vs llama.cpp at 4 t). NOTE: must come
-        // AFTER the backing read fills the buffer: hinting unfaulted zero pages
-        // makes every first fault on this host's `defrag=madvise` try
-        // synchronous compaction, and feeding khugepaged a ~750 MB zero range
-        // to collapse during inference steals CPU from the worker threads
-        // (measured as the ~5% generation regression; see §6.10.2).
         tinycoder::adviseHugePages(tensorData_.data(), totalSize);
 
         if (!file_) {
@@ -628,6 +900,7 @@ namespace tinycoder {
 
         return true;
     }
+#endif
 
     const uint8_t *GGUFLoader::getTensor(const std::string &name) const {
         auto it = tensorNameIndex_.find(name);
@@ -636,7 +909,11 @@ namespace tinycoder {
         }
 
         const auto &info = tensorInfos_[it->second];
+#if defined(__linux__)
+        return tensorData_ + info.offset;
+#else
         return tensorData_.data() + info.offset;
+#endif
     }
 
     const GGUFLoader::TensorInfo *
@@ -653,6 +930,25 @@ namespace tinycoder {
         result.shape = info.shape;
         result.type = info.type;
         return &result;
+    }
+
+    const std::vector<GGUFLoader::TensorInfo> &
+    GGUFLoader::tensorRecords() const {
+        if (!tensorRecordCacheValid_) {
+            tensorRecordCache_.clear();
+            tensorRecordCache_.reserve(tensorInfos_.size());
+            for (const auto &info: tensorInfos_) {
+                TensorInfo rec;
+                rec.name = info.name;
+                rec.offset = info.offset;
+                rec.size = 0;// not computed here (see getTensorInfo)
+                rec.shape = info.shape;
+                rec.type = info.type;
+                tensorRecordCache_.push_back(std::move(rec));
+            }
+            tensorRecordCacheValid_ = true;
+        }
+        return tensorRecordCache_;
     }
 
 }// namespace tinycoder

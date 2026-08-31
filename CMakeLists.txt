@@ -14,7 +14,7 @@ cmake_minimum_required(VERSION 3.18.0)
 #   cmake --build build --config Release
 #   ctest --test-dir build            # when BUILD_TESTS=ON
 # ---------------------------------------------------------------------------
-project(tinycoder_inference VERSION 0.3.0 DESCRIPTION "High-Performant local inference engine" LANGUAGES CXX)
+project(tinycoder_inference VERSION 0.2.0 DESCRIPTION "High-Performant local inference engine" LANGUAGES CXX)
 enable_testing()
 
 # ---- Options ----
@@ -120,7 +120,23 @@ if(ENABLE_CUDA)
     list(APPEND TINYCODER_CORE_SOURCES ${TINYCODER_CUDA_SOURCES})
     # The CUDA runtime needs explicit cuBLAS (already found below) plus the
     # shared library path for nvcc device-linking.
-    set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -lineinfo")
+    # -lineinfo gives line numbers in profiler traces.  Skip it in Debug
+    # builds: the shared cmake Config.cmake already adds --device-debug (-G),
+    # and nvcc warns that -G overrides -lineinfo for every .cu TU.
+    if(NOT CMAKE_BUILD_TYPE STREQUAL "Debug")
+        set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -lineinfo")
+    endif()
+    # Benign nvlink noise: CMake's separable-compilation device-link step
+    # passes the host-only static archives (-ldl/-lrt/-lpthread pulled in via
+    # the np/Threads link interface) to nvlink, which cannot use host static
+    # archives and prints "Skipping incompatible ... when searching for -l..."
+    # for every (arch, target).  They are a toolchain artifact, not code
+    # warnings, and cannot be removed from the link line without breaking the
+    # host link.  nvcc forwards -Xnvlink options to nvlink only during the
+    # -dlink stage (ignored at plain compile), so carrying -Xnvlink -w in
+    # CMAKE_CUDA_FLAGS suppresses the nvlink warnings while device-link
+    # ERRORS still fail the build.
+    set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -Xnvlink -w")
 endif()
 
 set(TINYCODER_HEADERS

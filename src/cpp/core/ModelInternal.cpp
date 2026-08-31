@@ -174,6 +174,21 @@ namespace tinycoder::detail {
             return;
         }
 
+        // IQ2_S / IQ3_XXS / IQ3_S (llama vec_dot_iq*_q8_K): quantize the shared
+        // activation x to Q8_K once per fused QKV call (reused by Q and K rows),
+        // accumulate integer dots per block and apply the trailing row scale
+        // once per output row — bit-identical to llama's CPU mul_mat. Q8_K
+        // quantization of x is cheap (256 fabs+rounds per block) and amortised
+        // over all Q/K rows.
+        const bool q8kQ = GGMLDequantize::supportsQ8KDot(qMat.type);
+        const bool q8kK = GGMLDequantize::supportsQ8KDot(kMat.type);
+        const uint32_t q8kBlocks = (cols + 255) / 256;
+        std::vector<Q8KBlock> q8x;
+        if (q8kQ || q8kK) {
+            q8x.resize(q8kBlocks);
+            GGMLDequantize::quantizeQ8K(x, cols, q8x.data());
+        }
+
         uint32_t blocksPerRowQ = (cols + blockSizeQ - 1) / blockSizeQ;
         uint64_t rowStrideQ = static_cast<uint64_t>(blocksPerRowQ) * typeSizeQ;
         uint32_t blocksPerRowK = (cols + blockSizeK - 1) / blockSizeK;
@@ -186,6 +201,57 @@ namespace tinycoder::detail {
         if (totalRows <= ThreadPool::instance().numThreads()) {
             // Small combined matrix: keep the serial block-outer loop (avoids the
             // spin-barrier + atomic dispatch overhead on tiny ranges).
+            if (q8kQ || q8kK) {
+                // Q8K types must accumulate sumf in float across the row's
+                // blocks (llama's `sumf += d * bsum;`) and apply the trailing
+                // 0.125/0.25 scale once per row. Since the serial branch loops
+                // block-outer, do a per-row pass for the Q8K projections.
+                const float scaleQ = q8kQ ? GGMLDequantize::q8KDotRowScale(qMat.type) : 1.0f;
+                const float scaleK = q8kK ? GGMLDequantize::q8KDotRowScale(kMat.type) : 1.0f;
+                // Q rows (llama-parity accumulation)
+                for (uint32_t j = 0; j < qRows; ++j) {
+                    float sumf = 0.0f;
+                    for (uint32_t b = 0; b < blocksPerRowQ; ++b) {
+                        uint32_t n = std::min(blockSizeQ, cols - b * blockSizeQ);
+                        const uint8_t *blockData = qMat.data.data() +
+                                                   static_cast<uint64_t>(j) * rowStrideQ + static_cast<uint64_t>(b) * typeSizeQ;
+                        if (q8kQ) {
+                            sumf += GGMLDequantize::dotProductFusedQ8K(qMat.type, blockData, &q8x[b], n);
+                        } else {
+                            sumf += GGMLDequantize::dotProductFused(qMat.type, blockData, x + b * blockSizeQ, n);
+                        }
+                    }
+                    qOut[j] = scaleQ * sumf;
+                }
+                // K rows
+                for (uint32_t j = 0; j < kRows; ++j) {
+                    float sumf = 0.0f;
+                    for (uint32_t b = 0; b < blocksPerRowK; ++b) {
+                        uint32_t n = std::min(blockSizeK, cols - b * blockSizeK);
+                        const uint8_t *blockData = kMat.data.data() +
+                                                   static_cast<uint64_t>(j) * rowStrideK + static_cast<uint64_t>(b) * typeSizeK;
+                        if (q8kK) {
+                            sumf += GGMLDequantize::dotProductFusedQ8K(kMat.type, blockData, &q8x[b], n);
+                        } else {
+                            sumf += GGMLDequantize::dotProductFused(kMat.type, blockData, x + b * blockSizeK, n);
+                        }
+                    }
+                    kOut[j] = scaleK * sumf;
+                }
+                // V rows (unchanged float path)
+                for (uint32_t j = 0; j < vRows; ++j) {
+                    double vdot = 0.0;
+                    for (uint32_t b = 0; b < blocksPerRowV; ++b) {
+                        uint32_t vn = std::min(blockSizeV, cols - b * blockSizeV);
+                        const uint8_t *blockData = vMat.data.data() +
+                                                   static_cast<uint64_t>(j) * rowStrideV + static_cast<uint64_t>(b) * typeSizeV;
+                        vdot += static_cast<double>(GGMLDequantize::dotProductFused(vMat.type, blockData, x + b * blockSizeV, vn));
+                    }
+                    vOut[j] = static_cast<float>(vdot);
+                }
+                return;
+            }
+
             for (uint32_t b = 0; b < blocksPerRowQ; ++b) {
                 uint32_t start = b * blockSizeQ;
                 uint32_t n = std::min(blockSizeQ, cols - start);
@@ -253,17 +319,27 @@ namespace tinycoder::detail {
                     out = vOut;
                 }
 
+                // Q8K types (IQ2_S / IQ3_XXS / IQ3_S): llama-parity accumulation
+                // — float sumf over the row's blocks, trailing 0.125/0.25 scale
+                // applied once per row. Others keep the float dequant-dot path.
+                const bool q8kRow = GGMLDequantize::supportsQ8KDot(ggmlType);
+                const float rowScale = q8kRow ? GGMLDequantize::q8KDotRowScale(ggmlType) : 1.0f;
+
                 uint32_t col = 0;
-                float acc = 0.0f;
+                float acc = (q8kRow ? 0.0f : 0.0f);
                 for (uint32_t b = 0; b < blocksPerRow; ++b) {
                     uint32_t n = std::min(ggmlBlockSize(ggmlType), cols - col);
                     const float *xBlock = x + col;
                     const uint8_t *blockData = data +
                                                static_cast<uint64_t>(r) * rowStride + static_cast<uint64_t>(b) * typeSize;
-                    acc += GGMLDequantize::dotProductFused(ggmlType, blockData, xBlock, n);
+                    if (q8kRow) {
+                        acc += GGMLDequantize::dotProductFusedQ8K(ggmlType, blockData, &q8x[b], n);
+                    } else {
+                        acc += GGMLDequantize::dotProductFused(ggmlType, blockData, xBlock, n);
+                    }
                     col += n;
                 }
-                out[r] = acc;
+                out[r] = rowScale * acc;
             }
         });
     }
@@ -422,6 +498,16 @@ namespace tinycoder::detail {
         }
         ScopedProfile sp("matMulVecBatchQuantized");
 
+        // IQ2_S / IQ3_XXS / IQ3_S: llama-parity Q8_K integer dot (quantize each
+        // token's x to Q8_K once, then vec_dot_iq*_q8_K accumulation with the
+        // trailing 0.125/0.25 scale applied once per row). Numerically different
+        // from the float dequant-dot below (up to ~5%), so must use this path.
+        if (GGMLDequantize::supportsQ8KDot(W.type)) {
+            GGMLDequantize::matMulVecBatchQ8K(W.type, W.data.data(), X, seqLen,
+                                              rows, cols, out);
+            return;
+        }
+
         // Q2_K pre-packed fast path: quantize each token's x to Q8_K once,
         // then use the int8 SIMD kernel for every (row, token) pair.
         if (W.type == GGML_TYPE_Q2_K && !W.prepackedData.empty()) {
@@ -549,6 +635,20 @@ namespace tinycoder::detail {
         if (gate.type != up.type || gate.rows != up.rows || gate.cols != up.cols) {
             matMulVecBatchQuantized(gate, X, seqLen, gateOut);
             matMulVecBatchQuantized(up, X, seqLen, upOut);
+            applySwishIf();
+            return;
+        }
+
+        // llama-parity Q8K path: for IQ2_S / IQ3_XXS / IQ3_S weights llama's CPU
+        // mul_mat quantizes the activations to Q8_K and accumulates with exact
+        // integer math (vec_dot_iq*_q8_K). The float dequant-dot diverges ~4.7%
+        // from that, so route these types through matMulVecBatchQ8K (which
+        // evaluates gate and up separately — each with its own Q8_K x-quant).
+        if (GGMLDequantize::supportsQ8KDot(gate.type)) {
+            GGMLDequantize::matMulVecBatchQ8K(gate.type, gate.data.data(), X, seqLen,
+                                              rows, cols, gateOut);
+            GGMLDequantize::matMulVecBatchQ8K(up.type, up.data.data(), X, seqLen,
+                                              rows, cols, upOut);
             applySwishIf();
             return;
         }
