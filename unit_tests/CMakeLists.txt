@@ -38,6 +38,18 @@ target_link_libraries(tinycoder_test
     tinycoder_core
 )
 
+# ---- Standalone logits probe (diagnostic; not a gtest) ----
+# Links the same way as tinycoder_test so CUDA separable compilation,
+# np, and tinycoder_core are all wired correctly for tools/tiny_logits_probe.cpp.
+add_executable(tiny_logits_probe
+    ../tools/tiny_logits_probe.cpp
+)
+
+target_link_libraries(tiny_logits_probe
+    PRIVATE
+    tinycoder_core
+)
+
 target_include_directories(tinycoder_test
     PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/Testing

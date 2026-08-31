@@ -37,12 +37,14 @@ namespace tinycoder {
     static constexpr const char *ARCH_QWEN2 = "qwen2";
     static constexpr const char *ARCH_GEMMA4 = "gemma4";
     static constexpr const char *ARCH_QWEN35MOE = "qwen35moe";
+    static constexpr const char *ARCH_QWEN35 = "qwen35";
 
     /// @brief Check if an architecture string is supported.
     inline bool isSupportedArchitecture(const std::string &arch) {
         return arch == ARCH_QWEN2 ||
                arch == ARCH_GEMMA4 ||
-               arch == ARCH_QWEN35MOE;
+               arch == ARCH_QWEN35MOE ||
+               arch == ARCH_QWEN35;
     }
 
     /// @brief Check if a model name is in the supported list.
@@ -62,6 +64,10 @@ namespace tinycoder {
         if (name == "Safetensors" ||
             name == "Qwen3.6 35B A3B Claude 4.7 Opus Reasoning Distilled" ||
             name == "Qwen3.6-35B-A3B")
+            return true;
+        // Qwen35 (dense) models — Qwen3.8 series
+        if (name == "Qwen3.8-27B" ||
+            name == "Qwen3.8-27B-UD")
             return true;
         return false;
     }
@@ -102,6 +108,13 @@ namespace tinycoder {
         uint32_t ssmTimeStepRank = 0;
         uint32_t expertSharedFeedForwardLength = 0;
         uint32_t nextnPredictLayers = 0;
+
+        // Qwen35 (dense) specific parameters
+        // (ropeDimensionCount is declared above in the Gemma4 group and reused
+        //  here as n_rot — number of rotated dims per head, 0 = use headDim)
+        uint32_t attentionKeyLength = 0;                 // 0 = derived from headDim (full-attn heads)
+        uint32_t attentionValueLength = 0;               // 0 = derived from headDim
+        uint32_t ropeDimensionSections[4] = {0, 0, 0, 0};// MRoPE sections (t,h,w,e)
 
         // Runtime
         uint32_t nThreads = 4;// OpenMP threads
