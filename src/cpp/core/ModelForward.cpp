@@ -51,6 +51,13 @@ namespace tinycoder {
             return np::Array<float>{};
         }
 
+        // GPU-offload continuation state for the qwen35 hybrid (partial
+        // offload): when the GPU runs only the first N layers ($TINYCODER_NGL),
+        // the CPU path below resumes from layer N on the GPU-produced hidden
+        // state.  Always zero/false for pure-CPU runs and for architectures
+        // that fully offload to the GPU.
+        uint32_t gpuContinueLayer = 0;
+        bool hiddenFromGpu = false;
 #ifdef USE_CUDA
         // GPU offload fast path: the GPU engine owns its own KV cache (kvPos_)
         // and is authoritative for the whole session once the first pass
@@ -60,11 +67,17 @@ namespace tinycoder {
         //     decode steps have kvCache_.pos > 0).
         // clearKVCache() resets both caches and clears the latch, so a new
         // session re-enters on pos == 0.
-        // The dispatch is deliberately conservative: only qwen2 (dense, no
-        // MoE/SSM). Both tied and separate LM heads are supported by the GPU
+        // Dispatch: qwen2 (dense) fully offloads when it fits in VRAM.  qwen35
+        // runs a hybrid when the model is too large for VRAM: the GPU executes
+        // the first numGpuLayers layers and the CPU continues the rest
+        // (llama.cpp -ngl style); if the full model fits, the GPU also computes
+        // the logits.  Both tied and separate LM heads are supported by the GPU
         // engine (separate output.weight is uploaded as a dedicated Q6_K
         // tensor).  Other architectures keep the CPU path.
-        if (gpu::gpuEnabled() && config_.architecture == ARCH_QWEN2 &&
+        if (gpu::gpuEnabled() &&
+            (config_.architecture == ARCH_QWEN2 ||
+             config_.architecture == ARCH_QWEN35 ||
+             config_.architecture == ARCH_QWEN35MOE) &&
             !tokens.empty() && (kvCache_.pos == 0 || gpuSessionActive_)) {
             std::string err;
             // Same construction idiom as the CPU logits path below (rank-2
@@ -77,20 +90,66 @@ namespace tinycoder {
                                                                          : size_t(1),
                                                                  config_.vocabSize});
             if (gpuForward(tokens, computeAllLogits, logits.data(), &err)) {
-                kvCache_.pos += tokens.size();
-                gpuSessionActive_ = true;// latch: session now owned by GPU
-                return logits;
-            }
-            if (!err.empty()) {
-                std::fprintf(stderr, "[gpu] forward fallback to CPU: %s\n", err.c_str());
+                // The GPU produced the logits (qwen2, or qwen35 with the full
+                // model on device): return them directly.
+                bool gpuDone = true;
+                if (config_.architecture == ARCH_QWEN35) {
+                    uint32_t nGpu = gpuNGpuLayers();
+                    if (nGpu > 0 && nGpu < config_.numLayers) {
+                        // Partial offload: the GPU stopped after layer nGpu-1
+                        // and left the hidden state on the device.  Copy it
+                        // back and resume the remaining layers on the CPU (the
+                        // shared tail below runs the final norm + LM head and
+                        // advances kvCache_.pos).  kvCache_.pos must stay at
+                        // its entry value during the continuation so the CPU
+                        // layers use positions P..P+seqLen-1 consistently with
+                        // the GPU prefix.
+                        gpuDone = false;
+                        ScratchPool &gscr = scratchPool();
+                        gscr.hidden.resize(static_cast<size_t>(tokens.size()) *
+                                           config_.hiddenSize);
+                        if (gpuCopyHiddenOut(gscr.hidden.data(),
+                                             static_cast<uint32_t>(tokens.size()),
+                                             &err)) {
+                            gpuContinueLayer = nGpu;
+                            hiddenFromGpu = true;
+                        } else {
+                            // Copy failed: re-run the whole model on the CPU.
+                            // The GPU prefix already consumed the tokens, so
+                            // fall back to layer 0 with a CPU-computed
+                            // embedding (exceptional path; log a warning).
+                            std::fprintf(stderr,
+                                         "[gpu] qwen35 hidden copy failed, "
+                                         "re-running from CPU: %s\n",
+                                         err.c_str());
+                            gpuContinueLayer = 0;
+                            hiddenFromGpu = false;
+                        }
+                    }
+                }
+                if (gpuDone) {
+                    kvCache_.pos += tokens.size();
+                    gpuSessionActive_ = true;// latch: session now owned by GPU
+                    return logits;
+                }
+                // qwen35 partial offload succeeded: the session is now owned by
+                // GPU (prefix) + CPU (continuation).  Fall through into the CPU
+                // path below, which resumes at gpuContinueLayer on the
+                // GPU-produced hidden state and advances kvCache_.pos in the
+                // shared tail.
+                gpuSessionActive_ = true;
             } else {
-                std::fprintf(stderr, "[gpu] forward fallback to CPU (no detail)\n");
+                if (!err.empty()) {
+                    std::fprintf(stderr, "[gpu] forward fallback to CPU: %s\n", err.c_str());
+                } else {
+                    std::fprintf(stderr, "[gpu] forward fallback to CPU (no detail)\n");
+                }
+                // Fall through to the CPU path below.  The GPU engine's KV cache is
+                // NOT consumed on the fallback (kvPos_ reverts to its pre-pass
+                // value) and the session latch is cleared, so the CPU-side KV
+                // cache (kvCache_) remains authoritative for the remaining steps.
+                gpuSessionActive_ = false;
             }
-            // Fall through to the CPU path below.  The GPU engine's KV cache is
-            // NOT consumed on the fallback (kvPos_ reverts to its pre-pass
-            // value) and the session latch is cleared, so the CPU-side KV
-            // cache (kvCache_) remains authoritative for the remaining steps.
-            gpuSessionActive_ = false;
         }
 #endif
 
@@ -127,16 +186,20 @@ namespace tinycoder {
         float *hiddenData = scratch.hidden.data();
 
         // Token embeddings: [seqLen, hiddenSize]
-        // Dequantize from quantized format on-the-fly (parallel over tokens)
-        runParallel([&](uint32_t i) {
-            int32_t tokenId = tokens[i];
-            if (tokenId >= 0 &&
-                tokenId < static_cast<int32_t>(quantizedEmbeddings_.vocabSize)) {
-                auto embRow = quantizedEmbeddings_.getRow(tokenId);
-                float *hRow = hiddenData + i * hiddenSize;
-                std::memcpy(hRow, embRow.data(), hiddenSize * sizeof(float));
-            }
-        });
+        // Dequantize from quantized format on-the-fly (parallel over tokens).
+        // Skipped when the qwen35 hybrid resumes from a GPU-produced hidden
+        // state (hiddenData then already holds the post-layer-nGpu activations).
+        if (!hiddenFromGpu) {
+            runParallel([&](uint32_t i) {
+                int32_t tokenId = tokens[i];
+                if (tokenId >= 0 &&
+                    tokenId < static_cast<int32_t>(quantizedEmbeddings_.vocabSize)) {
+                    auto embRow = quantizedEmbeddings_.getRow(tokenId);
+                    float *hRow = hiddenData + i * hiddenSize;
+                    std::memcpy(hRow, embRow.data(), hiddenSize * sizeof(float));
+                }
+            });
+        }
 
         // Pre-allocate per-layer buffers (reused across layers)
         // attnNorm: [seqLen, hiddenSize]
@@ -167,8 +230,29 @@ namespace tinycoder {
         float *upData = scratch.up.data();
         scratch.ffnOut.resize(static_cast<size_t>(seqLen) * hiddenSize);
 
-        for (uint32_t layer = 0; layer < nLayers; ++layer) {
+        // For the qwen35 hybrid the GPU already ran layers 0..gpuContinueLayer-1
+        // (their conv/GDN/KV state lives on the device); resume on the CPU from
+        // gpuContinueLayer.  Pure-CPU runs start at layer 0.
+        for (uint32_t layer = gpuContinueLayer; layer < nLayers; ++layer) {
             auto &w = layers_[layer];
+
+            // qwen35 (dense) and qwen35moe share the SAME hybrid structure:
+            // recurrent (gated delta net) layers + full-attention layers every
+            // fullAttentionInterval (both use the shared qwen35 GDN/attention
+            // math in ModelQwen35.cpp — fully config_-driven, so the moe
+            // geometry nVHeads=32/valueDim=4096/convChannels=8192/hidden=2048
+            // adapts automatically).  The qwen35moe FFN is routed MoE
+            // (expertCount > 0), handled inside forwardQwen35Layer via the
+            // computeQwen35MoE dispatch below.
+            if (config_.architecture == ARCH_QWEN35 ||
+                config_.architecture == ARCH_QWEN35MOE) {
+                forwardQwen35Layer(layer, hiddenData, attnNormData, attnProjData,
+                                   qData, kData, vData, attnOutData, gateData, upData,
+                                   ffnNormData, scratch.ffnOut.data(), seqLen,
+                                   hiddenSize, nHeads, nKVHeads, headDim,
+                                   intermediateSize);
+                continue;
+            }
 
             // True when the single-token Q3_K attnO kernel fused the attention
             // residual into hidden (hidden += attnO@attnOut) in its store
@@ -176,105 +260,10 @@ namespace tinycoder {
             // must be skipped.
             bool attnResidualFused = false;
 
-            // Check if this is an SSM layer for Qwen35MoE architecture
-            bool isSSMLayer = (config_.architecture == ARCH_QWEN35MOE &&
-                               config_.fullAttentionInterval > 0 &&
-                               (layer % config_.fullAttentionInterval) != 0 &&
-                               !w.ssmOut.empty());
-
-            if (isSSMLayer) {
-                // ---- SSM (Mamba-style) block replaces attention ----
-
-                // RMSNorm: attnNorm = rmsNorm(hidden, w.rmsNormAttn)
-                const float *rmsNormAttnData = w.rmsNormAttn.data();
-                runParallel([&](uint32_t s) {
-                    rmsNormSIMD(hiddenData + s * hiddenSize, attnNormData + s * hiddenSize,
-                                rmsNormAttnData, hiddenSize);
-                });
-
-                // SSM computation for each token
-                uint32_t ssmInnerSize = config_.ssmInnerSize;
-                uint32_t ssmStateSize = config_.ssmStateSize;
-                uint32_t ssmConvKernel = config_.ssmConvKernel;
-
-                // Pre-allocate SSM input buffer (reused across tokens)
-                scratch.ssmIn.resize(ssmInnerSize);
-                float *ssmInBuf = scratch.ssmIn.data();
-
-                for (uint32_t s = 0; s < seqLen; ++s) {
-                    const float *hRowPtr = attnNormData + s * hiddenSize;
-
-                    // Step 1: Input projection (hiddenSize → ssmInnerSize)
-                    // Write directly to pre-allocated buffer, avoiding heap allocation + memcpy
-                    w.ssmOut.matMulVec(hRowPtr, ssmInBuf);
-
-                    // Step 2: Conv1d with past buffer
-                    scratch.ssmConvOut.resize(ssmInnerSize);
-                    float *convOut = scratch.ssmConvOut.data();
-                    if (ssmConvKernel > 1 && !w.ssmConv1d.empty()) {
-                        scratch.ssmConvInput.resize(ssmConvKernel * ssmInnerSize);
-                        float *convInput = scratch.ssmConvInput.data();
-                        auto &convBuf = kvCache_.ssmConvBuf[layer];
-                        uint32_t bufLen = ssmConvKernel - 1;
-                        std::memcpy(convInput, convBuf.data(), bufLen * ssmInnerSize * sizeof(float));
-                        std::memcpy(convInput + bufLen * ssmInnerSize,
-                                    ssmInBuf, ssmInnerSize * sizeof(float));
-
-                        // Update conv buffer with current input (shift)
-                        std::memmove(convBuf.data(), convBuf.data() + ssmInnerSize,
-                                     (bufLen - 1) * ssmInnerSize * sizeof(float));
-                        std::memcpy(convBuf.data() + (bufLen - 1) * ssmInnerSize,
-                                    ssmInBuf, ssmInnerSize * sizeof(float));
-
-                        for (uint32_t c = 0; c < ssmInnerSize; ++c) {
-                            const float *wRow = reinterpret_cast<const float *>(w.ssmConv1d.data.data()) + static_cast<size_t>(c) * ssmConvKernel;
-                            convOut[c] = dotProductFMA(wRow, convInput + c * ssmConvKernel, ssmConvKernel);
-                        }
-                    } else {
-                        std::memcpy(convOut, ssmInBuf, ssmInnerSize * sizeof(float));
-                    }
-
-                    // Step 3: SiLU activation on conv output
-                    siluSIMD(convOut, ssmInnerSize);
-
-                    // Step 4: SSM state update
-                    auto &ssmState = kvCache_.ssmState[layer];
-                    for (uint32_t i = 0; i < ssmInnerSize; ++i) {
-                        float dt = std::log(1.0f + std::exp(w.ssmDtBias.data()[i]));
-                        for (uint32_t j = 0; j < ssmStateSize; ++j) {
-                            float aVal = w.ssmA.data()[i * ssmStateSize + j];
-                            float aBar = std::exp(aVal * dt);
-                            uint32_t idx = i * ssmStateSize + j;
-                            ssmState[idx] = aBar * ssmState[idx] + convOut[i];
-                        }
-                    }
-
-                    // Step 5: Output from SSM state
-                    scratch.ssmOut.resize(ssmInnerSize);
-                    float *ssmOutBuf = scratch.ssmOut.data();
-                    for (uint32_t i = 0; i < ssmInnerSize; ++i) {
-                        double hVal = 0.0;
-                        for (uint32_t j = 0; j < ssmStateSize; ++j) {
-                            hVal += ssmState[i * ssmStateSize + j];
-                        }
-                        float gateVal = w.ssmAlpha.data()[i] * static_cast<float>(hVal) + w.ssmBeta.data()[i];
-                        float gateAct = gateVal / (1.0f + std::exp(-gateVal));
-                        ssmOutBuf[i] = convOut[i] * gateAct;
-                    }
-
-                    // Step 6: Output projection back to hiddenSize using attnO
-                    // Write directly to pre-allocated attnProjData buffer
-                    deqMatMulVecF16(w.attnO_deq_f16.data(), ssmOutBuf,
-                                    w.attnO.rows, w.attnO.cols,
-                                    attnProjData + s * hiddenSize);
-                }
-
-                // SSM residual (standard residual, no post-norm)
-                for (uint32_t s = 0; s < seqLen; ++s) {
-                    addSIMD(hiddenData + s * hiddenSize, attnProjData + s * hiddenSize, hiddenSize);
-                }
-            } else {
-                // ---- Attention block ----
+            {
+                // ---- Attention block ---- (qwen35moe recurrent/attention layers
+                // are handled by the qwen35 GDN path above; this is the generic
+                // attention path for qwen2/gemma4/other architectures.)
 
                 // RMSNorm: attnNorm = rmsNorm(hidden, w.rmsNormAttn)
                 const float *rmsNormAttnData = w.rmsNormAttn.data();
@@ -455,46 +444,53 @@ namespace tinycoder {
                 // cuts weight traffic ~2.65x vs Q8_K (measurement: attnO+ffnDown
                 // ~35% of per-token time).
                 {
-                    ScopedProfile sp("matMulVecBatchQ3K");
-                    // Stage fusion (attnO + residual): for single-token
-                    // generation the compact Q3_K batch kernel accumulates the
-                    // attention output projection DIRECTLY into hidden
-                    // (out == residual == hiddenData, so the store epilogue
-                    // performs hidden[i] += attnO@attnOut[i]). This eliminates
-                    // the attnProj buffer write/read round-trip (~6 KB) and the
-                    // separate addSIMD pass over the hidden vector per layer.
-                    // Prefill (seqLen > 1) and all fallbacks keep the plain
-                    // attnProjData path (residual applied by the addSIMD below).
-                    attnResidualFused = false;
-                    if (seqLen == 1 && w.attnO.type == GGML_TYPE_Q3_K &&
-                        w.attnO.cols % 256 == 0 &&
-                        matMulVecBatchQ3K_SIMD(w.attnO.data.data(), attnOutData,
-                                               seqLen, w.attnO.rows,
-                                               w.attnO.cols, hiddenData,
-                                               /*residual=*/hiddenData)) {
-                        attnResidualFused = true;
-                        // handled by the compact Q3_K batch kernel (fused)
-                    } else if (w.attnO.type == GGML_TYPE_Q3_K &&
-                               w.attnO.cols % 256 == 0 &&
-                               matMulVecBatchQ3K_SIMD(w.attnO.data.data(), attnOutData,
-                                                      seqLen, w.attnO.rows,
-                                                      w.attnO.cols, attnProjData)) {
-                        // handled by the compact Q3_K batch kernel (prefill)
-                    } else if (!w.attnO_q8k.empty()) {
-                        // P4 + gen: Q8_K batch GEMM (vector kernel supports seqLen==1).
-                        matMulVecBatchQ8K(w.attnO_q8k.data(), attnOutData, seqLen,
-                                          w.attnO.rows, w.attnO.cols, attnProjData);
-                    } else if (seqLen > 1) {
-                        deqMatMulVecF16_Batch(w.attnO_deq_f16.data(), attnOutData, seqLen,
-                                              w.attnO.rows, w.attnO.cols, attnProjData);
+                    // IQ3_S / IQ2_S / IQ3_XXS attnO: llama streams the raw
+                    // quantized blocks with vec_dot_iq*_q8_K (exact integer
+                    // accumulation). Route through the llama-parity Q8K batch
+                    // path instead of the lossy pre-dequantized F16 copy.
+                    if (GGMLDequantize::supportsQ8KDot(w.attnO.type)) {
+                        ScopedProfile spQ8K("matMulVecBatchQ8K_attnO");
+                        GGMLDequantize::matMulVecBatchQ8K(w.attnO.type, w.attnO.data.data(),
+                                                          attnOutData, seqLen, w.attnO.rows,
+                                                          w.attnO.cols, attnProjData);
                     } else {
-                        runParallel([&](uint32_t s) {
-                            const float *attnRowPtr = attnOutData + s * nHeads * headDim;
-                            deqMatMulVecF16(w.attnO_deq_f16.data(), attnRowPtr,
-                                            w.attnO.rows, w.attnO.cols,
-                                            attnProjData + s * hiddenSize);
-                        });
-                    }
+                        ScopedProfile sp("matMulVecBatchQ3K");
+                        // Stage fusion (attnO + residual): for single-token
+                        // generation the compact Q3_K batch kernel accumulates the
+                        // attention output projection DIRECTLY into hidden
+                        // (out == residual == hiddenData, so the store epilogue
+                        // performs hidden[i] += attnO@attnOut[i]). This eliminates
+                        // the attnProj buffer write/read round-trip (~6 KB) and the
+                        // separate addSIMD pass over the hidden vector per layer.
+                        // Prefill (seqLen > 1) and all fallbacks keep the plain
+                        // attnProjData path (residual applied by the addSIMD below).
+                        attnResidualFused = false;
+                        if (seqLen == 1 && w.attnO.type == GGML_TYPE_Q3_K &&
+                            w.attnO.cols % 256 == 0 &&
+                            matMulVecBatchQ3K_SIMD(w.attnO.data.data(), attnOutData,
+                                                   seqLen, w.attnO.rows,
+                                                   w.attnO.cols, hiddenData,
+                                                   /*residual=*/hiddenData)) {
+                            attnResidualFused = true;
+                            // handled by the compact Q3_K batch kernel (fused)
+                        } else if (w.attnO.type == GGML_TYPE_Q3_K &&
+                                   w.attnO.cols % 256 == 0 &&
+                                   matMulVecBatchQ3K_SIMD(w.attnO.data.data(), attnOutData,
+                                                          seqLen, w.attnO.rows,
+                                                          w.attnO.cols, attnProjData)) {
+                            // handled by the compact Q3_K batch kernel (prefill)
+                        } else if (seqLen > 1) {
+                            deqMatMulVecF16_Batch(w.attnO_deq_f16.data(), attnOutData, seqLen,
+                                                  w.attnO.rows, w.attnO.cols, attnProjData);
+                        } else {
+                            runParallel([&](uint32_t s) {
+                                const float *attnRowPtr = attnOutData + s * nHeads * headDim;
+                                deqMatMulVecF16(w.attnO_deq_f16.data(), attnRowPtr,
+                                                w.attnO.rows, w.attnO.cols,
+                                                attnProjData + s * hiddenSize);
+                            });
+                        }
+                    }// end if (supportsQ8KDot(attnO))
                 }
 
                 // Attention residual + post-attention processing
@@ -588,12 +584,6 @@ namespace tinycoder {
                                                w.ffnDown.cols,
                                                scratch.ffnOut.data())) {
                         // handled by the compact Q3_K batch kernel
-                    } else if (!w.ffnDown_q8k.empty()) {
-                        // P4: Q8_K batch GEMM (int8 maddubs kernel, ~4x compute vs
-                        // the FP16 path) for the largest prefill matmul.
-                        matMulVecBatchQ8K(w.ffnDown_q8k.data(), gateData, seqLen,
-                                          w.ffnDown.rows, w.ffnDown.cols,
-                                          scratch.ffnOut.data());
                     } else if (w.ffnDown.type == GGML_TYPE_Q2_K &&
                                !w.ffnDown.prepackedData.empty() &&
                                w.ffnDown.cols % 256 == 0) {
@@ -601,6 +591,14 @@ namespace tinycoder {
                                 w.ffnDown.prepackedData.data(), gateData, seqLen,
                                 w.ffnDown.rows, w.ffnDown.cols,
                                 scratch.ffnOut.data());
+                    } else if (GGMLDequantize::supportsQ8KDot(w.ffnDown.type)) {
+                        // IQ3_XXS / IQ2_S / IQ3_S ffnDown: llama-parity Q8K
+                        // integer dot over the raw quantized blocks (exact),
+                        // instead of the lossy pre-dequantized F16 copy.
+                        GGMLDequantize::matMulVecBatchQ8K(w.ffnDown.type, w.ffnDown.data.data(),
+                                                          gateData, seqLen, w.ffnDown.rows,
+                                                          w.ffnDown.cols,
+                                                          scratch.ffnOut.data());
                     } else {
                         deqMatMulVecF16_Batch(w.ffnDown_deq_f16.data(), gateData, seqLen,
                                               w.ffnDown.rows, w.ffnDown.cols,
@@ -707,10 +705,12 @@ namespace tinycoder {
                                                                1, w.ffnDown.rows,
                                                                w.ffnDown.cols, downBuf)) {
                                         // handled by the compact Q3_K batch kernel
-                                    } else if (!w.ffnDown_q8k.empty()) {
-                                        matMulVecBatchQ8K(w.ffnDown_q8k.data(), ffnActPtr, 1,
-                                                          w.ffnDown.rows, w.ffnDown.cols,
-                                                          downBuf);
+                                    } else if (GGMLDequantize::supportsQ8KDot(w.ffnDown.type)) {
+                                        // IQ3_XXS / IQ2_S / IQ3_S ffnDown:
+                                        // llama-parity Q8K integer dot.
+                                        GGMLDequantize::matMulVecBatchQ8K(w.ffnDown.type, w.ffnDown.data.data(),
+                                                                          ffnActPtr, 1, w.ffnDown.rows,
+                                                                          w.ffnDown.cols, downBuf);
                                     } else {
                                         deqMatMulVecF16(w.ffnDown_deq_f16.data(), ffnActPtr,
                                                         w.ffnDown.rows, w.ffnDown.cols,
@@ -979,7 +979,8 @@ namespace tinycoder {
                     }
                     lmHeadPruneUseless_ = true;
                 }
-            } else if (lmHead_.type == GGML_TYPE_Q6_K && hiddenSize % 256 == 0) {
+            } else if (!forceScalarPath() && lmHead_.type == GGML_TYPE_Q6_K &&
+                       hiddenSize % 256 == 0) {
                 // Q6_K raw LM head kernel (0.82 B/elem vs 1.14 B/elem for the
                 // Q8_K copy below) — ~28% less per-token LM-head weight traffic,
                 // matching llama.cpp's working set. The hidden vector is
@@ -992,7 +993,7 @@ namespace tinycoder {
                     matMulVecBatchQ6K_SIMD(lmHead_.data.data(), hPtr, 1,
                                            vocabSize, hiddenSize, logitRow);
                 }
-            } else if (!lmHeadQ8K_.empty()) {
+            } else if (!forceScalarPath() && !lmHeadQ8K_.empty()) {
                 // Plan §3: pre-quantized Q8_K copy of the separate LM head. Quantize
                 // each token's hidden vector to Q8_K once (reused across all vocab
                 // rows), then parallelize over vocab rows with the int8

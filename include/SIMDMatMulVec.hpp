@@ -24,13 +24,40 @@ SOFTWARE.
 
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 
 #if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
 #include <xmmintrin.h>
 #endif
 
 namespace tinycoder {
+
+    /// @brief Global A/B switch: when true, QuantizedMatrix::matMulVec and the
+    /// layer matmuls skip the AVX2 register-tiled batch kernels (including the
+    /// Q2_K compact/prepacked fast paths) and fall through to the scalar
+    /// dequantize+dot reference. Seeded once from the TINYCODER_FORCE_SCALAR
+    /// env var (any non-empty value other than "0" enables it); unit tests may
+    /// override it at runtime via setForceScalarForTest(). This is a
+    /// diagnostic control to establish a scalar correctness baseline and to
+    /// bisect regressions between the SIMD kernels and the reference path.
+    inline bool &forceScalarFlag() {
+        static bool v = [] {
+            const char *e = std::getenv("TINYCODER_FORCE_SCALAR");
+            const bool on = e != nullptr && e[0] != '\0' && e[0] != '0';
+            if (on) {
+                std::fprintf(stderr,
+                             "[TinyCoder] FORCE_SCALAR: SIMD batch kernels "
+                             "disabled (scalar dequantize+dot baseline)\n");
+            }
+            return on;
+        }();
+        return v;
+    }
+    inline bool forceScalarPath() { return forceScalarFlag(); }
+    inline void setForceScalarForTest(bool on) { forceScalarFlag() = on; }
 
     /// @brief SIMD-accelerated accumulation: local[j] += alpha * blockOut[j] for j
     /// in [0, n).
@@ -456,6 +483,68 @@ namespace tinycoder {
     bool matMulVecBatchQ6K_SIMD(const uint8_t *W_q6k, const float *X,
                                 uint32_t seqLen, uint32_t rows, uint32_t cols,
                                 float *out);
+
+    /// @brief Register-tiled batch GEMM for a single COMPACT (raw GGUF) Q5_K
+    /// weight matrix over a batch of tokens (qwen35 FFN gate/up/down, ssm_out,
+    /// attn_qkv — all stored as Q5_K in this model).
+    ///
+    /// Q5_K (176 B/block): d(2) + dmin(2) + scales(12) + qh(32) + qs(64).
+    /// Decomposes like Q4_K (8 sub-blocks of 32, same 6-bit scale/min
+    /// extraction) but each weight is 5-bit: low 4 bits in qs, 5th bit in qh
+    /// with the u1/u2 bit pattern. The main term is d*sc*q5 and the min term
+    /// dmin*m folds through the Q8KBlock bsums (Q4_K-style). Returns true if a
+    /// vector kernel was used, false if the caller must fall back to the
+    /// generic path.
+    ///
+    /// @param W_q5k  Q5_K weights, row-major [rows * blocksPerRow] raw blocks
+    /// @param X      Input activations [seqLen, cols] (row-major)
+    /// @param seqLen Number of tokens in the batch
+    /// @param rows   Number of output rows
+    /// @param cols   Number of input columns
+    /// @param out    Output [seqLen, rows] (row-major)
+    /// @return true if the vector batch kernel was dispatched
+    bool matMulVecBatchQ5K_SIMD(const uint8_t *W_q5k, const float *X,
+                                uint32_t seqLen, uint32_t rows, uint32_t cols,
+                                float *out);
+
+    /// @brief Register-tiled batch GEMM for a single COMPACT (raw GGUF) IQ4_XS
+    /// weight matrix over a batch of tokens (qwen35 FFN gate/up — 136 B/block).
+    ///
+    /// IQ4_XS (136 B/block): d(2) + scales_h(2) + scales_l(4) + qs(128).
+    /// 8 sub-blocks of 32; each has scale dl = d*(ls-32) where ls is a SIGNED
+    /// 6-bit value from scales_h/scales_l; weights are
+    /// dl * kvalues_iq4nl[nibble] (kvalues_iq4nl is SIGNED). Returns true if a
+    /// vector kernel was used, false if the caller must fall back.
+    ///
+    /// @param W_iq4xs IQ4_XS weights, row-major [rows * blocksPerRow] blocks
+    /// @param X       Input activations [seqLen, cols] (row-major)
+    /// @param seqLen  Number of tokens in the batch
+    /// @param rows    Number of output rows
+    /// @param cols    Number of input columns
+    /// @param out     Output [seqLen, rows] (row-major)
+    /// @return true if the vector batch kernel was dispatched
+    bool matMulVecBatchIQ4XS_SIMD(const uint8_t *W_iq4xs, const float *X,
+                                  uint32_t seqLen, uint32_t rows, uint32_t cols,
+                                  float *out);
+
+    /// @brief Register-tiled batch GEMM for a single COMPACT (raw GGUF) IQ4_NL
+    /// weight matrix over a batch of tokens. IQ4_NL (18 B per 32 weights):
+    /// d(2) + 16 nibble bytes; weights are d * kvalues_iq4nl[nibble]. Since
+    /// IQ4_NL has 32-element blocks (not 256), the kernel expands each nibble
+    /// to a signed byte and dots against the raw x segment with a scale per
+    /// 32-elem block. Returns true if a vector kernel was used, false if the
+    /// caller must fall back.
+    ///
+    /// @param W_iq4nl IQ4_NL weights, row-major [rows * blocksPerRow] blocks
+    /// @param X       Input activations [seqLen, cols] (row-major)
+    /// @param seqLen  Number of tokens in the batch
+    /// @param rows    Number of output rows
+    /// @param cols    Number of input columns
+    /// @param out     Output [seqLen, rows] (row-major)
+    /// @return true if the vector batch kernel was dispatched
+    bool matMulVecBatchIQ4NL_SIMD(const uint8_t *W_iq4nl, const float *X,
+                                  uint32_t seqLen, uint32_t rows, uint32_t cols,
+                                  float *out);
 
     /// @brief Register-tiled batch GEMM for a single COMPACT (raw GGUF) Q2_K
     /// weight matrix over a batch of tokens, used for the separate LM head when

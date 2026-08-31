@@ -230,6 +230,78 @@ TEST(DequantizeTest, IQ2_SBlockNoCrash) {
 }
 
 // ---------------------------------------------------------------------------
+// Test: IQ2_XS + IQ3_S fused dot products match dequantize-then-dot reference
+// ---------------------------------------------------------------------------
+TEST(DequantizeTest, IQ2XS_IQ3S_FusedDotMatchesReference) {
+    // Deterministic pseudo-random block bytes (seeded, so reproducible).
+    auto fill = [](uint8_t *dst, size_t n, uint64_t seed) {
+        uint64_t s = seed * 6364136223846793005ULL + 1442695040888963407ULL;
+        for (size_t i = 0; i < n; ++i) {
+            s = s * 6364136223846793005ULL + 1442695040888963407ULL;
+            dst[i] = static_cast<uint8_t>(s >> 33);
+        }
+    };
+
+    auto reference = [](uint32_t type, const uint8_t *blk, const float *x) {
+        float out[256];
+        GGMLDequantize::dequantizeBlock(type, blk, out, 256);
+        double dot = 0.0;
+        for (int i = 0; i < 256; ++i) dot += static_cast<double>(x[i]) * out[i];
+        return static_cast<float>(dot);
+    };
+
+    // x must be a column vector of sane floats (NOT raw byte patterns, which
+    // can be NaN/Inf bit patterns).
+    float x[256];
+    {
+        uint64_t s = 777 * 6364136223846793005ULL + 1442695040888963407ULL;
+        for (int i = 0; i < 256; ++i) {
+            s = s * 6364136223846793005ULL + 1442695040888963407ULL;
+            double u = static_cast<double>(s >> 11) / static_cast<double>(1ULL << 53);
+            x[i] = static_cast<float>(2.0 * u - 1.0);
+        }
+    }
+
+    // IQ2_XS: 74-byte block
+    {
+        uint8_t blk[74];
+        fill(blk, sizeof(blk), 1234);
+        // d is at bytes 0-1 (fp16); fix to 1.25 (0x3D20 LE)
+        blk[0] = 0x20;
+        blk[1] = 0x3D;
+        float ref = reference(GGML_TYPE_IQ2_XS, blk, x);
+        float got = GGMLDequantize::dotProductIQ2_XS(blk, x);
+        EXPECT_NEAR(got, ref, 1e-3f * std::max(1.0f, std::fabs(ref)))
+                << "IQ2_XS fused dot deviates from reference";
+    }
+
+    // IQ3_S: 110-byte block
+    {
+        uint8_t blk[110];
+        fill(blk, sizeof(blk), 5678);
+        blk[0] = 0x20;
+        blk[1] = 0x3D;
+        float ref = reference(GGML_TYPE_IQ3_S, blk, x);
+        float got = GGMLDequantize::dotProductIQ3_S(blk, x);
+        EXPECT_NEAR(got, ref, 1e-3f * std::max(1.0f, std::fabs(ref)))
+                << "IQ3_S fused dot deviates from reference";
+    }
+
+    // Also verify the generic dotProductFused dispatch reaches the new dots.
+    {
+        uint8_t blk[74];
+        fill(blk, sizeof(blk), 9999);
+        blk[0] = 0x20;
+        blk[1] = 0x3D;
+        float viaDispatch = GGMLDequantize::dotProductFused(
+                GGML_TYPE_IQ2_XS, blk, x, 256);
+        float direct = GGMLDequantize::dotProductIQ2_XS(blk, x);
+        EXPECT_EQ(viaDispatch, direct)
+                << "dotProductFused did not dispatch to dotProductIQ2_XS";
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Test: Generic dequantizeBlock dispatcher
 // ---------------------------------------------------------------------------
 TEST(DequantizeTest, GenericDequantizeBlockAllTypes) {
@@ -263,7 +335,100 @@ TEST(DequantizeTest, GenericDequantizeBlockAllTypes) {
 }
 
 // ---------------------------------------------------------------------------
-// Test: matMulVecFused produces same result as full dequantize + dot product
+// Q8_1 / Q8_K block + bulk + fused dot + fused matmul correctness.
+//
+// Q8_1 (36 B/block: d fp16 + s fp16 + 32 x int8) and Q8_K (292 B/block:
+// d f32 + 256 x int8 + 16 x int16 bsums) are used by the qwen35 recurrent
+// gated-delta-net weights (ssm_alpha/ssm_beta as Q8_1, ssm_out as Q8_K).
+// They were previously missing from ggmlTypeSize()/dequantizeBlock(), which
+// both corrupted the load (overread) and zeroed the fused matmul output.
+// ---------------------------------------------------------------------------
+TEST(DequantizeTest, Q8_1AndQ8_K_DequantDotMatmul) {
+    // ---- Q8_1: fabricate two 32-wide blocks with known d/s/qs ----
+    uint8_t q8_1[2][36] = {};
+    {
+        // Block 0: d = 0.5 (0x3800), s = 1.0 (0x3C00), qs[i] = i - 16
+        uint8_t *blk = q8_1[0];
+        blk[0] = 0x00;
+        blk[1] = 0x38;// d = 0.5
+        blk[2] = 0x00;
+        blk[3] = 0x3C;// s = 1.0
+        for (int i = 0; i < 32; ++i) blk[4 + i] = static_cast<uint8_t>(static_cast<int8_t>(i - 16));
+        // Block 1: d = -0.25 (0xB000), qs = alternating -8/+8
+        uint8_t *blk1 = q8_1[1];
+        blk1[0] = 0x00;
+        blk1[1] = 0xB0;// d = -0.25
+        for (int i = 0; i < 32; ++i) blk1[4 + i] = static_cast<uint8_t>((i & 1) ? 8 : -8);
+    }
+
+    float x[64];
+    for (int i = 0; i < 64; ++i) x[i] = 0.01f * static_cast<float>(i + 1);
+
+    // dequantizeBlock for Q8_1
+    float deq[32];
+    GGMLDequantize::dequantizeBlock(GGML_TYPE_Q8_1, q8_1[0], deq, 32);
+    for (int i = 0; i < 32; ++i) {
+        EXPECT_NEAR(deq[i], 0.5f * static_cast<float>(i - 16), 1e-5f)
+                << "Q8_1 block0 dequant idx " << i;
+    }
+
+    // dotProductFused for Q8_1
+    double refDot0 = 0.0;
+    for (int i = 0; i < 32; ++i) refDot0 += static_cast<double>(x[i]) * deq[i];
+    EXPECT_NEAR(GGMLDequantize::dotProductFused(GGML_TYPE_Q8_1, q8_1[0], x, 32),
+                static_cast<float>(refDot0), 1e-4f);
+
+    // ---- Q8_K: fabricate one 256-wide block ----
+    uint8_t q8k[292] = {};
+    {
+        float d = 0.001f;
+        std::memcpy(q8k, &d, sizeof(float));
+        for (int i = 0; i < 256; ++i) q8k[4 + i] = static_cast<uint8_t>(static_cast<int8_t>(i - 128));
+    }
+    float deqK[256];
+    GGMLDequantize::dequantizeBlock(GGML_TYPE_Q8_K, q8k, deqK, 256);
+    double refDotK = 0.0;
+    for (int i = 0; i < 256; ++i) {
+        EXPECT_NEAR(deqK[i], 0.001f * static_cast<float>(i - 128), 1e-6f)
+                << "Q8_K dequant idx " << i;
+        refDotK += static_cast<double>(x[i % 32] + 0.0 * i) * deqK[i];// reuse x[0..31]
+    }
+    // Separate x vector covering all 256
+    std::vector<float> xK(256);
+    for (int i = 0; i < 256; ++i) xK[i] = 0.001f * static_cast<float>(i - 128);
+    double refDotK2 = 0.0;
+    for (int i = 0; i < 256; ++i) refDotK2 += static_cast<double>(xK[i]) * deqK[i];
+    EXPECT_NEAR(GGMLDequantize::dotProductFused(GGML_TYPE_Q8_K, q8k, xK.data(), 256),
+                static_cast<float>(refDotK2), 1e-5f);
+
+    // ---- Full fused matmul: rows x cols from Q8_1 blocks ----
+    constexpr uint32_t ROWS = 4;
+    constexpr uint32_t COLS = 64;// 2 blocks of 32 per row
+    std::vector<uint8_t> matQ8_1(ROWS * 2 * 36);
+    for (uint32_t r = 0; r < ROWS; ++r) {
+        std::memcpy(matQ8_1.data() + r * 72 + 0, q8_1[0], 36);
+        std::memcpy(matQ8_1.data() + r * 72 + 36, q8_1[1], 36);
+    }
+    std::vector<float> yFused(ROWS);
+    GGMLDequantize::matMulVecFused(GGML_TYPE_Q8_1, matQ8_1.data(), x, ROWS, COLS, yFused.data());
+    // Reference: dequantize whole matrix then dot per row
+    auto deqAll = GGMLDequantize::dequantize(GGML_TYPE_Q8_1, matQ8_1.data(), ROWS * COLS);
+    ASSERT_EQ(deqAll.size(), ROWS * COLS);
+    for (uint32_t r = 0; r < ROWS; ++r) {
+        double dot = 0.0;
+        for (uint32_t i = 0; i < COLS; ++i) {
+            dot += static_cast<double>(x[i]) * deqAll[r * COLS + i];
+        }
+        EXPECT_NEAR(yFused[r], static_cast<float>(dot), 1e-4f)
+                << "Q8_1 fused matmul row " << r;
+    }
+
+    // ---- Full fused matmul for Q8_K: one row of 256 ----
+    std::vector<float> yK(1);
+    GGMLDequantize::matMulVecFused(GGML_TYPE_Q8_K, q8k, xK.data(), 1, 256, yK.data());
+    EXPECT_NEAR(yK[0], static_cast<float>(refDotK2), 1e-5f)
+            << "Q8_K fused matmul mismatch";
+}
 // ---------------------------------------------------------------------------
 TEST(DequantizeTest, MatMulVecFusedMatchesDequantizeDot) {
     // Create a small quantized matrix and verify that matMulVecFused produces
@@ -413,6 +578,11 @@ TEST(DequantizeTest, TypeSizeAndBlockSize) {
     EXPECT_EQ(ggmlTypeSize(GGML_TYPE_IQ3_XXS), 98u);
     EXPECT_EQ(ggmlTypeSize(GGML_TYPE_IQ3_S), 110u);
     EXPECT_EQ(ggmlTypeSize(GGML_TYPE_IQ2_S), 82u);
+    // Q8_1 (d fp16 + s fp16 + 32 x int8) and Q8_K (d f32 + 256 x int8 + 16 x int16)
+    // are used by qwen35 ssm_alpha/ssm_beta/ssm_out weights. They must resolve to
+    // the correct per-block byte sizes or loadQuantized overreads the file.
+    EXPECT_EQ(ggmlTypeSize(GGML_TYPE_Q8_1), 36u);
+    EXPECT_EQ(ggmlTypeSize(GGML_TYPE_Q8_K), 292u);
 
     EXPECT_EQ(ggmlBlockSize(GGML_TYPE_F32), 1u);
     EXPECT_EQ(ggmlBlockSize(GGML_TYPE_Q5_1), 32u);
@@ -421,6 +591,8 @@ TEST(DequantizeTest, TypeSizeAndBlockSize) {
     EXPECT_EQ(ggmlBlockSize(GGML_TYPE_IQ3_XXS), 256u);
     EXPECT_EQ(ggmlBlockSize(GGML_TYPE_IQ3_S), 256u);
     EXPECT_EQ(ggmlBlockSize(GGML_TYPE_IQ2_S), 256u);
+    EXPECT_EQ(ggmlBlockSize(GGML_TYPE_Q8_1), 32u);
+    EXPECT_EQ(ggmlBlockSize(GGML_TYPE_Q8_K), 256u);
 }
 
 // ---------------------------------------------------------------------------
@@ -828,4 +1000,211 @@ TEST(DequantizeTest, BatchQ2KCompactVsScalarDot) {
     const double tol = 0.01 * std::max(1.0, maxRef) + 1e-3;
     EXPECT_LT(maxAbs, tol)
             << "Compact Q2_K batch kernel deviates from scalar dot reference";
+}
+
+// ---------------------------------------------------------------------------
+// Test: Q5_K IQ4_XS IQ4_NL batch SIMD kernels vs exact scalar dequantize+dot.
+// Fabricates quantized block bytes hand-per-layout (no encoder exists for
+// these types), calls the same matMulVecBatch*_SIMD kernels the generic
+// QuantizedMatrix::matMulVec dispatches for the qwen35 layer matmuls, and
+// compares against dequantizeBlock + float dot. This isolates the kernel math
+// from the forward pipeline (the Qwen3.8-27B sample-question regression).
+// ---------------------------------------------------------------------------
+namespace {
+
+    // Write a float as an fp16 bit pattern (little-endian) at `dst`.
+    void writeFp16(uint8_t *dst, float v) {
+        uint16_t h = GGMLDequantize::floatToHalf(v);
+        std::memcpy(dst, &h, sizeof(uint16_t));
+    }
+
+    // Reference: dot(x, dequantize(block)) using the exact scalar block path.
+    float scalarBlockDot(uint32_t type, const uint8_t *block, const float *x) {
+        float blockOut[256];
+        GGMLDequantize::dequantizeBlock(type, block, blockOut, 256);
+        double dot = 0.0;
+        for (uint32_t i = 0; i < 256; ++i) {
+            dot += static_cast<double>(x[i]) * blockOut[i];
+        }
+        return static_cast<float>(dot);
+    }
+
+    // One Q5_K block (176 B). Sub-block i (0..7) has scale d*sc[i], min dmin*m[i],
+    // and 32 weights of 0..31 where the 5th bit for sub-block element j comes
+    // from qh[j] bit (2*chunk + half). We iterate the SAME indexing scheme the
+    // reference dequantizeQ5_KBlock uses (chunk c of 4, half h of 2) to keep the
+    // qs/qh offsets and qh bit positions in lockstep.
+    void fabricateQ5KBlock(uint8_t *blk, float d, float dmin, const float sc[8],
+                           const float m[8], const uint8_t w[256]) {
+        std::memset(blk, 0, 176);
+        writeFp16(blk + 0, d);
+        writeFp16(blk + 2, dmin);
+        uint8_t *scales = blk + 4;
+        uint8_t *qh = blk + 16;
+        uint8_t *qs = blk + 48;
+        // scales: 6-bit d per sub-block + 6-bit m per sub-block (the packed
+        // 12-byte layout getScaleMin reads back).
+        for (int j = 0; j < 8; ++j) {
+            uint8_t sv = static_cast<uint8_t>(sc[j]) & 63;
+            uint8_t mv = static_cast<uint8_t>(m[j]) & 63;
+            if (j < 4) {
+                scales[j] |= sv;
+                scales[j + 4] |= mv;
+            } else {
+                scales[j + 4] |= (sv & 0xF) | ((mv & 0xF) << 4);
+                scales[j - 4] |= (sv >> 4) << 6;
+                scales[j] |= (mv >> 4) << 6;
+            }
+        }
+        for (int c = 0; c < 4; ++c) {
+            const int u1 = 1 << (2 * c), u2 = 1 << (2 * c + 1);
+            for (int l = 0; l < 32; ++l) {
+                uint8_t v0 = w[c * 64 + l];
+                uint8_t v1 = w[c * 64 + 32 + l];
+                qs[c * 32 + l] = (v0 & 0xF) | ((v1 & 0xF) << 4);
+                if (v0 & 16) qh[l] |= static_cast<uint8_t>(u1);
+                if (v1 & 16) qh[l] |= static_cast<uint8_t>(u2);
+            }
+        }
+    }
+
+    // One IQ4_XS block (136 B). Sub-block ib (0..7) has scale dl = d*(ls-32),
+    // ls packed as scales_l[ib/2] nibbles + 2-bit fields of the 16-bit scales_h
+    // word at bit positions 2*ib (`(scales_h >> 2*ib) & 3`, little-endian);
+    // qs advances 16 bytes per sub-block (reference dequantizeIQ4_XS).
+    void fabricateIQ4XSBlock(uint8_t *blk, float d, const uint8_t ls[8],
+                             const uint8_t nib[128]) {
+        std::memset(blk, 0, 136);
+        writeFp16(blk + 0, d);
+        uint16_t scales_h16 = 0;
+        uint8_t *scales_l = blk + 4;
+        uint8_t *qs = blk + 8;
+        for (int ib = 0; ib < 8; ++ib) {
+            scales_l[ib / 2] |= (ls[ib] & 0xF) << (4 * (ib % 2));
+            scales_h16 |= static_cast<uint16_t>(((ls[ib] >> 4) & 0x3)
+                                                << (2 * ib));
+            std::memcpy(qs + 16 * ib, nib + 16 * ib, 16);
+        }
+        std::memcpy(blk + 2, &scales_h16, sizeof(uint16_t));
+    }
+
+    // One IQ4_NL block (18 B): d + 16 nibbles, weight j = kvalues_iq4nl[nib].
+    void fabricateIQ4NLBlock(uint8_t *blk, float d, const uint8_t nib[16]) {
+        std::memset(blk, 0, 18);
+        writeFp16(blk + 0, d);
+        std::memcpy(blk + 2, nib, 16);
+    }
+
+}// namespace
+
+TEST(DequantizeTest, Q5KBatchSIMDVsScalarDot) {
+    constexpr uint32_t BLOCK = 256;
+    constexpr uint32_t ROWS = 16;
+    std::mt19937 rng(101);
+    std::uniform_real_distribution<float> dist(-0.05f, 0.05f);
+
+    std::vector<uint8_t> wQ(ROWS * 176);
+    for (uint32_t r = 0; r < ROWS; ++r) {
+        float sc[8], m[8];
+        uint8_t w[256];
+        for (int i = 0; i < 8; ++i) {
+            sc[i] = static_cast<float>(1 + rng() % 63);
+            m[i] = static_cast<float>(rng() % 32);
+        }
+        for (int i = 0; i < 256; ++i) w[i] = static_cast<uint8_t>(rng() % 32);
+        fabricateQ5KBlock(wQ.data() + r * 176, 0.01f, 0.002f, sc, m, w);
+    }
+
+    std::vector<float> x(BLOCK);
+    for (uint32_t i = 0; i < BLOCK; ++i) x[i] = dist(rng);
+    std::vector<float> out(ROWS, 0.0f);
+    bool used = matMulVecBatchQ5K_SIMD(wQ.data(), x.data(), 1, ROWS, BLOCK, out.data());
+    ASSERT_TRUE(used) << "Q5_K SIMD batch kernel not dispatched";
+
+    double maxAbs = 0.0, maxRef = 0.0;
+    for (uint32_t r = 0; r < ROWS; ++r) {
+        float ref = scalarBlockDot(GGML_TYPE_Q5_K, wQ.data() + r * 176, x.data());
+        maxAbs = std::max(maxAbs, std::fabs(static_cast<double>(out[r] - ref)));
+        maxRef = std::max(maxRef, std::fabs(static_cast<double>(ref)));
+    }
+    std::cout << "  Q5_K maxAbsDiff=" << maxAbs << " maxRef=" << maxRef << std::endl;
+    const double tol = 0.02 * std::max(1.0, maxRef) + 1e-3;
+    EXPECT_LT(maxAbs, tol) << "Q5_K SIMD kernel deviates from scalar dot";
+}
+
+TEST(DequantizeTest, IQ4XSBatchSIMDVsScalarDot) {
+    constexpr uint32_t BLOCK = 256;
+    constexpr uint32_t ROWS = 16;
+    std::mt19937 rng(202);
+    std::uniform_real_distribution<float> dist(-0.05f, 0.05f);
+
+    std::vector<uint8_t> wQ(ROWS * 136);
+    for (uint32_t r = 0; r < ROWS; ++r) {
+        uint8_t ls[8], nib[128];
+        for (int i = 0; i < 8; ++i) ls[i] = static_cast<uint8_t>(rng() % 64);
+        for (int i = 0; i < 128; ++i) nib[i] = static_cast<uint8_t>(rng() % 256);
+        fabricateIQ4XSBlock(wQ.data() + r * 136, 0.01f, ls, nib);
+    }
+
+    std::vector<float> x(BLOCK);
+    for (uint32_t i = 0; i < BLOCK; ++i) x[i] = dist(rng);
+    std::vector<float> out(ROWS, 0.0f);
+    bool used = matMulVecBatchIQ4XS_SIMD(wQ.data(), x.data(), 1, ROWS, BLOCK, out.data());
+    ASSERT_TRUE(used) << "IQ4_XS SIMD batch kernel not dispatched";
+
+    double maxAbs = 0.0, maxRef = 0.0;
+    for (uint32_t r = 0; r < ROWS; ++r) {
+        float ref = scalarBlockDot(GGML_TYPE_IQ4_XS, wQ.data() + r * 136, x.data());
+        maxAbs = std::max(maxAbs, std::fabs(static_cast<double>(out[r] - ref)));
+        maxRef = std::max(maxRef, std::fabs(static_cast<double>(ref)));
+    }
+    std::cout << "  IQ4_XS maxAbsDiff=" << maxAbs << " maxRef=" << maxRef << std::endl;
+    const double tol = 0.02 * std::max(1.0, maxRef) + 1e-3;
+    EXPECT_LT(maxAbs, tol) << "IQ4_XS SIMD kernel deviates from scalar dot";
+}
+
+TEST(DequantizeTest, IQ4NLBatchSIMDVsScalarDot) {
+    // IQ4_NL blocks are 32-wide, so one row = 8 blocks of 18 B.
+    constexpr uint32_t BLOCK = 32;
+    constexpr uint32_t BLOCKS_PER_ROW = 8;
+    constexpr uint32_t ROWS = 16;
+    constexpr uint32_t COLS = BLOCK * BLOCKS_PER_ROW;
+    std::mt19937 rng(303);
+    std::uniform_real_distribution<float> dist(-0.05f, 0.05f);
+
+    std::vector<uint8_t> wQ(ROWS * BLOCKS_PER_ROW * 18);
+    for (uint32_t r = 0; r < ROWS; ++r) {
+        for (uint32_t b = 0; b < BLOCKS_PER_ROW; ++b) {
+            uint8_t nib[16];
+            for (int i = 0; i < 16; ++i) nib[i] = static_cast<uint8_t>(rng() % 256);
+            fabricateIQ4NLBlock(wQ.data() + (r * BLOCKS_PER_ROW + b) * 18,
+                                0.02f, nib);
+        }
+    }
+
+    std::vector<float> x(COLS);
+    for (uint32_t i = 0; i < COLS; ++i) x[i] = dist(rng);
+    std::vector<float> out(ROWS, 0.0f);
+    bool used = matMulVecBatchIQ4NL_SIMD(wQ.data(), x.data(), 1, ROWS, COLS, out.data());
+    ASSERT_TRUE(used) << "IQ4_NL SIMD batch kernel not dispatched";
+
+    double maxAbs = 0.0, maxRef = 0.0;
+    for (uint32_t r = 0; r < ROWS; ++r) {
+        double dot = 0.0;
+        for (uint32_t b = 0; b < BLOCKS_PER_ROW; ++b) {
+            float blockOut[32];
+            GGMLDequantize::dequantizeIQ4_NLBlock(
+                    wQ.data() + (r * BLOCKS_PER_ROW + b) * 18, blockOut);
+            float *d = blockOut;
+            for (uint32_t i = 0; i < 32; ++i) {
+                dot += static_cast<double>(x[b * 32 + i]) * d[i];
+            }
+        }
+        float ref = static_cast<float>(dot);
+        maxAbs = std::max(maxAbs, std::fabs(static_cast<double>(out[r] - ref)));
+        maxRef = std::max(maxRef, std::fabs(static_cast<double>(ref)));
+    }
+    std::cout << "  IQ4_NL maxAbsDiff=" << maxAbs << " maxRef=" << maxRef << std::endl;
+    const double tol = 0.02 * std::max(1.0, maxRef) + 1e-3;
+    EXPECT_LT(maxAbs, tol) << "IQ4_NL SIMD kernel deviates from scalar dot";
 }

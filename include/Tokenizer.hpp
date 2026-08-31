@@ -85,9 +85,14 @@ namespace tinycoder {
         bool isSpecialToken(int32_t token) const;
 
         /// @brief Check if a token ID is an end-of-generation token.
-        /// Uses the EOS token ID loaded from GGUF metadata.
+        /// Uses the EOS token ID loaded from GGUF metadata, plus any
+        /// additional EOG tokens derived from tokenizer.ggml.token_type
+        /// (CONTROL tokens such as <|im_end|>/<|endoftext|>).
         bool isEogToken(int32_t token) const {
-            return token == eosTokenId_;
+            if (token == eosTokenId_) {
+                return true;
+            }
+            return eogTokens_.find(token) != eogTokens_.end();
         }
 
         // Special token IDs (loaded from GGUF metadata or configured per architecture)
@@ -109,6 +114,18 @@ namespace tinycoder {
 
         // Special tokens set
         std::unordered_set<int32_t> specialTokens_;
+
+        // Additional end-of-generation tokens (beyond eosTokenId_), e.g. the
+        // CONTROL tokens <|im_end|>/<|endoftext|> in Qwen3.8-family vocabs whose
+        // IDs live at the END of the vocabulary (not at the Qwen2-era defaults).
+        // Derived from tokenizer.ggml.token_type (type 3) when present in GGUF.
+        std::unordered_set<int32_t> eogTokens_;
+
+        // Per-token type classification read from tokenizer.ggml.token_type
+        // (0=normal, 3=CONTROL special, 4=USER_DEFINED etc). Used to derive the
+        // authoritative EOG set and special-token IDs from the real vocabulary.
+        // Empty when the GGUF does not provide token_type.
+        std::vector<int32_t> tokenTypes_;
 
         // Special token text -> ID mappings for encode()
         // These are populated by configureForArchitecture()

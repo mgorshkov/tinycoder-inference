@@ -1205,6 +1205,164 @@ namespace tinycoder {
         return perLayerStates;
     }
 
+    // -----------------------------------------------------------------------
+    // Debug bisection for qwen2: fingerprint every layer-0 intermediate for the
+    // token sequence, mirroring llama_ref_probe.cpp's [ar] captures (the last
+    // token of the sequence wins, exactly like the probe's always-overwrite
+    // intm map). Uses the SAME operation sequence as forwardWithPerLayerStates
+    // so a divergence in any op (RMSNorm/QKV/RoPE/attention/FFN) maps directly
+    // to the llama reference tensor of the same name.
+    // -----------------------------------------------------------------------
+    std::vector<std::pair<std::string, std::vector<float>>>
+    Model::debugQwen2Layer0Intm(const std::vector<int32_t> &tokens) {
+        std::vector<std::pair<std::string, std::vector<float>>> out;
+        if (tokens.empty()) {
+            return out;
+        }
+        const uint32_t hiddenSize = config_.hiddenSize;
+        const uint32_t nHeads = config_.numAttentionHeads;
+        const uint32_t nKVHeads = config_.numKVHeads;
+        const uint32_t headDim = config_.headDim;
+        const uint32_t maxSeqLen = config_.maxSeqLen;
+        const uint32_t seqLen = static_cast<uint32_t>(tokens.size());
+        const uint32_t intermediateSize = config_.intermediateSize;
+
+        clearKVCache();
+
+        // Single-token buffers (seqLen == 1 decode semantics, exactly like the
+        // real decode path).
+        std::vector<float> hidden(hiddenSize);
+        std::vector<float> attnNorm(hiddenSize);
+        std::vector<float> q(nHeads * headDim);
+        std::vector<float> k(nKVHeads * headDim);
+        std::vector<float> v(nKVHeads * headDim);
+        std::vector<float> attnOut(nHeads * headDim);
+        std::vector<float> attnProj(hiddenSize);
+        std::vector<float> ffnNorm(hiddenSize);
+        std::vector<float> gate(intermediateSize);
+        std::vector<float> up(intermediateSize);
+        std::vector<float> ffnOut(hiddenSize);
+
+        auto snapshot = [&](const char *name, const float *data, size_t n) {
+            out.emplace_back(name, std::vector<float>(data, data + n));
+        };
+
+        for (uint32_t pos = 0; pos < seqLen; ++pos) {
+            const int32_t tokenId = tokens[pos];
+            kvCache_.pos = pos;
+            if (tokenId >= 0 &&
+                tokenId < static_cast<int32_t>(quantizedEmbeddings_.vocabSize)) {
+                auto embRow = quantizedEmbeddings_.getRow(tokenId);
+                std::memcpy(hidden.data(), embRow.data(), hiddenSize * sizeof(float));
+            } else {
+                std::fill(hidden.begin(), hidden.end(), 0.0f);
+            }
+
+            auto &w = layers_[0];
+
+            // RMSNorm attn
+            rmsNormInPlace(hidden.data(), attnNorm.data(), w.rmsNormAttn.data(), hiddenSize);
+            if (pos == seqLen - 1) snapshot("attn_norm-0", attnNorm.data(), hiddenSize);
+
+            // Q / K / V projections (IQ2_S attn_q/k, Q4_K attn_v for this model)
+            np::Array<float> qRow = w.attnQ.matMulVec(attnNorm.data());
+            std::memcpy(q.data(), qRow.data(), nHeads * headDim * sizeof(float));
+            if (config_.architecture == ARCH_QWEN2 && !w.attnQBias.empty()) {
+                const float *qBias = w.attnQBias.data();
+                for (uint32_t i = 0; i < nHeads * headDim; ++i) q[i] += qBias[i];
+            }
+
+            np::Array<float> kRow = w.attnK.matMulVec(attnNorm.data());
+            std::memcpy(k.data(), kRow.data(), nKVHeads * headDim * sizeof(float));
+            if (config_.architecture == ARCH_QWEN2 && !w.attnKBias.empty()) {
+                const float *kBias = w.attnKBias.data();
+                for (uint32_t i = 0; i < nKVHeads * headDim; ++i) k[i] += kBias[i];
+            }
+
+            np::Array<float> vRow = w.attnV.matMulVec(attnNorm.data());
+            std::memcpy(v.data(), vRow.data(), nKVHeads * headDim * sizeof(float));
+            if (config_.architecture == ARCH_QWEN2 && !w.attnVBias.empty()) {
+                const float *vBias = w.attnVBias.data();
+                for (uint32_t i = 0; i < nKVHeads * headDim; ++i) v[i] += vBias[i];
+            }
+
+            // RoPE (mirrors forwardWithPerLayerStates: applyRoPE then store
+            // rotated values into the cache, no double rotation).
+            if (pos == seqLen - 1) snapshot("Qpre-0", q.data(), nHeads * headDim);
+            if (pos == seqLen - 1) snapshot("Kpre-0", k.data(), nKVHeads * headDim);
+            applyRoPE(q.data(), k.data(), 1, 1, nHeads, nKVHeads, pos, /*rotateK=*/false);
+            if (pos == seqLen - 1) snapshot("Qcur-0", q.data(), nHeads * headDim);
+            if (pos == seqLen - 1) snapshot("Kcur-0", k.data(), nKVHeads * headDim);
+            if (pos == seqLen - 1) snapshot("Vcur-0", v.data(), nKVHeads * headDim);
+
+            // Store K/V in cache
+            uint32_t cachePos = pos;
+            float *kCacheLayer =
+                    kvCache_.k.data() + 0 * maxSeqLen * nKVHeads * headDim;
+            float *vCacheLayer =
+                    kvCache_.v.data() + 0 * maxSeqLen * nKVHeads * headDim;
+            uint32_t kvSize = nKVHeads * headDim;
+            for (uint32_t i = 0; i < kvSize; ++i) {
+                kCacheLayer[cachePos * nKVHeads * headDim + i] = k[i];
+                vCacheLayer[cachePos * nKVHeads * headDim + i] = v[i];
+            }
+
+            // Attention (attends to pos 0..cachePos)
+            uint32_t totalCacheLen = cachePos + 1;
+            attentionFused(q.data(), kCacheLayer, vCacheLayer, attnOut.data(),
+                           1, cachePos, totalCacheLen, /*layer=*/0);
+            if (pos == seqLen - 1) snapshot("attn_out-0", attnOut.data(), nHeads * headDim);
+
+            // Output projection + residual (Q8K integer dot for IQ3_S to
+            // mirror llama's vec_dot_iq3_s_q8_K; F16 copy only as fallback).
+            if (GGMLDequantize::supportsQ8KDot(w.attnO.type)) {
+                GGMLDequantize::matMulVecFusedQ8K(w.attnO.type, w.attnO.data.data(),
+                                                  attnOut.data(), w.attnO.rows,
+                                                  w.attnO.cols, attnProj.data());
+            } else {
+                np::Array<float> projRow = deqMatMulVecF16(w.attnO_deq_f16.data(), attnOut.data(),
+                                                           w.attnO.rows, w.attnO.cols);
+                std::memcpy(attnProj.data(), projRow.data(), hiddenSize * sizeof(float));
+            }
+            if (pos == seqLen - 1) snapshot("attn_proj-0", attnProj.data(), hiddenSize);
+            for (uint32_t i = 0; i < hiddenSize; ++i) hidden[i] += attnProj[i];
+            if (pos == seqLen - 1) snapshot("ffn_inp-0", hidden.data(), hiddenSize);
+
+            // FFN RMSNorm
+            rmsNormInPlace(hidden.data(), ffnNorm.data(), w.rmsNormFFN.data(), hiddenSize);
+            if (pos == seqLen - 1) snapshot("ffn_norm-0", ffnNorm.data(), hiddenSize);
+
+            // Gate / Up projections
+            np::Array<float> gateRow = w.ffnGate.matMulVec(ffnNorm.data());
+            std::memcpy(gate.data(), gateRow.data(), intermediateSize * sizeof(float));
+            np::Array<float> upRow = w.ffnUp.matMulVec(ffnNorm.data());
+            std::memcpy(up.data(), upRow.data(), intermediateSize * sizeof(float));
+            if (pos == seqLen - 1) snapshot("ffn_gate-0", gate.data(), intermediateSize);
+            if (pos == seqLen - 1) snapshot("ffn_up-0", up.data(), intermediateSize);
+
+            // SwiGLU
+            swiGLUInPlace(gate.data(), up.data(), intermediateSize);
+            if (pos == seqLen - 1) snapshot("ffn_silu-0", gate.data(), intermediateSize);
+
+            // Down projection + residual (Q8K integer dot for IQ3_XXS to
+            // mirror llama's vec_dot_iq3_xxs_q8_K; F16 copy only as fallback).
+            if (GGMLDequantize::supportsQ8KDot(w.ffnDown.type)) {
+                GGMLDequantize::matMulVecFusedQ8K(w.ffnDown.type, w.ffnDown.data.data(),
+                                                  gate.data(), w.ffnDown.rows,
+                                                  w.ffnDown.cols, ffnOut.data());
+            } else {
+                np::Array<float> downRow = deqMatMulVecF16(w.ffnDown_deq_f16.data(), gate.data(),
+                                                           w.ffnDown.rows, w.ffnDown.cols);
+                std::memcpy(ffnOut.data(), downRow.data(), hiddenSize * sizeof(float));
+            }
+            if (pos == seqLen - 1) snapshot("ffn_out-0", ffnOut.data(), hiddenSize);
+            for (uint32_t i = 0; i < hiddenSize; ++i) hidden[i] += ffnOut[i];
+            if (pos == seqLen - 1) snapshot("l_out-0", hidden.data(), hiddenSize);
+        }
+
+        return out;
+    }
+
     std::pair<std::vector<std::vector<float>>, std::vector<float>>
     Model::forwardTokenByToken(const std::vector<int32_t> &tokens) {
         // Process tokens one-by-one, exactly matching the reference

@@ -267,7 +267,12 @@ namespace tinycoder::simd {
         for (; i < n; ++i) {
             sumSq += static_cast<double>(x[i]) * static_cast<double>(x[i]);
         }
-        float invRms = 1.0f / (std::sqrt(static_cast<float>(sumSq / static_cast<double>(n))) + eps);
+        // ggml computes scale = 1/sqrtf(mean + eps) -- eps INSIDE the sqrt.
+        // Previously the eps was added OUTSIDE (sqrt(mean) + eps), which
+        // systematically over-flattens every normalized vector and diverges
+        // from llama.cpp on every RMSNorm op (visible as a ~0.19% norm scale
+        // at the FIRST qwen35 layer, compounding across 64 layers).
+        float invRms = 1.0f / (std::sqrt(static_cast<float>(sumSq / static_cast<double>(n)) + eps));
 
         __m256 invRmsVec = _mm256_set1_ps(invRms);
         i = 0;
@@ -3601,6 +3606,384 @@ namespace tinycoder::simd {
             }
 
             // Store results.
+            for (uint32_t r = 0; r < batchSize; ++r) {
+                for (uint32_t s = 0; s < seqLen; ++s) {
+                    out[static_cast<size_t>(s) * rows + rowStart + r] =
+                            acc[static_cast<size_t>(r) * seqLen + s];
+                }
+            }
+        });
+    }
+
+    // ---- AVX2 register-tiled batch GEMM for a single Q5_K matrix over a batch ----
+    // Q5_K (176 B/block, 256 weights): d(2) + dmin(2) + scales(12) + qh(32) +
+    // qs(64). Decomposes like Q4_K (8 sub-blocks of 32 with the same 6-bit
+    // scale/min extraction) but each weight is 5-bit: low 4 bits in qs, the
+    // 5th bit in qh with the u1/u2 bit pattern per 64-weight chunk. The
+    // weight value is q5 = (qs_nibble | (qh_bit ? 16 : 0)) in [0,31], so
+    // value = d*(sc)*q5 - dmin*(m): the main term is the 5-bit expansion in
+    // the unsigned operand slot of _mm256_maddubs_epi16, and the min term
+    // folds through the Q8KBlock bsums exactly like Q4_K.
+    void matMulVecBatchQ5K_Q8K_AVX2(const uint8_t *W_q5k, const float *X,
+                                    uint32_t seqLen, uint32_t rows,
+                                    uint32_t cols, float *out) {
+        static constexpr uint32_t BATCH_SIZE = 8;
+        static constexpr uint32_t BLOCK_SIZE = 256;
+        static constexpr uint32_t Q5K_BLOCK_BYTES = 176;
+        uint32_t blocksPerRow = (cols + BLOCK_SIZE - 1) / BLOCK_SIZE;
+        uint64_t rowStride = static_cast<uint64_t>(blocksPerRow) * Q5K_BLOCK_BYTES;
+
+        auto halfToFloat = [](uint16_t h) -> float {
+            return tinycoder::GGMLDequantize::halfToFloatBranchFree(h);
+        };
+
+        static std::vector<tinycoder::Q8KBlock> q8All;
+        q8All.resize(static_cast<size_t>(seqLen) * blocksPerRow);
+        for (uint32_t s = 0; s < seqLen; ++s) {
+            GGMLDequantize::quantizeQ8K(X + static_cast<size_t>(s) * cols, cols,
+                                        q8All.data() + static_cast<size_t>(s) * blocksPerRow);
+        }
+
+        const __m256i one16 = _mm256_set1_epi16(1);
+        const __m256i lowmask = _mm256_set1_epi8(0x0F);
+
+        uint32_t numTiles = (rows + BATCH_SIZE - 1) / BATCH_SIZE;
+        ThreadPool::instance().parallelForSlab(0, numTiles, [&](uint32_t tile) {
+            uint32_t rowStart = tile * BATCH_SIZE;
+            uint32_t batchSize = std::min(BATCH_SIZE, rows - rowStart);
+
+            static thread_local std::vector<float> acc;
+            acc.assign(static_cast<size_t>(batchSize) * seqLen, 0.0f);
+
+            struct Q5KSetup {
+                float ds[8];
+                float mn[8];
+                __m256i nv[8];// 5-bit weights expanded from qs(4) + qh(1)
+            };
+            auto makeSetup = [&](const uint8_t *blockData) -> Q5KSetup {
+                Q5KSetup st;
+                const float d = halfToFloat(*(const uint16_t *) (blockData + 0));
+                const float dmin = halfToFloat(*(const uint16_t *) (blockData + 2));
+                const uint8_t *scales = blockData + 4;
+                const uint8_t *qh = blockData + 16;
+                const uint8_t *qs = blockData + 48;
+                for (int j = 0; j < 8; ++j) {
+                    uint8_t sc, m;
+                    if (j < 4) {
+                        sc = scales[j] & 63;
+                        m = scales[j + 4] & 63;
+                    } else {
+                        sc = (uint8_t) ((scales[j + 4] & 0xF) | ((scales[j - 4] >> 6) << 4));
+                        m = (uint8_t) ((scales[j + 4] >> 4) | ((scales[j] >> 6) << 4));
+                    }
+                    st.ds[j] = d * static_cast<float>(sc);
+                    st.mn[j] = dmin * static_cast<float>(m);
+                }
+                // Expand the 8 sub-blocks of 32 weights to unsigned bytes
+                // (value 0..31). The reference dequantizeQ5_KBlock uses:
+                //   for chunk c (4 chunks of 64 weights):
+                //     first 32: q5 = (qs[32c+l] & 0xF) | ((qh[l] & u1) ? 16 : 0)
+                //     next  32: q5 = (qs[32c+l] >> 4) | ((qh[l] & u2) ? 16 : 0)
+                //   with u1 = 1<<(2c), u2 = 1<<(2c+1). CRUCIALLY, qh (32 bytes,
+                //   offset 16) is NOT advanced inside the chunk loop — the SAME
+                //   32 qh bytes serve every chunk, selecting bits 2c and 2c+1.
+                // Sub-block i = chunk (i>>1), half (i&1):
+                //   byte j = (qs[32c+j] >> (4h)) & 0xF
+                //            | ((qh[j] >> (2c+h)) & 1) << 4
+                const __m256i qv = _mm256_loadu_si256((const __m256i *) qh);
+                for (int i = 0; i < 8; ++i) {
+                    const int c = i >> 1;
+                    const int half = i & 1;
+                    const int bit = 2 * c + half;
+                    __m256i low = _mm256_loadu_si256(
+                            (const __m256i *) (qs + 32 * c));
+                    if (half == 1) {
+                        // srli_epi16 on the byte-pair lanes gives output byte j
+                        // = qs[32c+j] >> 4 (the byte-boundary mix is masked by
+                        // the 0x0F AND).
+                        low = _mm256_and_si256(_mm256_srli_epi16(low, 4), lowmask);
+                    } else {
+                        low = _mm256_and_si256(low, lowmask);
+                    }
+                    __m256i sel = _mm256_and_si256(
+                            qv, _mm256_set1_epi8(static_cast<int8_t>(1 << bit)));
+                    __m256i hiBits = _mm256_and_si256(
+                            _mm256_cmpeq_epi8(
+                                    sel, _mm256_set1_epi8(static_cast<int8_t>(1 << bit))),
+                            _mm256_set1_epi8(0x10));
+                    st.nv[i] = _mm256_or_si256(low, hiBits);
+                }
+                return st;
+            };
+
+            for (uint32_t b = 0; b < blocksPerRow; ++b) {
+                for (uint32_t r = 0; r < batchSize; ++r) {
+                    const uint8_t *block =
+                            W_q5k + static_cast<uint64_t>(rowStart + r) * rowStride +
+                            static_cast<uint64_t>(b) * Q5K_BLOCK_BYTES;
+                    Q5KSetup st = makeSetup(block);
+
+                    for (uint32_t s = 0; s < seqLen; ++s) {
+                        const tinycoder::Q8KBlock &q8 =
+                                q8All[static_cast<size_t>(s) * blocksPerRow + b];
+                        const float xd = q8.d;
+                        const int16_t *bsums = q8.bsums;
+
+                        __m256i xraw[8];
+                        for (int i = 0; i < 8; ++i) {
+                            xraw[i] = _mm256_loadu_si256(
+                                    (const __m256i *) (q8.qs + i * 32));
+                        }
+
+                        float mainS = 0.0f;
+                        for (int i = 0; i < 8; ++i) {
+                            __m256i p = _mm256_maddubs_epi16(st.nv[i], xraw[i]);
+                            __m256i pi = _mm256_madd_epi16(p, one16);
+                            __m128i lo = _mm256_castsi256_si128(pi);
+                            __m128i hi = _mm256_extracti128_si256(pi, 1);
+                            __m128i s = _mm_add_epi32(lo, hi);
+                            s = _mm_hadd_epi32(s, s);
+                            s = _mm_hadd_epi32(s, s);
+                            int s32q = _mm_cvtsi128_si32(s);
+                            mainS += st.ds[i] * static_cast<float>(s32q);
+                        }
+
+                        float minS = 0.0f;
+                        for (int i = 0; i < 8; ++i) {
+                            minS += st.mn[i] *
+                                    static_cast<float>(bsums[2 * i] + bsums[2 * i + 1]);
+                        }
+
+                        acc[static_cast<size_t>(r) * seqLen + s] +=
+                                xd * (mainS - minS);
+                    }
+                }
+            }
+
+            for (uint32_t r = 0; r < batchSize; ++r) {
+                for (uint32_t s = 0; s < seqLen; ++s) {
+                    out[static_cast<size_t>(s) * rows + rowStart + r] =
+                            acc[static_cast<size_t>(r) * seqLen + s];
+                }
+            }
+        });
+    }
+
+    // ---- AVX2 register-tiled batch GEMM for a single IQ4_XS matrix over a batch ----
+    void matMulVecBatchIQ4XS_Q8K_AVX2(const uint8_t *W_iq4xs, const float *X,
+                                      uint32_t seqLen, uint32_t rows,
+                                      uint32_t cols, float *out) {
+        static constexpr uint32_t BATCH_SIZE = 8;
+        static constexpr uint32_t BLOCK_SIZE = 256;
+        static constexpr uint32_t IQ4XS_BLOCK_BYTES = 136;
+        uint32_t blocksPerRow = (cols + BLOCK_SIZE - 1) / BLOCK_SIZE;
+        uint64_t rowStride = static_cast<uint64_t>(blocksPerRow) * IQ4XS_BLOCK_BYTES;
+
+        auto halfToFloat = [](uint16_t h) -> float {
+            return tinycoder::GGMLDequantize::halfToFloatBranchFree(h);
+        };
+
+        static std::vector<tinycoder::Q8KBlock> q8All;
+        q8All.resize(static_cast<size_t>(seqLen) * blocksPerRow);
+        for (uint32_t s = 0; s < seqLen; ++s) {
+            GGMLDequantize::quantizeQ8K(X + static_cast<size_t>(s) * cols, cols,
+                                        q8All.data() + static_cast<size_t>(s) * blocksPerRow);
+        }
+
+        const __m256i one16 = _mm256_set1_epi16(1);
+
+        uint32_t numTiles = (rows + BATCH_SIZE - 1) / BATCH_SIZE;
+        ThreadPool::instance().parallelForSlab(0, numTiles, [&](uint32_t tile) {
+            uint32_t rowStart = tile * BATCH_SIZE;
+            uint32_t batchSize = std::min(BATCH_SIZE, rows - rowStart);
+
+            static thread_local std::vector<float> acc;
+            acc.assign(static_cast<size_t>(batchSize) * seqLen, 0.0f);
+
+            struct IQ4XSSetup {
+                // dl[8]: SIGNED per-sub-block scale d*(ls-32).
+                float dl[8];
+                // nv[8]: |kvalues_iq4nl| (1..127, ALL POSITIVE) — safe in the
+                // unsigned operand slot of _mm256_maddubs_epi16.
+                __m256i nv[8];
+                // sgn[8]: sign bytes (-1 where kvalues_iq4nl < 0, +1 otherwise),
+                // used with _mm256_sign_epi8 to flip x's sign before the dot.
+                __m256i sgn[8];
+            };
+            auto makeSetup = [&](const uint8_t *blockData) -> IQ4XSSetup {
+                IQ4XSSetup st;
+                const float d = halfToFloat(*(const uint16_t *) (blockData + 0));
+                uint16_t scales_h;
+                std::memcpy(&scales_h, blockData + 2, sizeof(uint16_t));
+                const uint8_t *scales_l = blockData + 4;
+                const uint8_t *qs = blockData + 8;
+                for (int j = 0; j < 8; ++j) {
+                    int ls = (scales_l[j / 2] >> (4 * (j % 2))) & 0xF;
+                    ls |= ((scales_h >> (2 * j)) & 0x3) << 4;
+                    st.dl[j] = d * static_cast<float>(ls - 32);
+                }
+                // IQ4_XS (reference dequantizeIQ4_XS):
+                //   value[ib*32 + j]      = dl * kvalues_iq4nl[qs[j] & 0xF]
+                //   value[ib*32 + 16 + j] = dl * kvalues_iq4nl[qs[j] >> 4]
+                // with qs advancing 16 bytes per 32-elem sub-block ib.
+                // maddubs(a, b) = sum a(UNSIGNED) * b(SIGNED) per 16-bit lane.
+                // Decompose: w = sign(w) * |w|. Then w*x = (|w|) * (sign(w)*x),
+                // so store |w| in the unsigned slot and pre-flip x's lanes with
+                // _mm256_sign_epi8(x, sign). |w| <= 127 and |x| <= 127, so each
+                // pair product fits int16 (2*127*127 = 32258 < 32767).
+                for (int i = 0; i < 8; ++i) {
+                    const uint8_t *q = qs + 16 * i;
+                    int8_t absIdx[32];
+                    int8_t sgnIdx[32];
+                    for (int k = 0; k < 16; ++k) {
+                        const int8_t v0 =
+                                tinycoder::GGMLDequantize::kvalues_iq4nl[q[k] & 0xF];
+                        const int8_t v1 =
+                                tinycoder::GGMLDequantize::kvalues_iq4nl[q[k] >> 4];
+                        absIdx[k] = static_cast<int8_t>(v0 < 0 ? -v0 : v0);
+                        absIdx[16 + k] = static_cast<int8_t>(v1 < 0 ? -v1 : v1);
+                        sgnIdx[k] = v0 < 0 ? -1 : 1;
+                        sgnIdx[16 + k] = v1 < 0 ? -1 : 1;
+                    }
+                    st.nv[i] = _mm256_loadu_si256((const __m256i *) absIdx);
+                    st.sgn[i] = _mm256_loadu_si256((const __m256i *) sgnIdx);
+                }
+                return st;
+            };
+
+            for (uint32_t b = 0; b < blocksPerRow; ++b) {
+                for (uint32_t r = 0; r < batchSize; ++r) {
+                    const uint8_t *block =
+                            W_iq4xs + static_cast<uint64_t>(rowStart + r) * rowStride +
+                            static_cast<uint64_t>(b) * IQ4XS_BLOCK_BYTES;
+                    IQ4XSSetup st = makeSetup(block);
+
+                    for (uint32_t s = 0; s < seqLen; ++s) {
+                        const tinycoder::Q8KBlock &q8 =
+                                q8All[static_cast<size_t>(s) * blocksPerRow + b];
+                        const float xd = q8.d;
+
+                        __m256i xraw[8];
+                        for (int i = 0; i < 8; ++i) {
+                            xraw[i] = _mm256_loadu_si256(
+                                    (const __m256i *) (q8.qs + i * 32));
+                        }
+
+                        float mainS = 0.0f;
+                        for (int i = 0; i < 8; ++i) {
+                            // Flip x where the weight is negative, then the
+                            // |w| (unsigned) * x' (signed) dot via maddubs.
+                            const __m256i xn =
+                                    _mm256_sign_epi8(xraw[i], st.sgn[i]);
+                            __m256i p = _mm256_maddubs_epi16(st.nv[i], xn);
+                            __m256i pi = _mm256_madd_epi16(p, one16);
+                            __m128i lo = _mm256_castsi256_si128(pi);
+                            __m128i hi = _mm256_extracti128_si256(pi, 1);
+                            __m128i s = _mm_add_epi32(lo, hi);
+                            s = _mm_hadd_epi32(s, s);
+                            s = _mm_hadd_epi32(s, s);
+                            const int s32q = _mm_cvtsi128_si32(s);
+                            mainS += st.dl[i] * static_cast<float>(s32q);
+                        }
+
+                        // No min term — IQ4_XS has no dmin offset (the (ls-32)
+                        // already centers the scale).
+                        acc[static_cast<size_t>(r) * seqLen + s] +=
+                                xd * mainS;
+                    }
+                }
+            }
+
+            for (uint32_t r = 0; r < batchSize; ++r) {
+                for (uint32_t s = 0; s < seqLen; ++s) {
+                    out[static_cast<size_t>(s) * rows + rowStart + r] =
+                            acc[static_cast<size_t>(r) * seqLen + s];
+                }
+            }
+        });
+    }
+
+    // ---- AVX2 register-tiled batch GEMM for a single IQ4_NL matrix over a batch ----
+    // IQ4_NL (18 B per 32 weights): d(2) + 16 nibble bytes. Each byte holds
+    // 2 weights (low nibble k -> weight k, high nibble -> weight 16+k). There
+    // is no min offset; the scale d multiplies the whole 32-vector. Since
+    // blocks are 32-wide (not 256) the number of blocks per row is cols/32.
+    void matMulVecBatchIQ4NL_Q8K_AVX2(const uint8_t *W_iq4nl, const float *X,
+                                      uint32_t seqLen, uint32_t rows,
+                                      uint32_t cols, float *out) {
+        static constexpr uint32_t BATCH_SIZE = 8;
+        static constexpr uint32_t BLOCK_SIZE = 32;
+        static constexpr uint32_t IQ4NL_BLOCK_BYTES = 18;
+        uint32_t blocksPerRow = (cols + BLOCK_SIZE - 1) / BLOCK_SIZE;
+        uint64_t rowStride = static_cast<uint64_t>(blocksPerRow) * IQ4NL_BLOCK_BYTES;
+
+        auto halfToFloat = [](uint16_t h) -> float {
+            return tinycoder::GGMLDequantize::halfToFloatBranchFree(h);
+        };
+
+        uint32_t numTiles = (rows + BATCH_SIZE - 1) / BATCH_SIZE;
+        ThreadPool::instance().parallelForSlab(0, numTiles, [&](uint32_t tile) {
+            uint32_t rowStart = tile * BATCH_SIZE;
+            uint32_t batchSize = std::min(BATCH_SIZE, rows - rowStart);
+
+            static thread_local std::vector<float> acc;
+            acc.assign(static_cast<size_t>(batchSize) * seqLen, 0.0f);
+
+            for (uint32_t r = 0; r < batchSize; ++r) {
+                const uint8_t *rowBase =
+                        W_iq4nl + static_cast<uint64_t>(rowStart + r) * rowStride;
+                for (uint32_t b = 0; b < blocksPerRow; ++b) {
+                    const uint8_t *block = rowBase +
+                                           static_cast<uint64_t>(b) * IQ4NL_BLOCK_BYTES;
+                    const float d = halfToFloat(*(const uint16_t *) (block + 0));
+                    const uint8_t *qs = block + 2;
+                    // Expand 16 nibbles to 32 SIGNED bytes.
+                    // Expand each nibble to signed bytes, then to FLOAT32
+                    // vectors (bytes[0..7], [8..15], [16..23], [24..31]) for
+                    // an AVX2 float FMA dot per 32-elem block. The array is
+                    // padded to 48 bytes so the 16-byte loads at offsets
+                    // 16/24/32 stay in-bounds.
+                    int8_t bytes[48];
+                    for (int k = 0; k < 16; ++k) {
+                        bytes[k] = tinycoder::GGMLDequantize::kvalues_iq4nl[qs[k] & 0xF];
+                        bytes[16 + k] = tinycoder::GGMLDequantize::kvalues_iq4nl[qs[k] >> 4];
+                    }
+                    auto f32v = [](const int8_t *p) -> __m256 {
+                        __m128i s = _mm_loadu_si128((const __m128i *) p);
+                        return _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(s));
+                    };
+                    const __m256 w0 = f32v(bytes + 0);
+                    const __m256 w1 = f32v(bytes + 8);
+                    const __m256 w2 = f32v(bytes + 16);
+                    const __m256 w3 = f32v(bytes + 24);
+                    for (uint32_t s = 0; s < seqLen; ++s) {
+                        const float *x = X + static_cast<size_t>(s) * cols + b * BLOCK_SIZE;
+                        // NOTE: the accumulator var MUST NOT be named `acc` — the
+                        // tile accumulator below is also `acc` (std::vector) and
+                        // the __m256 would shadow it, so the `acc[r*seqLen+s] +=`
+                        // would write into the __m256's vector elements (discarded
+                        // every iteration) and the kernel would emit ALL ZEROS.
+#if defined(__FMA__)
+                        __m256 vAcc = _mm256_fmadd_ps(w0, _mm256_loadu_ps(x + 0), _mm256_setzero_ps());
+                        vAcc = _mm256_fmadd_ps(w1, _mm256_loadu_ps(x + 8), vAcc);
+                        vAcc = _mm256_fmadd_ps(w2, _mm256_loadu_ps(x + 16), vAcc);
+                        vAcc = _mm256_fmadd_ps(w3, _mm256_loadu_ps(x + 24), vAcc);
+#else
+                        __m256 vAcc = _mm256_mul_ps(w0, _mm256_loadu_ps(x + 0));
+                        vAcc = _mm256_add_ps(vAcc, _mm256_mul_ps(w1, _mm256_loadu_ps(x + 8)));
+                        vAcc = _mm256_add_ps(vAcc, _mm256_mul_ps(w2, _mm256_loadu_ps(x + 16)));
+                        vAcc = _mm256_add_ps(vAcc, _mm256_mul_ps(w3, _mm256_loadu_ps(x + 24)));
+#endif
+                        __m128 s128 = _mm_add_ps(_mm256_castps256_ps128(vAcc),
+                                                 _mm256_extractf128_ps(vAcc, 1));
+                        s128 = _mm_hadd_ps(s128, s128);
+                        s128 = _mm_hadd_ps(s128, s128);
+                        const float sum = _mm_cvtss_f32(s128);
+                        acc[static_cast<size_t>(r) * seqLen + s] += d * sum;
+                    }
+                }
+            }
+
             for (uint32_t r = 0; r < batchSize; ++r) {
                 for (uint32_t s = 0; s < seqLen; ++s) {
                     out[static_cast<size_t>(s) * rows + rowStart + r] =

@@ -144,6 +144,17 @@ static void printTop(tinycoder::Tokenizer &tok, const std::string &label,
     std::cout << std::endl;
 }
 
+static void printTopPairs(tinycoder::Tokenizer &tok, const std::string &label,
+                          const std::vector<std::pair<float, int32_t>> &top) {
+    std::cout << "  " << label << ":";
+    for (const auto &kv: top) {
+        std::string text = tok.decodeToken(kv.second);
+        std::cout << " [" << kv.second << " " << text << " logit=" << kv.first
+                  << "]";
+    }
+    std::cout << std::endl;
+}
+
 // ---------------------------------------------------------------------------
 // GPU vs CPU logits comparison
 // ---------------------------------------------------------------------------
@@ -266,12 +277,15 @@ TEST_F(GPUCpuCompareTest, SequentialDecodeArgmaxAgrees) {
     // Per-step CPU top-5 reference (the corruption signal: a broken GPU engine
     // ranks EOG/chat-special tokens first, which never appear in the CPU's top-5).
     std::vector<std::vector<std::pair<float, int32_t>>> cpuTop5;
+    std::vector<std::vector<std::pair<float, int32_t>>> cpuTop10;
     cpuTop5.reserve(stream.size());
+    cpuTop10.reserve(stream.size());
     for (size_t i = 0; i < stream.size(); ++i) {
         auto logits = lastLogitRow(model->forward({stream[i]},
                                                   /*computeAllLogits=*/false));
         ASSERT_FALSE(logits.empty());
         cpuTop5.push_back(topN(logits, 5));
+        cpuTop10.push_back(topN(logits, 10));
         ASSERT_FALSE(cpuTop5[i].empty());
     }
 
@@ -279,9 +293,24 @@ TEST_F(GPUCpuCompareTest, SequentialDecodeArgmaxAgrees) {
     setenv("TINYCODER_GPU", "1", 1);
     model->clearKVCache();
     for (size_t i = 0; i < stream.size(); ++i) {
+        std::string piece = tokenizer.decodeToken(stream[i]);
+        std::cout << "\n-- step " << i << " (token " << stream[i] << " '" << piece
+                  << "') --" << std::endl;
         auto logits = lastLogitRow(model->forward({stream[i]},
                                                   /*computeAllLogits=*/false));
         ASSERT_FALSE(logits.empty());
+        // Logit magnitude/range check at this step (a collapsed GPU range is the
+        // signature of a broken GEMV/attention path).
+        float gMin = std::numeric_limits<float>::max(),
+              gMax = -std::numeric_limits<float>::max();
+        for (uint32_t v = 0; v < logits.size(); ++v) {
+            gMin = std::min(gMin, logits.get(v));
+            gMax = std::max(gMax, logits.get(v));
+        }
+        std::cout << "  GPU logit range: [" << gMin << ", " << gMax
+                  << "] (width " << (gMax - gMin) << ")" << std::endl;
+        printTopPairs(tokenizer, "CPU top-10", cpuTop10[i]);
+        printTop(tokenizer, "GPU top-10", logits, 10);
         auto gpuTop = topN(logits, 5);
         ASSERT_FALSE(gpuTop.empty());
 
@@ -306,6 +335,113 @@ TEST_F(GPUCpuCompareTest, SequentialDecodeArgmaxAgrees) {
                 << "Step " << i << " (token " << stream[i]
                 << "): GPU top-1=" << gpuTop[0].second
                 << " not among CPU top-5 (GPU distribution diverged - corruption?)";
+    }
+}
+
+/// @brief Kernel-level Q8K parity: run the GPU kQuantizeQ8K + kQGemvQ8K
+/// kernels on ONE real weight row and a deterministic activation, and compare
+/// against the CPU reference (matMulVecFusedQ8K, the path the CPU forward uses).
+/// This isolates the Q8K integer-dot kernels from the rest of the forward
+/// pass: a mismatch here means the GPU kernel itself diverges from llama's
+/// vec_dot_iq*_q8_K; a match here points the blame at the surrounding
+/// attention/KV-cache/layer plumbing instead.
+///
+/// Runs on the first `kRows` rows of layer-0 attnQ (IQ2_S), attnO (IQ3_S),
+/// ffnGate (IQ3_XXS) -- the three quant types that use the Q8K decode path.
+TEST_F(GPUCpuCompareTest, Q8KKernelParityWithCPU) {
+    if (!tinycoder::gpu::gpuEnabled()) {
+        GTEST_SKIP() << "GPU disabled ($TINYCODER_GPU=0) or no CUDA device";
+    }
+    tinycoder::Model *model = SharedTestEnv::model;
+    const auto &layers = model->debugGetLayers();
+    ASSERT_FALSE(layers.empty());
+
+    // Standalone GPUModel: only debugQ8KRow is used (no upload() call), and the
+    // default-constructed instance's destructor early-returns on !allocated_, so
+    // it is safe to stack-allocate.
+    tinycoder::gpu::GPUModel gm;
+    struct MatrixRef {
+        const char *name;
+        uint32_t type;
+        const tinycoder::AlignedVector<uint8_t> *data;
+        uint32_t rows, cols;
+    };
+    std::vector<MatrixRef> mats;
+    if (!layers[0].attnQ.empty() && layers[0].attnQ.type == GGML_TYPE_IQ2_S) {
+        mats.push_back({"L0 attnQ (IQ2_S)", layers[0].attnQ.type,
+                        &layers[0].attnQ.data, layers[0].attnQ.rows,
+                        layers[0].attnQ.cols});
+    }
+    if (!layers[0].attnO.empty() && layers[0].attnO.type == GGML_TYPE_IQ3_S) {
+        mats.push_back({"L0 attnO (IQ3_S)", layers[0].attnO.type,
+                        &layers[0].attnO.data, layers[0].attnO.rows,
+                        layers[0].attnO.cols});
+    }
+    if (!layers[0].ffnGate.empty() &&
+        layers[0].ffnGate.type == GGML_TYPE_IQ3_XXS) {
+        mats.push_back({"L0 ffnGate (IQ3_XXS)", layers[0].ffnGate.type,
+                        &layers[0].ffnGate.data, layers[0].ffnGate.rows,
+                        layers[0].ffnGate.cols});
+    }
+    if (mats.empty()) {
+        GTEST_SKIP() << "Model lacks the Q8K decode types (expected "
+                        "IQ3_XXS-imat layout: attnQ=IQ2_S, attnO=IQ3_S, "
+                        "ffnGate=IQ3_XXS); skipping kernel parity "
+                        "regression guard";
+    }
+
+    constexpr uint32_t kBlock = 256;
+    constexpr uint32_t kRows = 48;
+
+    // Deterministic, non-degenerate activation vector (scaled soft-sines with
+    // several sign changes; a "plain" spread would mask kernel bugs behind the
+    // dominant term).  Same vector for every matrix (each is Q8K-quantized
+    // independently on both sides).  Size = the first matrix's input width
+    // (hidden size for attnQ/attnO, intermediate for ffnGate).
+    std::vector<float> x(mats[0].cols);
+    for (uint32_t i = 0; i < x.size(); ++i) {
+        const double t = static_cast<double>(i);
+        x[i] = 0.9f * std::sin(0.021 * t) + 0.35f * std::cos(0.0037 * t) +
+               0.15f * std::sin(0.1103 * t + 0.7);
+    }
+
+    for (const auto &m: mats) {
+        SCOPED_TRACE(m.name);
+        const uint32_t blocksPerRow = (m.cols + kBlock - 1) / kBlock;
+        const uint32_t typeSize = m.type == GGML_TYPE_IQ2_S     ? 82
+                                  : m.type == GGML_TYPE_IQ3_XXS ? 98
+                                                                : 110;
+        for (uint32_t r = 0; r < std::min<uint32_t>(kRows, m.rows); ++r) {
+            // Weight pointer offset to row r (rows are contiguous in data).
+            const uint8_t *rowData = m.data->data() +
+                                     static_cast<size_t>(r) * blocksPerRow * typeSize;
+            // CPU reference: the same Q8K integer dot the CPU forward uses.
+            std::vector<float> cpuOut(1);
+            tinycoder::GGMLDequantize::matMulVecFusedQ8K(
+                    m.type, rowData, x.data(), 1, m.cols, cpuOut.data());
+            // GPU: kQuantizeQ8K on x + kQGemvQ8K on row r.
+            float gpuOut =
+                    gm.debugQ8KRow(m.type, rowData, blocksPerRow, x.data(), m.cols);
+            // Q8K quantization is integer-exact on both sides; only the final
+            // float d*bsum rounding can differ (~1-2 ulp of the accumulated
+            // value, which is typically O(1)).  Near-zero cpu outputs inflate a
+            // purely relative bound, so use an absolute cap of 1e-5 (well above
+            // a 2-ulp rounding of a ~50-magnitude sum) plus a loose relative
+            // cap for large values.  Any divergence larger than this is a real
+            // kernel bug (like the pre-fix IQ3_S grid2 byte-extraction error,
+            // which produced relErr 0.3..34).
+            const float absErr = std::fabs(gpuOut - cpuOut[0]);
+            const float relErr = absErr / (std::fabs(cpuOut[0]) + 1e-3f);
+            if (r == 0 || absErr > 1e-5f) {
+                std::cout << "[Q8K parity] " << m.name << " row=" << r
+                          << ": cpu=" << cpuOut[0] << " gpu=" << gpuOut
+                          << " absErr=" << absErr << " relErr=" << relErr
+                          << std::endl;
+            }
+            EXPECT_TRUE(absErr < 1e-5f || relErr < 1e-4f)
+                    << "GPU kQGemvQ8K diverges from CPU matMulVecFusedQ8K on "
+                    << m.name << " row " << r;
+        }
     }
 }
 
