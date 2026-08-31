@@ -8,3 +8,4 @@ std::string SharedTestEnv::modelPath;
 tinycoder::Model *SharedTestEnv::model = nullptr;
 bool SharedTestEnv::modelLoaded = false;
 tinycoder::ModelConfig SharedTestEnv::config;
+bool SharedTestEnv::warmedUp = false;

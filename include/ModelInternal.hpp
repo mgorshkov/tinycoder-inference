@@ -55,6 +55,24 @@ SOFTWARE.
 
 namespace tinycoder::detail {
 
+    /// @brief Whether a qwen35 layer is a recurrent (gated-delta-net) layer.
+    ///
+    /// Mirrors llama.cpp's qwen35 logic: with `full_attention_interval` = F,
+    /// layers where `(i+1) % F == 0` are full-attention; all other layers
+    /// (inside the real layer range, i.e. excluding the MTP block) are
+    /// recurrent. The MTP block (layer >= n_layer) is always full-attention.
+    inline bool isQwen35RecurrentLayer(const ModelConfig &cfg, uint32_t layer) {
+        if (cfg.architecture != ARCH_QWEN35 &&
+            cfg.architecture != ARCH_QWEN35MOE) {
+            return false;
+        }
+        uint32_t nLayer = cfg.numLayers - cfg.nextnPredictLayers;
+        if (layer >= nLayer) return false;// MTP block: full attention
+        uint32_t interval = cfg.fullAttentionInterval > 0 ? cfg.fullAttentionInterval : 4;
+        return (layer + 1) % interval != 0;
+    }
+
+
     // ---------------------------------------------------------------------
     // Temporary prefill profiler (P2 investigation). Gated by TINYCODER_PROFILE
     // env var; prints accumulated wall time per named stage at process exit.

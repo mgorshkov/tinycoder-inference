@@ -181,6 +181,9 @@ int main(int argc, char **argv) {
             opt.modelPath = "/data/models/qwen/qwen2.5-coder-1.5b-instruct-q2_k.gguf";
         }
     }
+    if (opt.modelPath.empty()) {
+        opt.modelPath = "/data/models/qwen/qwen2.5-coder-1.5b-instruct-q2_k.gguf";
+    }
 #ifdef USE_CUDA
     // --gpu: force the CUDA offload engine on (the default in CUDA builds;
     // this also overrides a TINYCODER_GPU=0 opt-out e.g. for a CPU baseline).
@@ -219,14 +222,20 @@ int main(int argc, char **argv) {
                  opt.nPrompts, opt.nGen, opt.reps, threads);
 
     // ---- Warmup rep (llama-bench runs a warmup batch first) ----
+    // The warmup is the COLD first-touch pass (page cache miss): on a 35 GB
+    // qwen35moe model in <35 GB RAM it is 15-23x slower than the warm reps and
+    // matches the COLD numbers the question tests used to report — the exact
+    // mismatch ([bench-parity] below reconciles the two harnesses).
+    double coldTg = 0.0, coldPp = 0.0;
     {
         double prefillMs = 0.0;
         auto r = runOneRep(model, prompt, opt.nGen, prefillMs, vocab);
+        coldTg = r.tokens / (r.ms / 1000.0);
+        coldPp = opt.nPrompts / (prefillMs / 1000.0);
         std::fprintf(stderr,
-                     "  warmup: %d tg tok in %.1f ms (%.1f tg tok/s); prefill %d tok "
-                     "in %.1f ms (%.1f pp tok/s)\n",
-                     r.tokens, r.ms, r.tokens / (r.ms / 1000.0), opt.nPrompts,
-                     prefillMs, opt.nPrompts / (prefillMs / 1000.0));
+                     "  warmup (COLD): %d tg tok in %.1f ms (%.1f tg tok/s); "
+                     "prefill %d tok in %.1f ms (%.1f pp tok/s)\n",
+                     r.tokens, r.ms, coldTg, opt.nPrompts, prefillMs, coldPp);
     }
 
     // ---- Measured reps ----
@@ -275,6 +284,18 @@ int main(int argc, char **argv) {
                 "pp%d | %.1f +/- %.1f tok/s | %.1f ms (mean)\n",
                 opt.nGen, static_cast<int>(threads), mean, stdev, meanMs,
                 opt.nPrompts, meanPp, 0.0, meanPrefillMs);
+
+    // Bench-parity summary: the two harnesses (this bench and the gtest
+    // question tests) intentionally report the SAME quantity — decode-only
+    // tg tok/s — with the cache state made explicit.  The question tests
+    // warm the page cache once (SharedTestEnv) and emit
+    //   [bench-parity] generation N tok @ X tg tok/s (...warm/cold)
+    // so bench-warm should match test-warm within measurement noise.
+    std::printf(
+            "[bench-parity] pp %d tok @ %.2f tok/s (cold warmup) || %.2f +/- %.2f "
+            "tok/s (warm reps) || tg %d tok @ %.2f tok/s (cold warmup) || "
+            "%.2f +/- %.2f tok/s (warm reps)\n",
+            opt.nPrompts, coldPp, meanPp, 0.0, opt.nGen, coldTg, mean, stdev);
 
     return 0;
 }
