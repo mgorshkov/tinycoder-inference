@@ -180,6 +180,15 @@ namespace tinycoder {
         /// @brief Clear the GPU KV cache (called by clearKVCache()).
         void gpuClearKV();
 
+        /// @brief Number of layers the GPU owns (0 = none/full-CPU).  Used by
+        /// the partial-offload continuation to know where the CPU starts.
+        uint32_t gpuNGpuLayers() const;
+
+        /// @brief Copy the GPU hidden state (after the offloaded layer prefix)
+        /// back to the host for the CPU continuation (partial offload).
+        bool gpuCopyHiddenOut(float *hiddenOut, uint32_t seqLen,
+                              std::string *errMsg = nullptr);
+
         /// @brief Tear down GPU resources (called by ~Model).
         void gpuShutdown();
 
@@ -222,7 +231,11 @@ namespace tinycoder {
             np::Array<float> attnKBias;// nKVHeads * headDim
             np::Array<float> attnVBias;// nKVHeads * headDim
 
-            // ---- Gemma4-specific: Q/K norms, post norms, layer scale ----
+            // ---- Shared Q/K per-head norms + post norms ----
+            // Used by Gemma4 (attn_q_norm/attn_k_norm, post_attention_norm/
+            // post_ffw_norm, layer_output_scale) and Qwen35 full-attention
+            // layers (attn_q_norm/attn_k_norm per-head RMSNorm before MRoPE,
+            // post_attention_norm after the attention block).
             np::Array<float> attnQNorm;       // headDim (QK RMSNorm before RoPE)
             np::Array<float> attnKNorm;       // headDim (QK RMSNorm before RoPE)
             np::Array<float> postAttnNorm;    // hiddenSize (post-attention norm)
@@ -243,6 +256,26 @@ namespace tinycoder {
             np::Array<float> attnQNormMoe;// headDim (Q norm for Qwen35MoE)
             np::Array<float> attnKNormMoe;// headDim (K norm for Qwen35MoE)
 
+            // ---- Qwen35 (dense) specific: full-attention layers ----
+            // attn_q projects BOTH the query and the gating signal (see llama.cpp
+            // qwen35 build_layer_attn): the first half of each head's slice is Q,
+            // the second half is the gating gate (used with a sigmoid). Q and K get
+            // per-head RMSNorm (attn_q_norm / attn_k_norm) before MRoPE (using the
+            // shared attnQNorm/attnKNorm fields declared above).
+
+            // ---- Qwen35 (dense) specific: recurrent (gated delta net) layers ----
+            // ssmConv1d is [ssmConvKernel, convChannels] where
+            //   convChannels = 2*kHeadDim*nGroup + dInner; the existing ssmConv1d
+            //   QuantizedMatrix is used as F32.
+            // ssmOut projects [dInner] -> [hiddenSize]; ssm_beta/ssm_alpha are
+            // [hiddenSize x nVHeads] (nVHeads = ssmTimeStepRank).
+            np::Array<float> ssmABroadcast;// nVHeads (decay per value head, a = -exp(ssmA))
+            np::Array<float> ssmDtBiasFull;// nVHeads (ssm_dt.bias, dense qwen35)
+            // ssm_beta / ssm_alpha are [hiddenSize x nVHeads] matmuls (unlike
+            // qwen35moe which stores them as 1D F32). nVHeads = ssmTimeStepRank.
+            QuantizedMatrix ssmBetaQ; // hiddenSize x nVHeads
+            QuantizedMatrix ssmAlphaQ;// hiddenSize x nVHeads
+
             // ---- Qwen35MoE: SSM (Mamba-style) ----
             QuantizedMatrix ssmConv1d; // ssmInnerSize x ssmConvKernel
             QuantizedMatrix ssmOut;    // ssmInnerSize x hiddenSize
@@ -253,7 +286,11 @@ namespace tinycoder {
             np::Array<float> ssmNorm;  // ssmInnerSize
 
             // ---- Qwen35MoE: MoE FFN ----
-            QuantizedMatrix ffnGateInpMoe;  // hiddenSize x expertCount (router)
+            QuantizedMatrix ffnGateInpMoe;// hiddenSize x expertCount (router)
+            // Fused gate+up experts (llama ffn_gate_up_exps): rows per expert =
+            // expertFF*2; rows [e*ff*2, e*ff*2+ff) = gate, [e*ff*2+ff, (e+1)*ff*2)
+            // = up.  Empty when the GGUF stores separate gate/up tensors.
+            QuantizedMatrix ffnGateUpExpsMoe;
             QuantizedMatrix ffnGateExps;    // expertCount x expertFF x hiddenSize
             QuantizedMatrix ffnUpExps;      // expertCount x expertFF x hiddenSize
             QuantizedMatrix ffnDownExpsMoe; // expertCount x hiddenSize x expertFF
@@ -353,6 +390,11 @@ namespace tinycoder {
         /// @brief Debug: get const reference to layer weights.
         const std::vector<LayerWeights> &debugGetLayers() const { return layers_; }
 
+        /// @brief Debug: get the final RMSNorm weights (hiddenSize floats).
+        const float *debugFinalNorm() const {
+            return finalNorm_.empty() ? nullptr : finalNorm_.data();
+        }
+
         /// @brief Debug: get the quantized separate LM head matrix (empty if tied).
         const QuantizedMatrix &debugGetLMHead() const { return lmHead_; }
 
@@ -410,6 +452,39 @@ namespace tinycoder {
         std::pair<std::vector<std::vector<float>>, std::vector<float>>
         forwardTokenByToken(const std::vector<int32_t> &tokens);
 
+        /// @brief Debug: run qwen35 token-by-token (exactly the shared math of
+        /// forward()) and snapshot the hidden state after EVERY layer for the
+        /// LAST processed token. Used to localize where SIMD-vs-scalar drift
+        /// first appears and to detect hidden-state norm pathologies (explosion
+        /// / collapse) that indicate a shared-math bug rather than kernel noise.
+        /// @param tokens Input token IDs
+        /// @return per-layer hidden states (after each layer's FFN residual),
+        ///         vector of nLayers vectors, each of size hiddenSize.
+        ///         Obeys the TINYCODER_FORCE_SCALAR / setForceScalarForTest flag.
+        std::vector<std::vector<float>>
+        debugQwen35PerLayer(const std::vector<int32_t> &tokens);
+
+        /// @brief Debug: fingerprint layer-0 recurrent intermediates for a
+        /// token sequence (mirrors llama_ref_probe captures; the fingerprint
+        /// corresponds to the LAST token of the sequence exactly like the
+        /// probe's always-overwrite intm map). Each entry is {name, values}:
+        /// attn_norm, linear_attn_qkv_mixed, z, beta_sigmoid, a_softplus,
+        /// gate, conv_output_raw, conv_output_silu, q_conv_predelta,
+        /// k_conv_predelta, v_conv_predelta, attn_output, final_output,
+        /// linear_attn_out, attn_residual, attn_post_norm, ffn_out, post_ffn.
+        std::vector<std::pair<std::string, std::vector<float>>>
+        debugQwen35Layer0Intm(const std::vector<int32_t> &tokens);
+
+        /// @brief Debug: fingerprint layer-0 intermediates for a qwen2 token
+        /// sequence, mirroring llama_ref_probe's [ar] captures (last token
+        /// of the sequence wins, exactly like the probe's intm map). Uses the
+        /// SAME math as forwardWithPerLayerStates (rpmsNormInPlace/
+        /// matMulVec/deqMatMulVecF16 + attentionFused). Entries: attn_norm-0,
+        /// Qcur-0, Kcur-0, Vcur-0, attn_out-0, attn_proj-0, ffn_inp-0,
+        /// ffn_norm-0, ffn_gate-0, ffn_up-0, ffn_silu-0, ffn_out-0, l_out-0.
+        std::vector<std::pair<std::string, std::vector<float>>>
+        debugQwen2Layer0Intm(const std::vector<int32_t> &tokens);
+
         /// @brief Estimate memory required to load the model from a GGUF file.
         /// @param modelPath Path to the GGUF file
         /// @return Estimated memory in bytes, or 0 if file cannot be read
@@ -458,6 +533,22 @@ namespace tinycoder {
                               uint32_t seqLen, uint32_t hiddenSize,
                               uint32_t intermediateSize,
                               const LayerWeights &w) const;
+
+        /// @brief Compute the ROUTED top-k expert FFN for Qwen35MoE: CPU-side
+        /// ROUTER (fp32 ffnGateInpMoe @ ffnNorm — reference math, bit-identical
+        /// for batch AND single-token prefills) + softmax + top-k +
+        /// renormalization + the 8 routed experts (NO shared expert — that
+        /// runs on the GPU in the hybrid CPU-expert mode).
+        /// The expert FFN parallelizes over (token, expert-rank) pairs via the
+        /// ThreadPool so even single-token decode uses all 8 threads.
+        /// @param ffnNorm Post-attn RMSNorm input (seqLen * hiddenSize)
+        /// @param ffnOut output (seqLen * hiddenSize)
+        /// @param seqLen number of tokens
+        /// @param hiddenSize hidden dimension
+        /// @param w Layer weights containing the expert tensors
+        void computeQwen35MoEFromLogits(const float *ffnNorm, float *ffnOut,
+                                        uint32_t seqLen, uint32_t hiddenSize,
+                                        const LayerWeights &w) const;
 
     private:
         // ---- Model weights (stored in native quantized format) ----
@@ -550,6 +641,15 @@ namespace tinycoder {
             std::vector<std::vector<float>> ssmConvBuf;
             // ssmState: [numLayers][ssmInnerSize * ssmStateSize] (SSM hidden state)
             std::vector<std::vector<float>> ssmState;
+
+            // ---- Qwen35 (dense, gated delta net) recurrent state ----
+            // conv_state: [numLayers][(ssmConvKernel-1) * convChannels] where
+            //   convChannels = 2*ssmStateSize*ssmGroupCount + ssmInnerSize
+            std::vector<std::vector<float>> q35ConvState;
+            // gdn_state: [numLayers][ssmInnerSize * (ssmInnerSize/nVHeads)] flattened
+            //   gated-delta state — per value-head a square matrix of size
+            //   headV = ssmInnerSize / ssmTimeStepRank (128x128 for Qwen3.8-27B).
+            std::vector<std::vector<float>> q35GdnState;
         };
         KVCache kvCache_;
 
@@ -620,6 +720,33 @@ namespace tinycoder {
             std::vector<float> ssmConvOut;
             std::vector<float> ssmConvInput;
             std::vector<float> ssmOut;
+
+            // ---- Qwen35 (dense gated delta net) temporaries ----
+            // qkvMixed: [seqLen, 2*kHeadDim*nKHeads + dInner] (attn_qkv output)
+            std::vector<float> q35QkvMixed;
+            // z: [seqLen, dInner] (attn_gate output)
+            std::vector<float> q35Z;
+            // beta: [seqLen, nVHeads]; alpha: [seqLen, nVHeads]; gatePerHead: [seqLen, nVHeads]
+            std::vector<float> q35Beta;
+            std::vector<float> q35Alpha;
+            std::vector<float> q35Gate;
+            // conv input: [convKernel + seqLen - 1, convChannels]
+            std::vector<float> q35ConvInput;
+            // conv output: [seqLen, convChannels] (post-silu, split into q/k/v)
+            std::vector<float> q35ConvOut;
+            // q/k/v convolved: [seqLen, nKHeads * headK] / [seqLen, nVHeads * headV]
+            std::vector<float> q35Q;
+            std::vector<float> q35K;
+            std::vector<float> q35V;
+            // gated delta net state scratch: [nVHeads, headV, headV]
+            std::vector<float> q35StateScratch;
+            // attn_out per token: [nVHeads * headV]
+            std::vector<float> q35AttnOut;
+            // l2-normalized q/k temporaries (per head slice)
+            std::vector<float> q35NormScratch;
+            // gated rmsnorm output: [seqLen, dInner]
+            std::vector<float> q35NormOut;
+            std::vector<float> q35FinalOut;
         };
 
         /// @brief Get the per-thread scratch pool for the calling thread.
@@ -703,6 +830,54 @@ namespace tinycoder {
                                    const float *hidden, int32_t pruneTopK,
                                    const std::vector<int32_t> *forceInclude,
                                    float *logitsOut);
+
+        /// @brief Process one Qwen35 layer (dense gated delta net + full
+        /// attention hybrid + MTP block). Implements the exact qwen35.cpp graph:
+        ///   rmsNorm(attn_norm) -> (recurrent | full-attention) block
+        ///   -> residual add -> rmsNorm(post_attention_norm) -> SwiGLU FFN
+        ///   -> residual add (to the pre-post-norm tensor).
+        /// Handles the fused Q+gate projection, per-head Q/K norms, MRoPE
+        /// (sections-based, n_rot=64) and the gated delta net recurrence.
+        void forwardQwen35Layer(uint32_t layer, float *hidden, float *attnNorm,
+                                float *attnProj, float *q, float *k, float *v,
+                                float *attnOut, float *gate, float *up,
+                                float *ffnNorm, float *ffnOut, uint32_t seqLen,
+                                uint32_t hiddenSize, uint32_t nHeads,
+                                uint32_t nKVHeads, uint32_t headDim,
+                                uint32_t intermediateSize);
+
+        /// @brief Apply MRoPE (Multi-section RoPE) to Q/K for one head tensor of
+        /// a full-attention qwen35 layer. Mirrors ggml_mrope_cache_init with
+        /// sections [11,11,10,0], all theta bases equal (freq_base), and
+        /// rotate_pairs(NEOX-style, n_dims=n_rot=64).
+        void applyMRoPE(float *q, float *k, uint32_t qSeqLen, uint32_t kSeqLen,
+                        uint32_t qHeads, uint32_t kHeads, uint32_t pos);
+
+        /// @brief Process one full-attention qwen35 layer: fused Q+G projection
+        /// (attn_q, first headDim of each 2*headDim head slice is Q, second is
+        /// the gate), shared per-head Q/K RMSNorm weights (attn_q_norm /
+        /// attn_k_norm, [headDim] applied to every head), MRoPE, attention
+        /// (kq_scale = 1/sqrt(headDim)), elementwise sigmoid(gate), attn_output
+        /// projection and residual add. Mirrors llama.cpp qwen35 build_layer_attn.
+        void forwardQwen35FullAttention(uint32_t layer, const LayerWeights &w,
+                                        float *hidden, float *attnNorm, float *q,
+                                        float *k, float *v, float *attnOut,
+                                        float *qGate, float *attnProj,
+                                        uint32_t seqLen, uint32_t hiddenSize,
+                                        uint32_t nHeads, uint32_t nKVHeads,
+                                        uint32_t headDim);
+
+        /// @brief Process one recurrent (gated delta net) qwen35 layer: attn_qkv,
+        /// attn_gate (z), ssm_beta/ssm_alpha/ssm_dt/ssm_a (gate/decay), conv1d
+        /// with silu, L2-norm'ed q/k repeated over value heads (periodic
+        /// hv % nKHeads), the gated delta net recurrence (per value-head
+        /// [headV, headV] state M stored transposed: M[j][i] = S[i][j]), gated
+        /// RMSNorm with silu(z), ssm_out projection and residual add. Mirrors
+        /// llama.cpp qwen35 build_layer_attn_linear + ggml gated_delta_net.
+        void forwardQwen35Recurrent(uint32_t layer, const LayerWeights &w,
+                                    float *hidden, float *attnNorm,
+                                    float *attnProj, uint32_t seqLen,
+                                    uint32_t hiddenSize);
 
         /// @brief Apply Q/K norms (per-head RMSNorm before RoPE).
         /// Used by Gemma4 and Qwen35MoE architectures.

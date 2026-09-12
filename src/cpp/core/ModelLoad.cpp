@@ -140,7 +140,7 @@ namespace tinycoder {
         if (!isSupportedArchitecture(config_.architecture)) {
             setError("Unsupported model architecture: \"" + config_.architecture +
                      "\". Supported architectures: " + ARCH_QWEN2 + ", " +
-                     ARCH_GEMMA4 + ", " + ARCH_QWEN35MOE);
+                     ARCH_GEMMA4 + ", " + ARCH_QWEN35MOE + ", " + ARCH_QWEN35);
             return false;
         }
 
@@ -180,6 +180,15 @@ namespace tinycoder {
         if (!tokenizer_.loadFromGGUF(modelPath)) {
             std::cerr << "[TinyCoder] Failed to load tokenizer, using embedded data"
                       << std::endl;
+        }
+
+        // Sync vocab size to the tokenizer's actual vocabulary. Some GGUF
+        // writers (e.g. Unsloth Qwen3.8-27B-UD) omit tokenizer.ggml.vocab_size,
+        // leaving the Qwen2.5-Coder default here; the real vocab count comes
+        // from tokenizer.ggml.tokens (which matches token_embd.weight rows /
+        // output.weight rows = the LM head width).
+        if (tokenizer_.vocabSize() > 0) {
+            config_.vocabSize = static_cast<uint32_t>(tokenizer_.vocabSize());
         }
 
         reportProgress(0.25f, "Loading model weights...");
@@ -276,7 +285,11 @@ namespace tinycoder {
         auto loadQuantized = [&](const std::string &name) -> QuantizedMatrix {
             auto info = loader.getTensorInfo(name);
             if (!info) {
-                std::cerr << "[TinyCoder] Tensor info not found: " << name << std::endl;
+                // Optional tensors are probed across all layers (e.g. the
+                // qwen35 MTP `nextn.*` block exists only in models that were
+                // exported with multi-token prediction; Qwen3.6-27B-Q5_K_M has
+                // none).  A missing optional tensor is normal, so stay quiet —
+                // required tensors are validated by the callers that need them.
                 return QuantizedMatrix{};
             }
 
@@ -621,69 +634,146 @@ namespace tinycoder {
                     return false;
                 }
             } else if (config_.architecture == ARCH_QWEN35MOE) {
-                // ---- Qwen35MoE architecture (MoE + SSM + MTP) ----
-                // Quantized attention weights (separate Q, K, V)
-                layers_[i].attnQ = loadQuantized(prefix + "attn_q.weight");
-                layers_[i].attnK = loadQuantized(prefix + "attn_k.weight");
-                layers_[i].attnV = loadQuantized(prefix + "attn_v.weight");
-                layers_[i].attnO = loadQuantized(prefix + "attn_output.weight");
+                // ---- Qwen35MoE architecture (gated delta net + MoE FFN) ----
+                // Layer types (llama.cpp qwen35moe.cpp):
+                //   - Recurrent (gated delta net): (i+1) % fullAttentionInterval != 0
+                //     tensors: attn_qkv, attn_gate, ssm_conv1d, ssm_a, ssm_alpha,
+                //              ssm_beta, ssm_dt.bias, ssm_norm, ssm_out
+                //   - Full attention: (i+1) % fullAttentionInterval == 0
+                //     tensors: attn_q (Q+gate fused), attn_k, attn_v, attn_output,
+                //              attn_q_norm, attn_k_norm
+                // Routed experts: ffn_gate_inp (router), ffn_gate_exps/ffn_up_exps
+                //   (or fused ffn_gate_up_exps) + ffn_down_exps, plus gated shared
+                //   expert ffn_*_shexp + ffn_gate_inp_shexp.
+                const bool isRecurrent = detail::isQwen35RecurrentLayer(config_, i);
 
-                // Dequantize attnO to FP16 for exact float dot product (halves memory bandwidth vs F32)
-                {
-                    auto &qm = layers_[i].attnO;
-                    uint64_t numElements = static_cast<uint64_t>(qm.rows) * qm.cols;
-                    layers_[i].attnO_deq_f16 = GGMLDequantize::dequantizeToF16(qm.type, qm.data.data(), numElements);
-                }
-
-                // Fused QKV projection (optional, may not be present in all layers)
-                layers_[i].attnQKV = loadQuantized(prefix + "attn_qkv.weight");
-
-                // Attention gate (element-wise gating for attention output)
-                layers_[i].attnGate = loadQuantized(prefix + "attn_gate.weight");
-
-                // Q/K norms (RMSNorm before RoPE)
-                layers_[i].attnQNormMoe = loadF32_1D(prefix + "attn_q_norm.weight");
-                layers_[i].attnKNormMoe = loadF32_1D(prefix + "attn_k_norm.weight");
-
-                // F32 norms
+                // Common norms
                 layers_[i].rmsNormAttn = loadF32_1D(prefix + "attn_norm.weight");
                 layers_[i].postAttnNorm = loadF32_1D(prefix + "post_attention_norm.weight");
 
-                // ---- SSM (Mamba-style) weights ----
-                layers_[i].ssmConv1d = loadQuantized(prefix + "ssm_conv1d.weight");
-                layers_[i].ssmOut = loadQuantized(prefix + "ssm_out.weight");
-                layers_[i].ssmA = loadF32_1D(prefix + "ssm_a");
-                layers_[i].ssmDtBias = loadF32_1D(prefix + "ssm_dt.bias");
-                layers_[i].ssmAlpha = loadF32_1D(prefix + "ssm_alpha.weight");
-                layers_[i].ssmBeta = loadF32_1D(prefix + "ssm_beta.weight");
-                layers_[i].ssmNorm = loadF32_1D(prefix + "ssm_norm.weight");
-
-                // ---- MoE FFN weights ----
-                // Expert router
+                // ---- MoE FFN weights (routed experts) ----
                 layers_[i].ffnGateInpMoe = loadQuantized(prefix + "ffn_gate_inp.weight");
-                // Expert weights (gate, up, down)
-                layers_[i].ffnGateExps = loadQuantized(prefix + "ffn_gate_exps.weight");
-                layers_[i].ffnUpExps = loadQuantized(prefix + "ffn_up_exps.weight");
+                // llama prefers the fused ffn_gate_up_exps (TENSOR_NOT_REQUIRED); falls
+                // back to separate ffn_gate_exps + ffn_up_exps.  When fused, the
+                // compute path slices rows [e*ff*2, e*ff*2+ff) as gate and
+                // [e*ff*2+ff, (e+1)*ff*2) as up from ffnGateUpExpsMoe.
+                layers_[i].ffnGateUpExpsMoe = loadQuantized(prefix + "ffn_gate_up_exps.weight");
+                if (layers_[i].ffnGateUpExpsMoe.empty()) {
+                    layers_[i].ffnGateExps = loadQuantized(prefix + "ffn_gate_exps.weight");
+                    layers_[i].ffnUpExps = loadQuantized(prefix + "ffn_up_exps.weight");
+                }
                 layers_[i].ffnDownExpsMoe = loadQuantized(prefix + "ffn_down_exps.weight");
 
-                // Shared expert weights
+                // Shared expert weights + router (sigmoid gate)
                 layers_[i].ffnGateInpShexp = loadQuantized(prefix + "ffn_gate_inp_shexp.weight");
                 layers_[i].ffnGateShexp = loadQuantized(prefix + "ffn_gate_shexp.weight");
                 layers_[i].ffnUpShexp = loadQuantized(prefix + "ffn_up_shexp.weight");
                 layers_[i].ffnDownShexp = loadQuantized(prefix + "ffn_down_shexp.weight");
+
+                if (isRecurrent) {
+                    // ---- Gated delta net (linear attention) tensors ----
+                    layers_[i].attnQKV = loadQuantized(prefix + "attn_qkv.weight");
+                    layers_[i].attnGate = loadQuantized(prefix + "attn_gate.weight");
+                    layers_[i].ssmConv1d = loadQuantized(prefix + "ssm_conv1d.weight");// F32 [4, 8192]
+                    layers_[i].ssmABroadcast = loadF32_1D(prefix + "ssm_a");
+                    layers_[i].ssmAlphaQ = loadQuantized(prefix + "ssm_alpha.weight");// F32 [2048, 32]
+                    layers_[i].ssmBetaQ = loadQuantized(prefix + "ssm_beta.weight");  // F32 [2048, 32]
+                    layers_[i].ssmDtBiasFull = loadF32_1D(prefix + "ssm_dt.bias");
+                    layers_[i].ssmNorm = loadF32_1D(prefix + "ssm_norm.weight");// [headV]
+                    layers_[i].ssmOut = loadQuantized(prefix + "ssm_out.weight");
+
+                    if (layers_[i].attnQKV.empty() || layers_[i].attnGate.empty() ||
+                        layers_[i].ssmConv1d.empty() || layers_[i].ssmOut.empty()) {
+                        std::cerr << "[TinyCoder] Missing recurrent tensors for layer "
+                                  << i << std::endl;
+                        return false;
+                    }
+                } else {
+                    // ---- Full-attention tensors ----
+                    layers_[i].attnQ = loadQuantized(prefix + "attn_q.weight");// Q+gate fused
+                    layers_[i].attnK = loadQuantized(prefix + "attn_k.weight");
+                    layers_[i].attnV = loadQuantized(prefix + "attn_v.weight");
+                    layers_[i].attnO = loadQuantized(prefix + "attn_output.weight");
+                    layers_[i].attnQNorm = loadF32_1D(prefix + "attn_q_norm.weight");
+                    layers_[i].attnKNorm = loadF32_1D(prefix + "attn_k_norm.weight");
+
+                    if (layers_[i].attnQ.empty() || layers_[i].attnK.empty() ||
+                        layers_[i].attnV.empty() || layers_[i].attnO.empty()) {
+                        std::cerr << "[TinyCoder] Missing attention weights for layer "
+                                  << i << std::endl;
+                        return false;
+                    }
+                }
 
                 // ---- MTP (Multi-Token Prediction) weights ----
                 layers_[i].nextnEhProj = loadQuantized(prefix + "nextn.eh_proj.weight");
                 layers_[i].nextnEnorm = loadF32_1D(prefix + "nextn.enorm.weight");
                 layers_[i].nextnHnorm = loadF32_1D(prefix + "nextn.hnorm.weight");
                 layers_[i].nextnSharedHeadNorm = loadF32_1D(prefix + "nextn.shared_head_norm.weight");
+            } else if (config_.architecture == ARCH_QWEN35) {
+                // ---- Qwen35 architecture (dense: gated delta net + full attention) ----
+                //
+                // Layer types (llama.cpp qwen35.cpp):
+                //   - Recurrent (gated delta net): i < nLayer && (i+1) % interval != 0
+                //     tensors: attn_qkv, attn_gate, ssm_conv1d, ssm_a, ssm_alpha,
+                //              ssm_beta, ssm_dt.bias, ssm_norm, ssm_out
+                //   - Full attention: i < nLayer && (i+1) % interval == 0
+                //     tensors: attn_q (Q+gate fused), attn_k, attn_v, attn_output,
+                //              attn_q_norm, attn_k_norm
+                //   - MTP block (i >= nLayer): full attention + nextn.* (not run in
+                //     the main decode pass).
+                // All layers share attn_norm, post_attention_norm, ffn_gate/up/down.
+                const bool isRecurrent = detail::isQwen35RecurrentLayer(config_, i);
 
-                // Validate core tensors loaded
-                if (layers_[i].attnQ.empty() || layers_[i].attnK.empty() ||
-                    layers_[i].attnV.empty() || layers_[i].attnO.empty()) {
-                    std::cerr << "[TinyCoder] Missing attention weights for layer " << i
-                              << std::endl;
-                    return false;
+                // Common norms
+                layers_[i].rmsNormAttn = loadF32_1D(prefix + "attn_norm.weight");
+                layers_[i].postAttnNorm = loadF32_1D(prefix + "post_attention_norm.weight");
+
+                // Common FFN (SwiGLU): quantized path (no FP16/Q8_K prepacks here)
+                layers_[i].ffnGate = loadQuantized(prefix + "ffn_gate.weight");
+                layers_[i].ffnUp = loadQuantized(prefix + "ffn_up.weight");
+                layers_[i].ffnDown = loadQuantized(prefix + "ffn_down.weight");
+
+                if (isRecurrent) {
+                    // ---- Gated delta net (linear attention) tensors ----
+                    layers_[i].attnQKV = loadQuantized(prefix + "attn_qkv.weight");
+                    layers_[i].attnGate = loadQuantized(prefix + "attn_gate.weight");
+                    layers_[i].ssmConv1d = loadQuantized(prefix + "ssm_conv1d.weight");// F32 [4, 10240]
+                    layers_[i].ssmABroadcast = loadF32_1D(prefix + "ssm_a");
+                    layers_[i].ssmAlphaQ = loadQuantized(prefix + "ssm_alpha.weight");
+                    layers_[i].ssmBetaQ = loadQuantized(prefix + "ssm_beta.weight");
+                    layers_[i].ssmDtBiasFull = loadF32_1D(prefix + "ssm_dt.bias");
+                    layers_[i].ssmNorm = loadF32_1D(prefix + "ssm_norm.weight");
+                    layers_[i].ssmOut = loadQuantized(prefix + "ssm_out.weight");
+
+                    if (layers_[i].attnQKV.empty() || layers_[i].attnGate.empty() ||
+                        layers_[i].ssmConv1d.empty() || layers_[i].ssmOut.empty()) {
+                        std::cerr << "[TinyCoder] Missing recurrent tensors for layer "
+                                  << i << std::endl;
+                        return false;
+                    }
+                } else {
+                    // ---- Full-attention tensors (incl. MTP block) ----
+                    layers_[i].attnQ = loadQuantized(prefix + "attn_q.weight");
+                    layers_[i].attnK = loadQuantized(prefix + "attn_k.weight");
+                    layers_[i].attnV = loadQuantized(prefix + "attn_v.weight");
+                    layers_[i].attnO = loadQuantized(prefix + "attn_output.weight");
+                    layers_[i].attnQNorm = loadF32_1D(prefix + "attn_q_norm.weight");
+                    layers_[i].attnKNorm = loadF32_1D(prefix + "attn_k_norm.weight");
+
+                    // MTP (nextn) tensors (only present in the blk.<nLayer> block)
+                    layers_[i].nextnEhProj = loadQuantized(prefix + "nextn.eh_proj.weight");
+                    layers_[i].nextnEnorm = loadF32_1D(prefix + "nextn.enorm.weight");
+                    layers_[i].nextnHnorm = loadF32_1D(prefix + "nextn.hnorm.weight");
+                    layers_[i].nextnSharedHeadNorm =
+                            loadF32_1D(prefix + "nextn.shared_head_norm.weight");
+
+                    if (layers_[i].attnQ.empty() || layers_[i].attnK.empty() ||
+                        layers_[i].attnV.empty() || layers_[i].attnO.empty()) {
+                        std::cerr << "[TinyCoder] Missing full-attention tensors for layer "
+                                  << i << std::endl;
+                        return false;
+                    }
                 }
             } else {
                 std::cerr << "[TinyCoder] Unknown architecture: " << config_.architecture
@@ -705,6 +795,11 @@ namespace tinycoder {
         uint32_t nLayers = config_.numLayers;
         uint32_t nKVHeads = config_.numKVHeads;
         uint32_t headDim = config_.headDim;
+        // Qwen35 layers are hybrids: full-attention layers use the KV cache,
+        // recurrent (gated-delta-net) layers use the SSM/conv state. The KV
+        // cache for the recurrent layers is unused (they don't store K/V); only
+        // the full-attention layers (and the MTP block) read/write it. Allocate
+        // the full numLayers x maxSeq cache anyway to keep the indexing simple.
 
         uint64_t cacheMemBytes = static_cast<uint64_t>(nLayers) * maxSeq * nKVHeads *
                                  headDim * sizeof(float) * 2;
@@ -718,29 +813,43 @@ namespace tinycoder {
         kvCache_.v = np::Array<float>(np::Shape{nLayers, maxSeq, nKVHeads, headDim});
         kvCache_.pos = 0;
 
-        // Initialize SSM state for Qwen35MoE architecture
-        if (config_.architecture == ARCH_QWEN35MOE && config_.ssmInnerSize > 0) {
-            uint32_t ssmConvKernel = config_.ssmConvKernel;
-            uint32_t ssmStateSize = config_.ssmStateSize;
-            uint32_t ssmInnerSize = config_.ssmInnerSize;
-
-            kvCache_.ssmConvBuf.resize(nLayers);
-            kvCache_.ssmState.resize(nLayers);
+        // ---- Qwen35/Qwen35MoE (gated delta net) recurrent state ----
+        // Both architectures use the same GDN recurrence: per-layer conv state
+        // [(convKernel-1)*convChannels] and per-value-head square [headV, headV]
+        // GDN state.  Only recurrent layers allocate it.
+        if ((config_.architecture == ARCH_QWEN35 ||
+             config_.architecture == ARCH_QWEN35MOE) &&
+            config_.ssmInnerSize > 0 && config_.ssmConvKernel > 1) {
+            const uint32_t convChannels =
+                    2 * config_.ssmStateSize * config_.ssmGroupCount +
+                    config_.ssmInnerSize;
+            kvCache_.q35ConvState.resize(nLayers);
+            kvCache_.q35GdnState.resize(nLayers);
+            uint32_t headV = config_.ssmInnerSize / config_.ssmTimeStepRank;
+            uint32_t nRecurrent = 0;
             for (uint32_t i = 0; i < nLayers; ++i) {
-                // Conv buffer: store (ssmConvKernel - 1) past inputs, each of size ssmInnerSize
-                if (ssmConvKernel > 1) {
-                    kvCache_.ssmConvBuf[i].resize((ssmConvKernel - 1) * ssmInnerSize, 0.0f);
+                if (!detail::isQwen35RecurrentLayer(config_, i)) {
+                    continue;
                 }
-                // SSM state: ssmInnerSize x ssmStateSize
-                kvCache_.ssmState[i].resize(ssmInnerSize * ssmStateSize, 0.0f);
+                kvCache_.q35ConvState[i].assign(
+                        (config_.ssmConvKernel - 1) * convChannels, 0.0f);
+                // one square [headV, headV] state per value-head
+                kvCache_.q35GdnState[i].assign(
+                        static_cast<size_t>(config_.ssmTimeStepRank) *
+                                static_cast<size_t>(headV) * headV,
+                        0.0f);
+                ++nRecurrent;
             }
-
-            uint64_t ssmMemBytes = static_cast<uint64_t>(nLayers) * ssmInnerSize *
-                                   (ssmConvKernel + ssmStateSize) * sizeof(float);
-            std::cout << "[TinyCoder] SSM state: " << nLayers << " layers x "
-                      << ssmInnerSize << " inner x " << ssmStateSize << " state + "
-                      << ssmConvKernel << " conv = " << (ssmMemBytes / (1024 * 1024)) << " MB"
-                      << std::endl;
+            uint64_t memBytes =
+                    static_cast<uint64_t>(nRecurrent) *
+                    (static_cast<uint64_t>(config_.ssmConvKernel - 1) * convChannels +
+                     static_cast<uint64_t>(config_.ssmTimeStepRank) * headV * headV) *
+                    sizeof(float);
+            std::cout << "[TinyCoder] Qwen35 recurrent state: " << nRecurrent
+                      << " layers (conv " << config_.ssmConvKernel - 1 << "x"
+                      << convChannels << " + gdn " << config_.ssmTimeStepRank
+                      << "x" << headV << "x" << headV << ") = "
+                      << (memBytes / (1024 * 1024)) << " MB" << std::endl;
         }
 
         return true;
@@ -946,6 +1055,13 @@ namespace tinycoder {
             std::fill(buf.begin(), buf.end(), 0.0f);
         }
         for (auto &state: kvCache_.ssmState) {
+            std::fill(state.begin(), state.end(), 0.0f);
+        }
+        // Clear Qwen35 (dense gated delta net) recurrent state
+        for (auto &buf: kvCache_.q35ConvState) {
+            std::fill(buf.begin(), buf.end(), 0.0f);
+        }
+        for (auto &state: kvCache_.q35GdnState) {
             std::fill(state.begin(), state.end(), 0.0f);
         }
     }

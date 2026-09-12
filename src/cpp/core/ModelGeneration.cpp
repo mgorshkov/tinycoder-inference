@@ -50,7 +50,8 @@ namespace tinycoder {
         // token-for-token (Q1..Q4 = 43/40/42/48).
         auto applyLlamaWrap = [&](std::string s) -> std::string {
             if (addGenerationPrompt &&
-                (config_.architecture == ARCH_QWEN2 || config_.architecture == ARCH_QWEN35MOE)) {
+                (config_.architecture == ARCH_QWEN2 || config_.architecture == ARCH_QWEN35MOE ||
+                 config_.architecture == ARCH_QWEN35)) {
                 s = "<|im_start|>user\n$" + s + "<|im_end|>\n<|im_start|>assistant\n";
             }
             return s;
@@ -69,7 +70,7 @@ namespace tinycoder {
                 }
                 return result;
             } else {
-                // Qwen2 / Qwen35MoE default: <|im_start|>role\n...<|im_end|>\n
+                // Qwen2 / Qwen35MoE / Qwen35 default: <|im_start|>role\n...<|im_end|>\n
                 std::string result;
                 for (const auto &msg: messages) {
                     result += "<|im_start|>" + msg.first + "\n" + msg.second + "<|im_end|>\n";
@@ -79,6 +80,61 @@ namespace tinycoder {
                 }
                 return applyLlamaWrap(result);
             }
+        }
+
+        // Qwen35 (Qwen3.8) embeds a large multiturn/tool Jinja template (macros,
+        // namespaces, `~` concat, raise_exception) that the lightweight
+        // ChatTemplateRenderer cannot evaluate faithfully. Use the plain
+        // Qwen3-style <|im_start|> framing (token-identical for the supported
+        // single/user messages) instead of the mangled output.
+        // NOTE: for qwen35 the empty-template branch above already returned
+        // applyLlamaWrap(framed), so this non-empty-template branch must NOT
+        // double-wrap (it would inject "$" and an extra <|im_start|>user\n).
+        if (config_.architecture == ARCH_QWEN35) {
+            std::string result;
+            for (const auto &msg: messages) {
+                result += "<|im_start|>" + msg.first + "\n" + msg.second + "<|im_end|>\n";
+            }
+            if (addGenerationPrompt) {
+                result += "<|im_start|>assistant\n";
+            }
+            return applyLlamaWrap(result);
+        }
+
+        // Qwen2 / Qwen2.5-series models (including Qwen2.5-Coder) ship a Jinja
+        // chat template with constructs the lightweight renderer cannot evaluate
+        // faithfully (macros, ~ concat, raise_exception, tool_calls).  The
+        // canonical Qwen2 framing below is byte-identical to what llama.cpp
+        // produces for these models, so render it directly:
+        //   <|im_start|>system\n...<|im_end|>\n<|im_start|>user\n...<|im_end|>\n<|im_start|>assistant\n
+        // NOTE: the llama-completion "$" wrap is NOT applied here.  It was added
+        // for token-count parity with llama-completion's -p evaluation, but it
+        // produces a prompt the model cannot follow (nested user/system blocks,
+        // a stray '$', a duplicated assistant header) and the sampled output
+        // degenerates into <|fim_suffix|> noise.  Correct generation wins.
+        if (config_.architecture == ARCH_QWEN2) {
+            std::string result;
+            for (const auto &msg: messages) {
+                result += "<|im_start|>" + msg.first + "\n" + msg.second + "<|im_end|>\n";
+            }
+            if (addGenerationPrompt) {
+                result += "<|im_start|>assistant\n";
+            }
+            {
+                std::string escaped;
+                for (char c: result) {
+                    if (c == '\n') escaped += "\\n";
+                    else if (c == '\r')
+                        escaped += "\\r";
+                    else if (c == '\t')
+                        escaped += "\\t";
+                    else
+                        escaped += c;
+                }
+                std::cout << "[TinyCoder] Rendered prompt (" << result.size()
+                          << " chars): \"" << escaped << "\"" << std::endl;
+            }
+            return result;
         }
 
         // Use the dedicated Jinja template renderer

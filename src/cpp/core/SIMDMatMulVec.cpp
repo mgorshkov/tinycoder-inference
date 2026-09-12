@@ -102,7 +102,12 @@ namespace {
         for (uint32_t i = 0; i < n; ++i) {
             sumSq += static_cast<double>(x[i]) * static_cast<double>(x[i]);
         }
-        float invRms = 1.0f / (std::sqrt(static_cast<float>(sumSq / static_cast<double>(n))) + eps);
+        // ggml computes scale = 1/sqrtf(mean + eps) -- eps INSIDE the sqrt.
+        // Previously the eps was added OUTSIDE (sqrt(mean) + eps), which
+        // systematically over-flattens every normalized vector and diverges
+        // from llama.cpp on every RMSNorm op (visible as a ~0.19% norm scale
+        // at the FIRST qwen35 layer, compounding across 64 layers).
+        float invRms = 1.0f / (std::sqrt(static_cast<float>(sumSq / static_cast<double>(n)) + eps));
         for (uint32_t i = 0; i < n; ++i) {
             out[i] = x[i] * invRms * weight[i];
         }
@@ -1076,6 +1081,94 @@ namespace tinycoder {
         }
 #endif
         (void) W_q2k;
+        (void) X;
+        (void) seqLen;
+        (void) rows;
+        (void) cols;
+        (void) out;
+        return false;
+    }
+
+    // ---- matMulVecBatchQ5K_SIMD ----
+    // Register-tiled batch GEMM for a single COMPACT (raw GGUF) Q5_K matrix over
+    // a batch of tokens. Used for the qwen35 FFN gate/up/down, ssm_out, and
+    // attn_qkv projections (stored as Q5_K in this model: 176 B/block).
+    // Dispatches to the AVX2 kernel when available; returns false so the caller
+    // falls back to the generic scalar dotProductQ5_K path.
+    bool matMulVecBatchQ5K_SIMD(const uint8_t *W_q5k, const float *X,
+                                uint32_t seqLen, uint32_t rows, uint32_t cols,
+                                float *out) {
+        static std::atomic<int> s_level{-1};
+        int level = s_level.load(std::memory_order_acquire);
+        if (level < 0) {
+            level = static_cast<int>(np::internal::max_simd_level());
+            s_level.store(level, std::memory_order_release);
+        }
+#if defined(__AVX2__) && defined(__FMA__)
+        if (level >= static_cast<int>(np::internal::SimdLevel::AVX2)) {
+            simd::matMulVecBatchQ5K_Q8K_AVX2(W_q5k, X, seqLen, rows, cols, out);
+            return true;
+        }
+#endif
+        (void) W_q5k;
+        (void) X;
+        (void) seqLen;
+        (void) rows;
+        (void) cols;
+        (void) out;
+        return false;
+    }
+
+    // ---- matMulVecBatchIQ4XS_SIMD ----
+    // Register-tiled batch GEMM for a single COMPACT (raw GGUF) IQ4_XS matrix
+    // over a batch of tokens. Used for the qwen35 FFN gate/up (stored as IQ4_XS
+    // in this model: 136 B/block). Dispatches to the AVX2 kernel when available;
+    // returns false so the caller falls back to the generic scalar path.
+    bool matMulVecBatchIQ4XS_SIMD(const uint8_t *W_iq4xs, const float *X,
+                                  uint32_t seqLen, uint32_t rows, uint32_t cols,
+                                  float *out) {
+        static std::atomic<int> s_level{-1};
+        int level = s_level.load(std::memory_order_acquire);
+        if (level < 0) {
+            level = static_cast<int>(np::internal::max_simd_level());
+            s_level.store(level, std::memory_order_release);
+        }
+#if defined(__AVX2__) && defined(__FMA__)
+        if (level >= static_cast<int>(np::internal::SimdLevel::AVX2)) {
+            simd::matMulVecBatchIQ4XS_Q8K_AVX2(W_iq4xs, X, seqLen, rows, cols, out);
+            return true;
+        }
+#endif
+        (void) W_iq4xs;
+        (void) X;
+        (void) seqLen;
+        (void) rows;
+        (void) cols;
+        (void) out;
+        return false;
+    }
+
+    // ---- matMulVecBatchIQ4NL_SIMD ----
+    // Register-tiled batch GEMM for a single COMPACT (raw GGUF) IQ4_NL matrix
+    // over a batch of tokens (18 B per 32 weights). Used for the smaller qwen35
+    // tensors. Dispatches to the AVX2 kernel when available; returns false so
+    // the caller falls back to the generic scalar path.
+    bool matMulVecBatchIQ4NL_SIMD(const uint8_t *W_iq4nl, const float *X,
+                                  uint32_t seqLen, uint32_t rows, uint32_t cols,
+                                  float *out) {
+        static std::atomic<int> s_level{-1};
+        int level = s_level.load(std::memory_order_acquire);
+        if (level < 0) {
+            level = static_cast<int>(np::internal::max_simd_level());
+            s_level.store(level, std::memory_order_release);
+        }
+#if defined(__AVX2__) && defined(__FMA__)
+        if (level >= static_cast<int>(np::internal::SimdLevel::AVX2)) {
+            simd::matMulVecBatchIQ4NL_Q8K_AVX2(W_iq4nl, X, seqLen, rows, cols, out);
+            return true;
+        }
+#endif
+        (void) W_iq4nl;
         (void) X;
         (void) seqLen;
         (void) rows;

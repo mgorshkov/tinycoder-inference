@@ -25,7 +25,10 @@ SOFTWARE.
 #include "GGMLDequantize.hpp"
 #include "Model.hpp"
 #include <algorithm>
+#include <atomic>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <vector>
 
 #include <np/Array.hpp>
@@ -41,6 +44,89 @@ namespace tinycoder {
         np::Array<float> result(np::Shape{rows});
         matMulVec(x, result.data());
         return result;
+    }
+
+    uint32_t ggmlTypeSize(uint32_t type);
+
+    // Dispatch statistics (A/B diagnostics): count how many matMulVec calls
+    // went through the SIMD batch kernels vs the scalar fallback, per quant
+    // type. Printed once at process exit via std::atexit — zero runtime cost
+    // (relaxed atomic increments).
+    namespace {
+        std::atomic<uint64_t> g_batchKernelCalls{0};
+        std::atomic<uint64_t> g_scalarFallbackCalls{0};
+        std::atomic<int> g_batchKernelTypes[64]{};
+        struct BatchKernelStatsDumper {
+            BatchKernelStatsDumper() {
+                std::atexit([] {
+                    if (g_batchKernelCalls.load() == 0 &&
+                        g_scalarFallbackCalls.load() == 0)
+                        return;
+                    std::fprintf(stderr,
+                                 "[TinyCoder] matMulVec dispatch: SIMD-batch=%llu "
+                                 "scalar=%llu | per-type (type:calls) ",
+                                 static_cast<unsigned long long>(
+                                         g_batchKernelCalls.load()),
+                                 static_cast<unsigned long long>(
+                                         g_scalarFallbackCalls.load()));
+                    for (int t = 0; t < 64; ++t) {
+                        int c = g_batchKernelTypes[t].load();
+                        if (c > 0)
+                            std::fprintf(stderr, "[%d:%d] ", t, c);
+                    }
+                    std::fprintf(stderr, "\n");
+                });
+            }
+        };
+        inline BatchKernelStatsDumper g_batchKernelStatsDumper;
+    }// namespace
+
+    // Single-token (seqLen==1) dispatcher into the register-tiled AVX2 batch
+    // GEMM kernels. These are the same kernels that give the LM head ~36
+    // GFLOP/s (vs the scalar double-precision dotProductFused path at ~0.3
+    // GFLOP/s) — the dominant qwen35 per-token cost was the scalar path.
+    //
+    // Contract: all kernels require cols % 256 == 0 (a whole number of K-quant
+    // blocks), which holds for every real qwen2/qwen35 matrix (embedding 5120,
+    // FFN intermediate 17408, headDim 128/256). Non-multiple cols fall back to
+    // the scalar fused path below.
+    static bool matMulVecBatchSIMD(uint32_t type, const uint8_t *data,
+                                   const float *x, uint32_t rows, uint32_t cols,
+                                   float *out) {
+        if (cols == 0 || (cols & 255) != 0) {
+            return false;
+        }
+        // Each case dispatches to the register-tiled AVX2 batch kernel for that
+        // quant type (see SIMDMatMulVecAVX2.cpp). All kernels require the
+        // cols % 256 == 0 contract checked above. Q5_K needs its own kernel
+        // (176 B/block: the high bit lives in a separate qh array, not in the
+        // low nibbles), IQ4_XS its own (136 B/block with per-32 scale), and
+        // IQ4_NL has 32-wide blocks (18 B/block) — none can share another
+        // type's layout.
+        switch (type) {
+            case GGML_TYPE_Q6_K:
+                return matMulVecBatchQ6K_SIMD(data, x, 1, rows, cols, out);
+            case GGML_TYPE_Q5_K:
+                // Q5_K yields exactly the same block size (256) and the same
+                // scale/min extraction as Q4_K except the weights are 5-bit
+                // (low 4 bits in qs, high bit in qh). Use a dedicated AVX2
+                // kernel (see below); no generic fallback here.
+                return matMulVecBatchQ5K_SIMD(data, x, 1, rows, cols, out);
+            case GGML_TYPE_Q4_K:
+                return matMulVecBatchQ4K_SIMD(data, x, 1, rows, cols, out);
+            case GGML_TYPE_IQ4_XS:
+                return matMulVecBatchIQ4XS_SIMD(data, x, 1, rows, cols, out);
+            case GGML_TYPE_IQ4_NL:
+                return matMulVecBatchIQ4NL_SIMD(data, x, 1, rows, cols, out);
+            case GGML_TYPE_Q3_K:
+                return matMulVecBatchQ3K_SIMD(data, x, 1, rows, cols, out);
+            case GGML_TYPE_Q8_K:
+                return matMulVecBatchQ8K_SIMD(
+                        reinterpret_cast<const Q8KBlock *>(data), x, 1, rows,
+                        cols, out);
+            default:
+                return false;
+        }
     }
 
     void QuantizedMatrix::matMulVec(const float *x, float *out) const {
@@ -85,6 +171,24 @@ namespace tinycoder {
         // matMulVecFused computes y_j = sum_i x[i] * W[j][i]
         // where x has size cols, result has size rows
 
+        // OPTIMIZATION: register-tiled AVX2 batch GEMM fast path (single token).
+        // The LM head reaches ~36 GFLOP/s through these kernels while the
+        // generic scalar dotProductFused path below crawls at ~0.3 GFLOP/s.
+        // This is the dominant qwen35 per-token cost (FFN gate/up/down +
+        // attention projections all call matMulVec with seqLen==1). All real
+        // model matrices have cols % 256 == 0; non-multiple cols fall back.
+        // TINYCODER_FORCE_SCALAR=1 bypasses the kernels to establish a scalar
+        // correctness baseline (A/B the same generation between the SIMD batch
+        // kernels and the reference dequantize+dot path).
+        if (!forceScalarPath() &&
+            matMulVecBatchSIMD(type, data.data(), x, rows, cols, out)) {
+            g_batchKernelCalls.fetch_add(1, std::memory_order_relaxed);
+            if (type >= 0 && type < 64)
+                g_batchKernelTypes[type].fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+        g_scalarFallbackCalls.fetch_add(1, std::memory_order_relaxed);
+
         // OPTIMIZATION: Use pre-packed kernel for Q2_K matrices that have been
         // pre-packed at load time. The pre-packed format eliminates the 2-bit
         // extraction overhead in the SIMD kernel.
@@ -126,6 +230,25 @@ namespace tinycoder {
             return;
         }
 
+        // llama-parity Q8K path: for IQ2_S / IQ3_XXS / IQ3_S weights llama's CPU
+        // mul_mat quantizes the activations to Q8_K and accumulates with exact
+        // integer math (vec_dot_iq*_q8_K). Route single-token generation
+        // through matMulVecFusedQ8K to reproduce that bit-for-bit instead of
+        // the lossy float dequant-dot (diverges ~4.7% from llama).
+        if (GGMLDequantize::supportsQ8KDot(type)) {
+            GGMLDequantize::matMulVecFusedQ8K(type, data.data(), x, rows, cols,
+                                              gateOut);
+            GGMLDequantize::matMulVecFusedQ8K(type, other.data.data(), x, rows,
+                                              cols, upOut);
+            if (applySwish) {
+                for (uint32_t j = 0; j < rows; ++j) {
+                    float g = gateOut[j];
+                    gateOut[j] = (g / (1.0f + std::exp(-g))) * upOut[j];
+                }
+            }
+            return;
+        }
+
         // Fast path: fused Q2_K gate+up kernel over the COMPACT (raw) blocks.
         // This fn is used for single-token generation, which is
         // DRAM-bandwidth-bound; the compact 84-byte Q2_K blocks (vs 276-byte
@@ -134,7 +257,8 @@ namespace tinycoder {
         // the 2-bit quants on the fly (verified index-identical to the prepacked
         // expansion) and computes both dot products per row, quantizing x to
         // Q8_K once.
-        if (type == GGML_TYPE_Q2_K && !data.empty() && !other.data.empty()) {
+        if (!forceScalarPath() && type == GGML_TYPE_Q2_K && !data.empty() &&
+            !other.data.empty()) {
             GGMLDequantize::matMulVecFusedGateUpQ2_K_Compact_Q8(
                     data.data(), other.data.data(), x, rows, cols,
                     gateOut, upOut, applySwish);
@@ -143,7 +267,8 @@ namespace tinycoder {
 
         // Fallback fast path: pre-packed Q2_K gate+up fused kernel (same maths,
         // 3.3x larger weight read — used when the compact data is unavailable).
-        if (type == GGML_TYPE_Q2_K && !prepackedData.empty() && !other.prepackedData.empty()) {
+        if (!forceScalarPath() && type == GGML_TYPE_Q2_K && !prepackedData.empty() &&
+            !other.prepackedData.empty()) {
             GGMLDequantize::matMulVecFusedGateUpQ2_K_PrePacked_Q8(
                     prepackedData.data(), other.prepackedData.data(), x, rows, cols,
                     gateOut, upOut);
@@ -153,6 +278,20 @@ namespace tinycoder {
         // General fallback: two separate matmuls
         matMulVec(x, gateOut);
         other.matMulVec(x, upOut);
+
+        // The Q2_K fast paths fuse the SwiGLU activation into their epilogues,
+        // so the caller relies on this function to apply it consistently for
+        // EVERY dispatch route.  The general fallback must therefore honour
+        // applySwish too — otherwise single-token generation skips the
+        // silu(gate)*up activation entirely for non-Q2_K quant types (Q5_0 /
+        // Q8_0 / Q4_K / Q6_K), producing garbage logits and diverging from the
+        // batched prefill path (which always applies it).
+        if (applySwish) {
+            for (uint32_t j = 0; j < rows; ++j) {
+                float g = gateOut[j];
+                gateOut[j] = (g / (1.0f + std::exp(-g))) * upOut[j];
+            }
+        }
     }
 
     void QuantizedMatrix::matMulVecRows(const float *x, uint32_t rowStart, uint32_t numRows, float *out) const {

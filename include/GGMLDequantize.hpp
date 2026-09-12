@@ -28,6 +28,7 @@ SOFTWARE.
 #include <cassert>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <functional>
 #include <iostream>
@@ -48,6 +49,13 @@ namespace tinycoder {
 
         /// K-quant block size constant used in dequantization functions.
         static constexpr uint32_t QK_K = 256;
+
+        /// IQ4_NL / IQ4_XS 4-bit lookup table (same nibble mapping as llama.cpp
+        /// `kvalues_iq4nl`). Both formats index this table with 4-bit weights:
+        ///   value = scale * kvalues_iq4nl[nibble]
+        static constexpr int8_t kvalues_iq4nl[16] = {
+                -127, -104, -83, -65, -49, -35, -22, -10,
+                1, 13, 25, 38, 53, 69, 89, 113};
 
         /// @brief Convert IEEE 754 half-precision (16-bit) to float.
         /// @brief Convert a float32 value to IEEE 754 half-precision (FP16).
@@ -252,6 +260,74 @@ namespace tinycoder {
             for (uint64_t b = 0; b < numBlocks; ++b) {
                 float blockOut[BLOCK_SIZE];
                 dequantizeQ8_0Block(data + b * BLOCK_BYTES, blockOut);
+                uint64_t start = b * BLOCK_SIZE;
+                uint64_t end = std::min(start + BLOCK_SIZE, numElements);
+                for (uint64_t i = start; i < end; ++i) {
+                    result[i] = blockOut[i - start];
+                }
+            }
+            return result;
+        }
+
+        /// @brief Dequantize a Q8_1 block (32 weights, 36 bytes per block).
+        /// Block layout: d(fp16,2) + s(fp16,2) + qs(int8,32) = 36 bytes (block_q8_1).
+        /// Per-weight value = q * d. The `s` field is a precomputed sum (d * sum(q))
+        /// used only for cross-type activation compensation in llama.cpp, never as
+        /// a per-weight reconstructor — as a weight (src0) matrix it is
+        /// dequantized exactly like Q8_0 but with the extra 2-byte s field.
+        static void dequantizeQ8_1Block(const uint8_t *blockData, float *out) {
+            float d_val = halfToFloat(*(const uint16_t *) (blockData + 0));
+            const int8_t *qs = reinterpret_cast<const int8_t *>(blockData + 4);
+
+            for (int i = 0; i < 32; ++i) {
+                out[i] = static_cast<float>(qs[i]) * d_val;
+            }
+        }
+
+        static std::vector<float> dequantizeQ8_1(const uint8_t *data,
+                                                 uint64_t numElements) {
+            static constexpr uint32_t BLOCK_SIZE = 32;
+            static constexpr uint32_t BLOCK_BYTES = 36;// d(2) + s(2) + qs(32)
+            uint64_t numBlocks = (numElements + BLOCK_SIZE - 1) / BLOCK_SIZE;
+            std::vector<float> result(numElements);
+
+            for (uint64_t b = 0; b < numBlocks; ++b) {
+                float blockOut[BLOCK_SIZE];
+                dequantizeQ8_1Block(data + b * BLOCK_BYTES, blockOut);
+                uint64_t start = b * BLOCK_SIZE;
+                uint64_t end = std::min(start + BLOCK_SIZE, numElements);
+                for (uint64_t i = start; i < end; ++i) {
+                    result[i] = blockOut[i - start];
+                }
+            }
+            return result;
+        }
+
+        /// @brief Dequantize a Q8_K block (256 weights, 292 bytes per block).
+        /// Block layout: d(float,4) + qs(int8,256) + bsums(int16,32) = 292 bytes
+        /// (block_q8_K). Per-weight value = q * d. bsums holds precomputed sums of
+        /// 16-weight groups, used only by SIMD dot kernels, never for weight
+        /// reconstruction.
+        static void dequantizeQ8_KBlock(const uint8_t *blockData, float *out) {
+            float d_val;
+            std::memcpy(&d_val, blockData, sizeof(float));
+            const int8_t *qs = reinterpret_cast<const int8_t *>(blockData + 4);
+
+            for (int i = 0; i < 256; ++i) {
+                out[i] = static_cast<float>(qs[i]) * d_val;
+            }
+        }
+
+        static std::vector<float> dequantizeQ8_K(const uint8_t *data,
+                                                 uint64_t numElements) {
+            static constexpr uint32_t BLOCK_SIZE = 256;
+            static constexpr uint32_t BLOCK_BYTES = 292;// d(4) + qs(256) + bsums(32)
+            uint64_t numBlocks = (numElements + BLOCK_SIZE - 1) / BLOCK_SIZE;
+            std::vector<float> result(numElements);
+
+            for (uint64_t b = 0; b < numBlocks; ++b) {
+                float blockOut[BLOCK_SIZE];
+                dequantizeQ8_KBlock(data + b * BLOCK_BYTES, blockOut);
                 uint64_t start = b * BLOCK_SIZE;
                 uint64_t end = std::min(start + BLOCK_SIZE, numElements);
                 for (uint64_t i = start; i < end; ++i) {
@@ -742,9 +818,16 @@ namespace tinycoder {
         // into a uint32_t (each byte is one value 0-15).
         static const uint32_t IQ3S_GRID[512];
 
-        // IQ2_XS grid lookup table: 512 entries, each storing a 16-bit grid index.
+        // IQ2_XS grid lookup table: 512 entries, each storing 8 dequantized
+        // values byte-packed into a uint64_t (low byte = grid[0], high =
+        // grid[7]). Byte-identical to ggml's iq2xs_grid table in ggml-common.h.
         // (ksigns_iq2xs and kmask_iq2xs are already defined inline above and reused)
-        static const uint16_t iq2xs_grid[512];
+        static const uint64_t iq2xs_grid[512];
+
+        // IQ2_XXS grid lookup table: 256 entries, each storing 8 dequantized
+        // values byte-packed into a uint64_t (low byte = grid[0], high =
+        // grid[7]). Byte-identical to ggml's iq2xxs_grid table in ggml-common.h.
+        static const uint64_t iq2xxs_grid[256];
 
         /// @brief Dequantize IQ2_S tensor data to float32.
         /// IQ2_S: 2.5625 bpw, 256 weights per block, 82 bytes per block.
@@ -815,14 +898,15 @@ namespace tinycoder {
                         uint16_t qval = qs16[ib32 * 4 + l];
                         uint16_t gridIdx = qval & 0x1FF;
                         uint8_t signIdx = static_cast<uint8_t>(qval >> 9);
-                        uint16_t gridPacked = iq2xs_grid[gridIdx];
+                        // ggml semantics: grid = 8 byte-packed dequantized
+                        // values (0x08=8, 0x19=25, 0x2b=43). jsigns from
+                        // ksigns_iq2xs, sign flip via kmask_iq2xs.
+                        const uint8_t *grid =
+                                reinterpret_cast<const uint8_t *>(&iq2xs_grid[gridIdx]);
                         const uint8_t signs = ksigns_iq2xs[signIdx];
+                        float dl = db[l / 2];
                         for (uint32_t j = 0; j < 8; ++j) {
-                            // Extract 2-bit value from packed uint16_t
-                            // Map: 0->-2, 1->-1, 2->1, 3->2
-                            static const int8_t iq2xs_vals[4] = {-2, -1, 1, 2};
-                            int8_t val = iq2xs_vals[(gridPacked >> (2 * j)) & 3];
-                            float w = db[l / 2] * static_cast<float>(val) *
+                            float w = dl * static_cast<float>(grid[j]) *
                                       (signs & kmask_iq2xs[j] ? -1.0f : 1.0f);
                             uint64_t idx = base + ib32 * 32 + l * 8 + j;
                             if (idx < numElements) {
@@ -830,6 +914,28 @@ namespace tinycoder {
                             }
                         }
                     }
+                }
+            }
+            return result;
+        }
+
+        /// @brief Dequantize IQ2_XXS tensor data to float32.
+        /// IQ2_XXS: 2.0625 bpw, 256 weights per block, 66 bytes per block.
+        /// Block layout: d(2) + qs[32 x uint16] = 66 bytes.
+        static std::vector<float> dequantizeIQ2_XXS(const uint8_t *data,
+                                                    uint64_t numElements) {
+            static constexpr uint32_t BLOCK_SIZE = 256;
+            static constexpr uint32_t BLOCK_BYTES = 66;
+            uint64_t numBlocks = (numElements + BLOCK_SIZE - 1) / BLOCK_SIZE;
+            std::vector<float> result(numElements);
+
+            for (uint64_t b = 0; b < numBlocks; ++b) {
+                float blockOut[256];
+                dequantizeIQ2_XXSBlock(data + b * BLOCK_BYTES, blockOut);
+                uint64_t base = b * BLOCK_SIZE;
+                uint64_t n = std::min<uint64_t>(BLOCK_SIZE, numElements - base);
+                for (uint64_t i = 0; i < n; ++i) {
+                    result[base + i] = blockOut[i];
                 }
             }
             return result;
@@ -902,6 +1008,82 @@ namespace tinycoder {
                     qh += 2;
                     qs += 8;
                     signs += 4;
+                }
+            }
+            return result;
+        }
+
+        /// @brief Dequantize IQ4_NL tensor data to float32.
+        /// IQ4_NL: 4.5 bpw, 32 weights per block, 18 bytes per block.
+        /// Block layout: d(fp16,2) + qs[16] = 18 bytes.
+        /// Each qs byte holds two 4-bit nibbles; values are
+        ///   d * kvalues_iq4nl[nibble]  (table has signed int8 entries).
+        static std::vector<float> dequantizeIQ4_NL(const uint8_t *data,
+                                                   uint64_t numElements) {
+            static constexpr uint32_t BLOCK_SIZE = 32;
+            static constexpr uint32_t BLOCK_BYTES = 18;
+            uint64_t numBlocks = (numElements + BLOCK_SIZE - 1) / BLOCK_SIZE;
+            std::vector<float> result(numElements);
+
+            for (uint64_t b = 0; b < numBlocks; ++b) {
+                const uint8_t *blockData = data + b * BLOCK_BYTES;
+                float d_val = halfToFloat(*(const uint16_t *) (blockData + 0));
+                const uint8_t *qs = blockData + 2;
+
+                uint64_t base = b * BLOCK_SIZE;
+                for (uint32_t j = 0; j < 16; ++j) {
+                    uint64_t idx0 = base + j;
+                    uint64_t idx1 = base + j + 16;
+                    float w0 = d_val * static_cast<float>(kvalues_iq4nl[qs[j] & 0xf]);
+                    float w1 = d_val * static_cast<float>(kvalues_iq4nl[qs[j] >> 4]);
+                    if (idx0 < numElements)
+                        result[idx0] = w0;
+                    if (idx1 < numElements)
+                        result[idx1] = w1;
+                }
+            }
+            return result;
+        }
+
+        /// @brief Dequantize IQ4_XS tensor data to float32.
+        /// IQ4_XS: 4.25 bpw, 256 weights per block, 136 bytes per block.
+        /// Block layout: d(fp16,2) + scales_h(2) + scales_l(4) + qs[128] = 136 bytes.
+        /// The 256 weights are split into 8 sub-blocks of 32. For sub-block ib:
+        ///   ls  = ((scales_l[ib/2] >> 4*(ib%2)) & 0xf) | (((scales_h >> 2*ib) & 3) << 4)
+        ///   dl  = d * (ls - 32)
+        ///   value[j] = dl * kvalues_iq4nl[nibble]
+        static std::vector<float> dequantizeIQ4_XS(const uint8_t *data,
+                                                   uint64_t numElements) {
+            static constexpr uint32_t BLOCK_SIZE = 256;
+            static constexpr uint32_t BLOCK_BYTES = 136;
+            uint64_t numBlocks = (numElements + BLOCK_SIZE - 1) / BLOCK_SIZE;
+            std::vector<float> result(numElements);
+
+            for (uint64_t b = 0; b < numBlocks; ++b) {
+                const uint8_t *blockData = data + b * BLOCK_BYTES;
+                float d_val = halfToFloat(*(const uint16_t *) (blockData + 0));
+                const uint8_t *scales_l = blockData + 4;
+                uint16_t scales_h;
+                std::memcpy(&scales_h, blockData + 2, sizeof(uint16_t));
+                const uint8_t *qs = blockData + 8;
+
+                uint64_t base = b * BLOCK_SIZE;
+                for (uint32_t ib = 0; ib < QK_K / 32; ++ib) {
+                    int ls = static_cast<int>((scales_l[ib / 2] >> (4 * (ib % 2))) & 0xf) |
+                             static_cast<int>((scales_h >> (2 * ib)) & 0x3) << 4;
+                    float dl = d_val * static_cast<float>(ls - 32);
+                    uint64_t subBase = base + static_cast<uint64_t>(ib) * 32;
+                    for (uint32_t j = 0; j < 16; ++j) {
+                        uint64_t idx0 = subBase + j;
+                        uint64_t idx1 = subBase + j + 16;
+                        float w0 = dl * static_cast<float>(kvalues_iq4nl[qs[j] & 0xf]);
+                        float w1 = dl * static_cast<float>(kvalues_iq4nl[qs[j] >> 4]);
+                        if (idx0 < numElements)
+                            result[idx0] = w0;
+                        if (idx1 < numElements)
+                            result[idx1] = w1;
+                    }
+                    qs += 16;
                 }
             }
             return result;
@@ -1079,18 +1261,81 @@ namespace tinycoder {
                     uint16_t gridIdx = qval & 0x1FF;
                     // Sign index: upper 7 bits (shifted right by 9)
                     uint8_t signIdx = static_cast<uint8_t>(qval >> 9);
-                    uint16_t gridPacked = iq2xs_grid[gridIdx];
+                    // ggml semantics: 8 byte-packed values in a uint64_t entry.
+                    const uint8_t *grid =
+                            reinterpret_cast<const uint8_t *>(&iq2xs_grid[gridIdx]);
                     const uint8_t signs = ksigns_iq2xs[signIdx];
+                    float dl = db[l / 2];
                     for (uint32_t j = 0; j < 8; ++j) {
-                        // Extract 2-bit value from packed uint16_t
-                        // Map: 0->-2, 1->-1, 2->1, 3->2
-                        static const int8_t iq2xs_vals[4] = {-2, -1, 1, 2};
-                        int8_t val = iq2xs_vals[(gridPacked >> (2 * j)) & 3];
                         out[ib32 * 32 + l * 8 + j] =
-                                db[l / 2] * static_cast<float>(val) *
+                                dl * static_cast<float>(grid[j]) *
                                 (signs & kmask_iq2xs[j] ? -1.0f : 1.0f);
                     }
                 }
+            }
+        }
+
+        /// @brief Dequantize a single IQ2_XXS block (256 weights, 66 bytes).
+        /// Block layout: d(fp16,2) + qs[64] (32 x uint16) = 66 bytes.
+        /// Per 32-weight sub-block ib32: aux32 = qs[4*ib32 .. 4*ib32+4) (two
+        /// uint32 words). aux8[0..3] (low bytes) hold the 4 grid indices (each
+        /// 0-255 into iq2xxs_grid); the scale is (aux32[1] >> 28), and the 4
+        /// sign indices are ksigns_iq2xs[(aux32[1] >> 7*l) & 127] for l=0..3.
+        static void dequantizeIQ2_XXSBlock(const uint8_t *blockData, float *out) {
+            float d_val = halfToFloat(*(const uint16_t *) (blockData + 0));
+            const uint8_t *qs = blockData + 2;
+
+            uint32_t aux32[2];
+            const uint8_t *aux8 = reinterpret_cast<const uint8_t *>(aux32);
+            for (uint32_t ib32 = 0; ib32 < QK_K / 32; ++ib32) {
+                std::memcpy(aux32, qs + 4 * ib32, 2 * sizeof(uint32_t));
+                const float db = d_val * (0.5f + static_cast<float>(aux32[1] >> 28)) * 0.25f;
+                for (uint32_t l = 0; l < 4; ++l) {
+                    const uint8_t *grid =
+                            reinterpret_cast<const uint8_t *>(&iq2xxs_grid[aux8[l]]);
+                    const uint8_t signs = ksigns_iq2xs[(aux32[1] >> (7 * l)) & 127];
+                    for (uint32_t j = 0; j < 8; ++j) {
+                        out[ib32 * 32 + l * 8 + j] =
+                                db * static_cast<float>(grid[j]) *
+                                (signs & kmask_iq2xs[j] ? -1.0f : 1.0f);
+                    }
+                }
+            }
+        }
+
+        /// @brief Dequantize a single IQ4_NL block (32 weights, 18 bytes).
+        /// Block layout: d(fp16,2) + qs[16] = 18 bytes.
+        static void dequantizeIQ4_NLBlock(const uint8_t *blockData, float *out) {
+            float d_val = halfToFloat(*(const uint16_t *) (blockData + 0));
+            const uint8_t *qs = blockData + 2;
+
+            for (uint32_t j = 0; j < 16; ++j) {
+                out[j] = d_val * static_cast<float>(kvalues_iq4nl[qs[j] & 0xf]);
+                out[j + 16] = d_val * static_cast<float>(kvalues_iq4nl[qs[j] >> 4]);
+            }
+        }
+
+        /// @brief Dequantize a single IQ4_XS block (256 weights, 136 bytes).
+        /// Block layout: d(fp16,2) + scales_h(2) + scales_l(4) + qs[128] = 136 bytes.
+        /// 8 sub-blocks of 32 weights; each sub-block has its own scale:
+        ///   ls = ((scales_l[ib/2] >> 4*(ib%2)) & 0xf) | (((scales_h >> 2*ib) & 3) << 4)
+        ///   dl = d * (ls - 32)
+        static void dequantizeIQ4_XSBlock(const uint8_t *blockData, float *out) {
+            float d_val = halfToFloat(*(const uint16_t *) (blockData + 0));
+            uint16_t scales_h;
+            std::memcpy(&scales_h, blockData + 2, sizeof(uint16_t));
+            const uint8_t *scales_l = blockData + 4;
+            const uint8_t *qs = blockData + 8;
+
+            for (uint32_t ib = 0; ib < QK_K / 32; ++ib) {
+                int ls = static_cast<int>((scales_l[ib / 2] >> (4 * (ib % 2))) & 0xf) |
+                         static_cast<int>((scales_h >> (2 * ib)) & 0x3) << 4;
+                float dl = d_val * static_cast<float>(ls - 32);
+                for (uint32_t j = 0; j < 16; ++j) {
+                    out[ib * 32 + j] = dl * static_cast<float>(kvalues_iq4nl[qs[j] & 0xf]);
+                    out[ib * 32 + j + 16] = dl * static_cast<float>(kvalues_iq4nl[qs[j] >> 4]);
+                }
+                qs += 16;
             }
         }
 
@@ -1116,6 +1361,12 @@ namespace tinycoder {
                     break;
                 case GGML_TYPE_Q8_0:
                     dequantizeQ8_0Block(blockData, out);
+                    break;
+                case GGML_TYPE_Q8_1:
+                    dequantizeQ8_1Block(blockData, out);
+                    break;
+                case GGML_TYPE_Q8_K:
+                    dequantizeQ8_KBlock(blockData, out);
                     break;
                 case GGML_TYPE_Q5_K:
                     dequantizeQ5_KBlock(blockData, out);
@@ -1143,6 +1394,15 @@ namespace tinycoder {
                     break;
                 case GGML_TYPE_IQ2_XS:
                     dequantizeIQ2_XSBlock(blockData, out);
+                    break;
+                case GGML_TYPE_IQ2_XXS:
+                    dequantizeIQ2_XXSBlock(blockData, out);
+                    break;
+                case GGML_TYPE_IQ4_NL:
+                    dequantizeIQ4_NLBlock(blockData, out);
+                    break;
+                case GGML_TYPE_IQ4_XS:
+                    dequantizeIQ4_XSBlock(blockData, out);
                     break;
                 default: {
                     auto deq = dequantize(ggmlType, blockData, blockSize);
@@ -1401,6 +1661,36 @@ namespace tinycoder {
             return static_cast<float>(dot) * d_val;
         }
 
+        /// @brief Fused dot product for Q8_1 block (32 weights, 36 bytes).
+        /// Layout: d(fp16,2) + s(fp16,2) + qs(int8,32). Value = q * d; `s` is a
+        /// precomputed sum used only for cross-type activation compensation and is
+        /// NOT part of per-weight reconstruction.
+        static float dotProductQ8_1(const uint8_t *blockData, const float *x) {
+            float d_val = halfToFloat(*(const uint16_t *) (blockData + 0));
+            const int8_t *q = reinterpret_cast<const int8_t *>(blockData + 4);
+
+            double dot = 0.0;
+            for (int i = 0; i < 32; ++i) {
+                dot += static_cast<double>(x[i]) * q[i];
+            }
+            return static_cast<float>(dot) * d_val;
+        }
+
+        /// @brief Fused dot product for Q8_K block (256 weights, 292 bytes).
+        /// Layout: d(float32,4) + qs(int8,256) + bsums(int16,32). Value = q * d;
+        /// bsums hold precomputed group sums used only by SIMD dot kernels.
+        static float dotProductQ8_K(const uint8_t *blockData, const float *x) {
+            float d_val;
+            std::memcpy(&d_val, blockData, sizeof(float));
+            const int8_t *q = reinterpret_cast<const int8_t *>(blockData + 4);
+
+            double dot = 0.0;
+            for (int i = 0; i < 256; ++i) {
+                dot += static_cast<double>(x[i]) * q[i];
+            }
+            return static_cast<float>(dot) * d_val;
+        }
+
         /// @brief Fused dot product for Q5_0 block (32 weights, 22 bytes).
         static float dotProductQ5_0(const uint8_t *blockData, const float *x) {
             float d_val = halfToFloat(*(const uint16_t *) (blockData + 0));
@@ -1439,6 +1729,459 @@ namespace tinycoder {
             return static_cast<float>(static_cast<double>(d_val) * sum_xq + static_cast<double>(m_val) * sum_x);
         }
 
+        /// @brief Fused dot product for IQ4_NL block (32 weights, 18 bytes).
+        static float dotProductIQ4_NL(const uint8_t *blockData, const float *x) {
+            float d_val = halfToFloat(*(const uint16_t *) (blockData + 0));
+            const uint8_t *qs = blockData + 2;
+
+            double sum_xq = 0.0;
+            for (uint32_t j = 0; j < 16; ++j) {
+                sum_xq += static_cast<double>(x[j]) * kvalues_iq4nl[qs[j] & 0xf];
+                sum_xq += static_cast<double>(x[j + 16]) * kvalues_iq4nl[qs[j] >> 4];
+            }
+            return static_cast<float>(static_cast<double>(d_val) * sum_xq);
+        }
+
+        /// @brief Fused dot product for IQ4_XS block (256 weights, 136 bytes).
+        static float dotProductIQ4_XS(const uint8_t *blockData, const float *x) {
+            float d_val = halfToFloat(*(const uint16_t *) (blockData + 0));
+            uint16_t scales_h;
+            std::memcpy(&scales_h, blockData + 2, sizeof(uint16_t));
+            const uint8_t *scales_l = blockData + 4;
+            const uint8_t *qs = blockData + 8;
+
+            double dot = 0.0;
+            for (uint32_t ib = 0; ib < QK_K / 32; ++ib) {
+                int ls = static_cast<int>((scales_l[ib / 2] >> (4 * (ib % 2))) & 0xf) |
+                         static_cast<int>((scales_h >> (2 * ib)) & 0x3) << 4;
+                float dl = d_val * static_cast<float>(ls - 32);
+                double sum_xq = 0.0;
+                for (uint32_t j = 0; j < 16; ++j) {
+                    sum_xq += static_cast<double>(x[ib * 32 + j]) * kvalues_iq4nl[qs[j] & 0xf];
+                    sum_xq += static_cast<double>(x[ib * 32 + j + 16]) * kvalues_iq4nl[qs[j] >> 4];
+                }
+                dot += static_cast<double>(dl) * sum_xq;
+                qs += 16;
+            }
+            return static_cast<float>(dot);
+        }
+
+        /// @brief Fused dot product for IQ2_XS block (256 weights, 74 bytes).
+        /// Block layout: d(fp16,2) + qs[64] + scales[8] = 74 bytes.
+        /// 8 sub-blocks of 32 weights. Each sub-block ib32 has 4 x 16-bit q
+        /// entries: bit 0-8 grid index, bit 9-15 sign index. Sub-scale:
+        ///   db[0] = d*(0.5+(scales[ib32]&0xf))*0.25, db[1] = d*(0.5+(scales[ib32]>>4))*0.25
+        /// l belongs to db[l/2]; each 16-bit q supplies 8 weights (l*8+j, j=0..7)
+        /// via iq2xs_grid (8 byte-packed values per uint64_t entry) times sign.
+        static float dotProductIQ2_XS(const uint8_t *blockData, const float *x) {
+            float d_val = halfToFloat(*(const uint16_t *) (blockData + 0));
+            const uint16_t *qs16 = reinterpret_cast<const uint16_t *>(blockData + 2);
+            const uint8_t *scales = blockData + 66;
+
+            double dot = 0.0;
+            for (uint32_t ib32 = 0; ib32 < QK_K / 32; ++ib32) {
+                float db[2];
+                db[0] = d_val * (0.5f + static_cast<float>(scales[ib32] & 0xf)) * 0.25f;
+                db[1] = d_val * (0.5f + static_cast<float>(scales[ib32] >> 4)) * 0.25f;
+                for (uint32_t l = 0; l < 4; ++l) {
+                    uint16_t qval = qs16[ib32 * 4 + l];
+                    uint16_t gridIdx = qval & 0x1FF;
+                    uint8_t signIdx = static_cast<uint8_t>(qval >> 9);
+                    const uint8_t *grid =
+                            reinterpret_cast<const uint8_t *>(&iq2xs_grid[gridIdx]);
+                    const uint8_t signs = ksigns_iq2xs[signIdx];
+                    float dl = db[l / 2];
+                    for (uint32_t j = 0; j < 8; ++j) {
+                        float w = dl * static_cast<float>(grid[j]) *
+                                  (signs & kmask_iq2xs[j] ? -1.0f : 1.0f);
+                        dot += static_cast<double>(x[ib32 * 32 + l * 8 + j]) * w;
+                    }
+                }
+            }
+            return static_cast<float>(dot);
+        }
+
+        /// @brief Fused dot product for IQ2_XXS block (256 weights, 66 bytes).
+        /// Block layout: d(fp16,2) + qs[32 x uint16] = 66 bytes. Mirrors llama
+        /// dequantize_row_iq2_xxs: per 32-weight sub-block, aux32 = two uint32
+        /// words from qs[4*ib32..]; the low bytes aux8[0..3] are grid indices
+        /// (0-255) into iq2xxs_grid; db = d*(0.5+(aux32[1]>>28))*0.25; signs
+        /// ksigns_iq2xs[(aux32[1] >> 7*l) & 127].
+        static float dotProductIQ2_XXS(const uint8_t *blockData, const float *x) {
+            float d_val = halfToFloat(*(const uint16_t *) (blockData + 0));
+            const uint8_t *qs = blockData + 2;
+
+            uint32_t aux32[2];
+            const uint8_t *aux8 = reinterpret_cast<const uint8_t *>(aux32);
+            double dot = 0.0;
+            for (uint32_t ib32 = 0; ib32 < QK_K / 32; ++ib32) {
+                std::memcpy(aux32, qs + 4 * ib32, 2 * sizeof(uint32_t));
+                const float db = d_val * (0.5f + static_cast<float>(aux32[1] >> 28)) * 0.25f;
+                for (uint32_t l = 0; l < 4; ++l) {
+                    const uint8_t *grid =
+                            reinterpret_cast<const uint8_t *>(&iq2xxs_grid[aux8[l]]);
+                    const uint8_t signs = ksigns_iq2xs[(aux32[1] >> (7 * l)) & 127];
+                    for (uint32_t j = 0; j < 8; ++j) {
+                        float w = db * static_cast<float>(grid[j]) *
+                                  (signs & kmask_iq2xs[j] ? -1.0f : 1.0f);
+                        dot += static_cast<double>(x[ib32 * 32 + l * 8 + j]) * w;
+                    }
+                }
+            }
+            return static_cast<float>(dot);
+        }
+
+        /// @brief Fused dot product for IQ3_S block (256 weights, 110 bytes).
+        /// Block layout: d(fp16,2) + qs[64] + qh[8] + signs[32] + scales[4].
+        /// Pairs of 16 values per 32-entry half use IQ3S_GRID (512 entries, each
+        /// storing 4 x 4-bit values packed into uint32_t), with kmask_iq2xs
+        /// sign masks. Sub-scales: db1 = d*(1+2*(scales[ib/2]&0xf)),
+        /// db2 = d*(1+2*(scales[ib/2]>>4)).
+        static float dotProductIQ3_S(const uint8_t *blockData, const float *x) {
+            float d_val = halfToFloat(*(const uint16_t *) (blockData + 0));
+            const uint8_t *qs = blockData + 2;
+            const uint8_t *qh = blockData + 66;
+            const uint8_t *signs = blockData + 74;
+            const uint8_t *scales = blockData + 106;
+
+            double dot = 0.0;
+            for (uint32_t ib32 = 0; ib32 < QK_K / 32; ib32 += 2) {
+                float db1 = d_val * (1.0f + 2.0f * static_cast<float>(scales[ib32 / 2] & 0xf));
+                float db2 = d_val * (1.0f + 2.0f * static_cast<float>(scales[ib32 / 2] >> 4));
+                for (int l = 0; l < 4; ++l) {
+                    uint16_t gridIdx1 = qs[2 * l + 0] | ((qh[0] << (8 - 2 * l)) & 256);
+                    uint16_t gridIdx2 = qs[2 * l + 1] | ((qh[0] << (7 - 2 * l)) & 256);
+                    const uint8_t *grid1 =
+                            reinterpret_cast<const uint8_t *>(&IQ3S_GRID[gridIdx1]);
+                    const uint8_t *grid2 =
+                            reinterpret_cast<const uint8_t *>(&IQ3S_GRID[gridIdx2]);
+                    for (int j = 0; j < 4; ++j) {
+                        float w1 = db1 * static_cast<float>(grid1[j]) *
+                                   (signs[l] & kmask_iq2xs[j + 0] ? -1.0f : 1.0f);
+                        float w2 = db1 * static_cast<float>(grid2[j]) *
+                                   (signs[l] & kmask_iq2xs[j + 4] ? -1.0f : 1.0f);
+                        dot += static_cast<double>(x[ib32 * 32 + l * 8 + j]) * w1;
+                        dot += static_cast<double>(x[ib32 * 32 + l * 8 + j + 4]) * w2;
+                    }
+                }
+                qs += 8;
+                signs += 4;
+                for (int l = 0; l < 4; ++l) {
+                    uint16_t gridIdx1 = qs[2 * l + 0] | ((qh[1] << (8 - 2 * l)) & 256);
+                    uint16_t gridIdx2 = qs[2 * l + 1] | ((qh[1] << (7 - 2 * l)) & 256);
+                    const uint8_t *grid1 =
+                            reinterpret_cast<const uint8_t *>(&IQ3S_GRID[gridIdx1]);
+                    const uint8_t *grid2 =
+                            reinterpret_cast<const uint8_t *>(&IQ3S_GRID[gridIdx2]);
+                    for (int j = 0; j < 4; ++j) {
+                        float w1 = db2 * static_cast<float>(grid1[j]) *
+                                   (signs[l] & kmask_iq2xs[j + 0] ? -1.0f : 1.0f);
+                        float w2 = db2 * static_cast<float>(grid2[j]) *
+                                   (signs[l] & kmask_iq2xs[j + 4] ? -1.0f : 1.0f);
+                        dot += static_cast<double>(x[(ib32 + 1) * 32 + l * 8 + j]) * w1;
+                        dot += static_cast<double>(x[(ib32 + 1) * 32 + l * 8 + j + 4]) * w2;
+                    }
+                }
+                qh += 2;
+                qs += 8;
+                signs += 4;
+            }
+            return static_cast<float>(dot);
+        }
+
+        /// @brief True when ggmlType has a llama-parity Q8_K integer dot path
+        /// (IQ2_S / IQ3_XXS / IQ3_S). llama.cpp's CPU mul_mat quantizes the
+        /// activation vector to Q8_K (the vec_dot_type of these types) once per
+        /// matmul and accumulates with exact integer math in
+        /// vec_dot_iq*_q8_K, which is numerically different from a float
+        /// dequant-dot (up to ~5% on real activations). Mirror it here.
+        // TEMP-DIAG: TINYCODER_DISABLE_Q8K_DOT=1 forces the float dequant-dot
+        // path for IQ2_S/IQ3_XXS/IQ3_S so we can A/B it against the GPU's
+        // kQGemv float-dot decode kernels (which never quantize activations).
+        static bool supportsQ8KDot(uint32_t ggmlType) {
+            if (std::getenv("TINYCODER_DISABLE_Q8K_DOT") != nullptr) {
+                return false;
+            }
+            return ggmlType == GGML_TYPE_IQ2_S || ggmlType == GGML_TYPE_IQ3_XXS ||
+                   ggmlType == GGML_TYPE_IQ3_S;
+        }
+
+        /// @brief Q8_K integer dot product for one IQ2_S block, mirroring
+        /// llama.cpp's ggml_vec_dot_iq2_s_q8_K_generic exactly
+        /// (quants.c): integer bsum accumulation, d = fp16(x.d)*y.d,
+        /// result = 0.125f * sumf.
+        /// Block layout: d(fp16,2) + qs[64] + qh[8] + scales[8] (82 bytes);
+        /// signs at qs+QK_K/8. Per (ib32,l): sub-scale ls1/ls2 from the
+        /// nibbles of scales[ib32]; grid index = qs[l] | ((qh[ib32] << (8-2l)) & 0x300).
+        static float dotProductIQ2_S_Q8K(const uint8_t *blockData, const Q8KBlock *q8) {
+            const float d = halfToFloat(*(const uint16_t *) (blockData + 0)) * q8->d;
+            const uint8_t *qs0 = blockData + 2;
+            const uint8_t *qh = blockData + 66;
+            const uint8_t *scales = blockData + 74;
+            const int8_t *yq = q8->qs;
+
+            // Mirror llama's ggml_vec_dot_iq2_s_q8_K generic loop exactly:
+            //   q8 advances 16 per ib32 (2 sub-blocks of 4 l × 8 j);
+            //   sumi1 uses yq[ib32*32 + 0..15], sumi2 uses yq[ib32*32 + 16..31].
+            int bsum = 0;
+            for (uint32_t ib32 = 0; ib32 < QK_K / 32; ++ib32) {
+                const uint8_t *qs = qs0 + ib32 * 4;
+                const uint8_t *signs = qs0 + QK_K / 8 + ib32 * 4;
+                const int ls1 = 1 + 2 * (scales[ib32] & 0xf);
+                const int ls2 = 1 + 2 * (scales[ib32] >> 4);
+                const int8_t *q8p = yq + ib32 * 32;
+                int sumi1 = 0, sumi2 = 0;
+                for (uint32_t l = 0; l < 4; ++l) {
+                    const uint8_t *grid = reinterpret_cast<const uint8_t *>(
+                            &IQ2S_GRID[qs[l] | ((qh[ib32] << (8 - 2 * l)) & 0x300)]);
+                    for (uint32_t j = 0; j < 8; ++j) {
+                        const int sw = (signs[l] & kmask_iq2xs[j]) ? -1 : 1;
+                        if (l < 2) {
+                            sumi1 += q8p[l * 8 + j] * grid[j] * sw;
+                        } else {
+                            sumi2 += q8p[l * 8 + j] * grid[j] * sw;
+                        }
+                    }
+                }
+                bsum += ls1 * sumi1 + ls2 * sumi2;
+            }
+            // Unscaled d*bsum: the caller accumulates sumf (float) across the
+            // row's blocks and applies the 0.125f scale once, exactly as llama's
+            // ggml_vec_dot_iq2_s_q8_K_generic does for a multi-block row.
+            return d * static_cast<float>(bsum);
+        }
+
+        /// @brief Q8_K integer dot product for one IQ3_XXS block, mirroring
+        /// llama.cpp's ggml_vec_dot_iq3_xxs_q8_K_generic exactly:
+        /// result = 0.25f * sumf.
+        /// Block layout: d(fp16,2) + qs[96] (98 bytes); scales_and_signs at
+        /// qs+QK_K/4. Per ib32: ls = 2*(aux32>>28)+1, signs
+        /// ksigns_iq2xs[(aux32 >> 7*l) & 127], grid1/grid2 from IQ3XXS_GRID.
+        static float dotProductIQ3_XXS_Q8K(const uint8_t *blockData, const Q8KBlock *q8) {
+            const float d = halfToFloat(*(const uint16_t *) (blockData + 0)) * q8->d;
+            const uint8_t *q3 = blockData + 2;
+            const uint8_t *gas = q3 + QK_K / 4;
+            const int8_t *yq = q8->qs;
+
+            // llama's generic loop advances q8 by 8 per l (32 per ib32), so
+            // sub-block ib32 uses yq[ib32*32 .. ib32*32+31].
+            int32_t bsum = 0;
+            uint32_t aux32;
+            for (uint32_t ib32 = 0; ib32 < QK_K / 32; ++ib32) {
+                std::memcpy(&aux32, gas, sizeof(uint32_t));
+                gas += sizeof(uint32_t);
+                const int ls = static_cast<int>(2 * (aux32 >> 28) + 1);
+                const int8_t *q8p = yq + ib32 * 32;
+                int32_t sumi = 0;
+                for (uint32_t l = 0; l < 4; ++l) {
+                    const uint8_t *grid1 = reinterpret_cast<const uint8_t *>(
+                            &IQ3XXS_GRID[q3[2 * l + 0]]);
+                    const uint8_t *grid2 = reinterpret_cast<const uint8_t *>(
+                            &IQ3XXS_GRID[q3[2 * l + 1]]);
+                    const uint8_t signs = ksigns_iq2xs[(aux32 >> (7 * l)) & 127];
+                    for (uint32_t j = 0; j < 4; ++j) {
+                        sumi += static_cast<int>(grid1[j]) * q8p[l * 8 + j + 0] *
+                                ((signs & kmask_iq2xs[j + 0]) ? -1 : 1);
+                        sumi += static_cast<int>(grid2[j]) * q8p[l * 8 + j + 4] *
+                                ((signs & kmask_iq2xs[j + 4]) ? -1 : 1);
+                    }
+                }
+                q3 += 8;
+                bsum += sumi * ls;
+            }
+            // Unscaled d*bsum (0.25f applied once per row by the caller).
+            return d * static_cast<float>(bsum);
+        }
+
+        /// @brief Q8_K integer dot product for one IQ3_S block, mirroring
+        /// llama.cpp's ggml_vec_dot_iq3_s_q8_K_generic exactly:
+        /// result = sumf (no trailing scale).
+        /// Block layout: d(fp16,2) + qs[64] + qh[8] + signs[32] + scales[4]
+        /// (110 bytes). Per pair of 32-entry halves: ls1/ls2 from scales[ib/2]
+        /// nibbles; grid idx1/idx2 with the qh bit at bit 8.
+        static float dotProductIQ3_S_Q8K(const uint8_t *blockData, const Q8KBlock *q8) {
+            const float d = halfToFloat(*(const uint16_t *) (blockData + 0)) * q8->d;
+            const uint8_t *qs = blockData + 2;
+            const uint8_t *qh = blockData + 66;
+            const uint8_t *signs = blockData + 74;
+            const uint8_t *scales = blockData + 106;
+            const int8_t *yq = q8->qs;
+
+            int32_t bsum = 0;
+            for (uint32_t ib32 = 0; ib32 < QK_K / 32; ib32 += 2) {
+                const int ls1 = static_cast<int>(2 * (scales[ib32 / 2] & 0xf) + 1);
+                const int ls2 = static_cast<int>(2 * (scales[ib32 / 2] >> 4) + 1);
+                const int8_t *q8p = yq + ib32 * 32;
+                int32_t sumi = 0;
+                for (uint32_t l = 0; l < 4; ++l) {
+                    const uint8_t *grid1 = reinterpret_cast<const uint8_t *>(&IQ3S_GRID[qs[2 * l + 0] | ((qh[ib32 + 0] << (8 - 2 * l)) & 256)]);
+                    const uint8_t *grid2 = reinterpret_cast<const uint8_t *>(&IQ3S_GRID[qs[2 * l + 1] | ((qh[ib32 + 0] << (7 - 2 * l)) & 256)]);
+                    for (uint32_t j = 0; j < 4; ++j) {
+                        sumi += static_cast<int>(grid1[j]) * q8p[l * 8 + j + 0] *
+                                ((signs[l] & kmask_iq2xs[j + 0]) ? -1 : 1);
+                        sumi += static_cast<int>(grid2[j]) * q8p[l * 8 + j + 4] *
+                                ((signs[l] & kmask_iq2xs[j + 4]) ? -1 : 1);
+                    }
+                }
+                qs += 8;
+                signs += 4;
+                bsum += sumi * ls1;
+                sumi = 0;
+                q8p = yq + (ib32 + 1) * 32;
+                for (uint32_t l = 0; l < 4; ++l) {
+                    const uint8_t *grid1 = reinterpret_cast<const uint8_t *>(&IQ3S_GRID[qs[2 * l + 0] | ((qh[ib32 + 1] << (8 - 2 * l)) & 256)]);
+                    const uint8_t *grid2 = reinterpret_cast<const uint8_t *>(&IQ3S_GRID[qs[2 * l + 1] | ((qh[ib32 + 1] << (7 - 2 * l)) & 256)]);
+                    for (uint32_t j = 0; j < 4; ++j) {
+                        sumi += static_cast<int>(grid1[j]) * q8p[l * 8 + j + 0] *
+                                ((signs[l] & kmask_iq2xs[j + 0]) ? -1 : 1);
+                        sumi += static_cast<int>(grid2[j]) * q8p[l * 8 + j + 4] *
+                                ((signs[l] & kmask_iq2xs[j + 4]) ? -1 : 1);
+                    }
+                }
+                qs += 8;
+                signs += 4;
+                bsum += sumi * ls2;
+            }
+            // Unscaled d*bsum (no trailing scale for IQ3_S in llama).
+            return d * static_cast<float>(bsum);
+        }
+
+        /// @brief Trailing row scale applied by llama's vec_dot_iq*_q8_K once
+        /// per row: IQ2_S -> 0.125f, IQ3_XXS -> 0.25f, IQ3_S -> 1.0f.
+        static float q8KDotRowScale(uint32_t ggmlType) {
+            switch (ggmlType) {
+                case GGML_TYPE_IQ2_S:
+                    return 0.125f;
+                case GGML_TYPE_IQ3_XXS:
+                    return 0.25f;
+                case GGML_TYPE_IQ3_S:
+                    return 1.0f;
+                default:
+                    return 1.0f;
+            }
+        }
+
+        /// @brief Dispatch to the per-block Q8_K integer dot (unscaled d*bsum).
+        /// @param blockData Weight block (IQ2_S / IQ3_XXS / IQ3_S)
+        /// @param q8        Q8_K-quantized activation block (from quantizeQ8K)
+        /// Mirrors llama.cpp vec_dot_iq*_q8_K inner accumulation:
+        /// d = fp16(block.d) * q8->d, integer bsum; the trailing 0.125/0.25/1.0
+        /// scale is applied once per row by the caller (q8KDotRowScale).
+        static float dotProductFusedQ8K(uint32_t ggmlType, const uint8_t *blockData,
+                                        const Q8KBlock *q8, uint32_t blockSize) {
+            uint32_t fullBlockSize = ggmlBlockSize(ggmlType);
+            if (blockSize < fullBlockSize) {
+                // Partial block (unit-test edge case): dequantize the weight
+                // block and reconstruct the activation from its Q8K form, then
+                // float-dot (consistent with the quantized semantics).
+                float blockOut[256];
+                dequantizeBlock(ggmlType, blockData, blockOut, blockSize);
+                double dot = 0.0;
+                for (uint32_t i = 0; i < blockSize; ++i) {
+                    dot += static_cast<double>(q8->d * static_cast<float>(q8->qs[i])) * blockOut[i];
+                }
+                return static_cast<float>(dot);
+            }
+            switch (ggmlType) {
+                case GGML_TYPE_IQ2_S:
+                    return dotProductIQ2_S_Q8K(blockData, q8);
+                case GGML_TYPE_IQ3_XXS:
+                    return dotProductIQ3_XXS_Q8K(blockData, q8);
+                case GGML_TYPE_IQ3_S:
+                    return dotProductIQ3_S_Q8K(blockData, q8);
+                default:
+                    // Should never happen: callers gate on supportsQ8KDot.
+                    return 0.0f;
+            }
+        }
+
+        /// @brief Fully llama-parity matrix-vector multiply for IQ2_S /
+        /// IQ3_XXS / IQ3_S matrices: quantize the activation x to Q8_K once,
+        /// then per output row accumulate sumf (float) over the row's blocks via
+        /// the integer dots and apply the trailing scale once. This reproduces
+        /// llama.cpp's ggml_cpu mul_mat + vec_dot_iq*_q8_K bit-for-bit
+        /// (including the float sumf rounding), which is numerically different
+        /// from a float dequant-dot (up to ~5% on real activations).
+        /// Weight layout: data[j * blocksPerRow * typeSize + b * typeSize].
+        static void matMulVecFusedQ8K(uint32_t ggmlType, const uint8_t *data,
+                                      const float *x, uint32_t rows, uint32_t cols,
+                                      float *result) {
+            static constexpr uint32_t MAX_STACK_BLOCKS = 64;
+            uint32_t blockSize = ggmlBlockSize(ggmlType);
+            uint32_t typeSize = ggmlTypeSize(ggmlType);
+            uint32_t blocksPerRow = (cols + blockSize - 1) / blockSize;
+            uint64_t rowStrideBytes = static_cast<uint64_t>(blocksPerRow) * typeSize;
+            const float scale = q8KDotRowScale(ggmlType);
+
+            // Quantize x to Q8_K once per matmul (reused across all rows).
+            Q8KBlock stackQ8[MAX_STACK_BLOCKS];
+            Q8KBlock *q8 = stackQ8;
+            std::vector<Q8KBlock> heapQ8;
+            if (blocksPerRow > MAX_STACK_BLOCKS) {
+                heapQ8.resize(blocksPerRow);
+                q8 = heapQ8.data();
+            }
+            quantizeQ8K(x, cols, q8);
+
+            ThreadPool::instance().parallelFor(0, rows, [&](uint32_t j) {
+                const uint8_t *rowData = data + static_cast<uint64_t>(j) * rowStrideBytes;
+                float sumf = 0.0f;
+                for (uint32_t b = 0; b < blocksPerRow; ++b) {
+                    const uint8_t *blockData = rowData + static_cast<uint64_t>(b) * typeSize;
+                    uint32_t start = b * blockSize;
+                    uint32_t n = std::min(blockSize, cols - start);
+                    // Integer dot (unscaled d*bsum), float-accumulated across
+                    // blocks exactly like llama's `sumf += d * bsum;`.
+                    sumf += dotProductFusedQ8K(ggmlType, blockData, &q8[b], n);
+                }
+                result[j] = scale * sumf;
+            });
+        }
+
+        /// @brief Batched matMulVecFusedQ8K over seqLen tokens sharing the same
+        /// weight matrix. Each token's x row is quantized to Q8_K once; every
+        /// output row reproduces llama's vec_dot_iq*_q8_K accumulation.
+        /// out[s * rows + j] = scale * sumf over the row's blocks.
+        static void matMulVecBatchQ8K(uint32_t ggmlType, const uint8_t *data,
+                                      const float *X, uint32_t seqLen,
+                                      uint32_t rows, uint32_t cols, float *out) {
+            static constexpr uint32_t MAX_STACK_BLOCKS = 64;
+            uint32_t blockSize = ggmlBlockSize(ggmlType);
+            uint32_t typeSize = ggmlTypeSize(ggmlType);
+            uint32_t blocksPerRow = (cols + blockSize - 1) / blockSize;
+            uint64_t rowStrideBytes = static_cast<uint64_t>(blocksPerRow) * typeSize;
+            const float scale = q8KDotRowScale(ggmlType);
+
+            // Reusable grow-only scratch for all tokens' Q8_K quantizations.
+            static std::vector<Q8KBlock> q8All;
+            q8All.resize(static_cast<size_t>(seqLen) * blocksPerRow);
+            for (uint32_t s = 0; s < seqLen; ++s) {
+                Q8KBlock *q8s = q8All.data() + static_cast<size_t>(s) * blocksPerRow;
+                if (blocksPerRow <= MAX_STACK_BLOCKS) {
+                    quantizeQ8K(X + static_cast<size_t>(s) * cols, cols, q8s);
+                } else {
+                    std::vector<Q8KBlock> tmp(blocksPerRow);
+                    quantizeQ8K(X + static_cast<size_t>(s) * cols, cols, tmp.data());
+                    std::memcpy(q8s, tmp.data(), sizeof(Q8KBlock) * blocksPerRow);
+                }
+            }
+
+            ThreadPool::instance().parallelFor(0, rows, [&](uint32_t j) {
+                const uint8_t *rowData = data + static_cast<uint64_t>(j) * rowStrideBytes;
+                for (uint32_t s = 0; s < seqLen; ++s) {
+                    const Q8KBlock *q8 = q8All.data() + static_cast<size_t>(s) * blocksPerRow;
+                    float sumf = 0.0f;
+                    for (uint32_t b = 0; b < blocksPerRow; ++b) {
+                        const uint8_t *blockData = rowData + static_cast<uint64_t>(b) * typeSize;
+                        uint32_t start = b * blockSize;
+                        uint32_t n = std::min(blockSize, cols - start);
+                        sumf += dotProductFusedQ8K(ggmlType, blockData, &q8[b], n);
+                    }
+                    out[static_cast<size_t>(s) * rows + j] = scale * sumf;
+                }
+            });
+        }
+
         /// @brief Dispatch to type-specific fused dot product.
         /// @return dot(x, dequantize(blockData)) for one block.
         /// @note The type-specific functions always process the full block
@@ -1470,10 +2213,24 @@ namespace tinycoder {
                     return dotProductQ6_K(blockData, x);
                 case GGML_TYPE_Q8_0:
                     return dotProductQ8_0(blockData, x);
+                case GGML_TYPE_Q8_1:
+                    return dotProductQ8_1(blockData, x);
+                case GGML_TYPE_Q8_K:
+                    return dotProductQ8_K(blockData, x);
                 case GGML_TYPE_Q5_0:
                     return dotProductQ5_0(blockData, x);
                 case GGML_TYPE_Q5_1:
                     return dotProductQ5_1(blockData, x);
+                case GGML_TYPE_IQ4_NL:
+                    return dotProductIQ4_NL(blockData, x);
+                case GGML_TYPE_IQ4_XS:
+                    return dotProductIQ4_XS(blockData, x);
+                case GGML_TYPE_IQ2_XS:
+                    return dotProductIQ2_XS(blockData, x);
+                case GGML_TYPE_IQ2_XXS:
+                    return dotProductIQ2_XXS(blockData, x);
+                case GGML_TYPE_IQ3_S:
+                    return dotProductIQ3_S(blockData, x);
                 default: {
                     // Fallback: dequantize then dot product
                     float blockOut[256];
@@ -1501,10 +2258,24 @@ namespace tinycoder {
                     return dotProductQ6_K;
                 case GGML_TYPE_Q8_0:
                     return dotProductQ8_0;
+                case GGML_TYPE_Q8_1:
+                    return dotProductQ8_1;
+                case GGML_TYPE_Q8_K:
+                    return dotProductQ8_K;
                 case GGML_TYPE_Q5_0:
                     return dotProductQ5_0;
                 case GGML_TYPE_Q5_1:
                     return dotProductQ5_1;
+                case GGML_TYPE_IQ4_NL:
+                    return dotProductIQ4_NL;
+                case GGML_TYPE_IQ4_XS:
+                    return dotProductIQ4_XS;
+                case GGML_TYPE_IQ2_XS:
+                    return dotProductIQ2_XS;
+                case GGML_TYPE_IQ2_XXS:
+                    return dotProductIQ2_XXS;
+                case GGML_TYPE_IQ3_S:
+                    return dotProductIQ3_S;
                 default:
                     return nullptr;
             }
@@ -1533,6 +2304,15 @@ namespace tinycoder {
         static void matMulVecFused(uint32_t ggmlType, const uint8_t *data,
                                    const float *x, uint32_t rows, uint32_t cols,
                                    float *result) {
+            // IQ2_S / IQ3_XXS / IQ3_S: llama.cpp CPU mul_mat quantizes the
+            // activation to Q8_K and uses exact integer vec_dot_iq*_q8_K
+            // accumulation, which differs numerically from a float dequant-dot
+            // (up to ~5% on real activations). Route through the llama-parity
+            // path so Q/K/FFN results match llama bit-for-bit.
+            if (supportsQ8KDot(ggmlType)) {
+                matMulVecFusedQ8K(ggmlType, data, x, rows, cols, result);
+                return;
+            }
             uint32_t blockSize = ggmlBlockSize(ggmlType);
             uint32_t typeSize = ggmlTypeSize(ggmlType);
 
@@ -1609,6 +2389,12 @@ namespace tinycoder {
         static void matMulVecFusedCacheBlocked(uint32_t ggmlType, const uint8_t *data,
                                                const float *x, uint32_t rows,
                                                uint32_t cols, float *result) {
+            // IQ2_S / IQ3_XXS / IQ3_S route through the llama-parity Q8_K
+            // integer path (see matMulVecFused).
+            if (supportsQ8KDot(ggmlType)) {
+                matMulVecFusedQ8K(ggmlType, data, x, rows, cols, result);
+                return;
+            }
             uint32_t blockSize = ggmlBlockSize(ggmlType);
             uint32_t typeSize = ggmlTypeSize(ggmlType);
 
@@ -1661,6 +2447,10 @@ namespace tinycoder {
                     return dequantizeQ5_1(data, numElements);
                 case GGML_TYPE_Q8_0:
                     return dequantizeQ8_0(data, numElements);
+                case GGML_TYPE_Q8_1:
+                    return dequantizeQ8_1(data, numElements);
+                case GGML_TYPE_Q8_K:
+                    return dequantizeQ8_K(data, numElements);
                 case GGML_TYPE_Q5_K:
                     return dequantizeQ5_K(data, numElements);
                 case GGML_TYPE_Q4_K:
@@ -1675,10 +2465,16 @@ namespace tinycoder {
                     return dequantizeIQ2_S(data, numElements);
                 case GGML_TYPE_IQ2_XS:
                     return dequantizeIQ2_XS(data, numElements);
+                case GGML_TYPE_IQ2_XXS:
+                    return dequantizeIQ2_XXS(data, numElements);
                 case GGML_TYPE_IQ3_S:
                     return dequantizeIQ3_S(data, numElements);
                 case GGML_TYPE_IQ3_XXS:
                     return dequantizeIQ3_XXS(data, numElements);
+                case GGML_TYPE_IQ4_NL:
+                    return dequantizeIQ4_NL(data, numElements);
+                case GGML_TYPE_IQ4_XS:
+                    return dequantizeIQ4_XS(data, numElements);
                 default:
                     return {};// Unsupported
             }

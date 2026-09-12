@@ -214,6 +214,38 @@ namespace tinycoder::simd {
                                     uint32_t seqLen, uint32_t rows,
                                     uint32_t cols, float *out);
 
+    // Register-tiled batch GEMM for a single COMPACT (raw GGUF) Q5_K weight
+    // matrix over a batch of tokens (qwen35 FFN gate/up/down + ssm_out +
+    // attn_qkv, all stored as Q5_K in this model; 176 B/block). Q5_K
+    // decomposes like Q4_K (shared scale/min extraction, 8 sub-blocks of 32)
+    // but the weights are 5-bit: the low 4 bits sit in qs (64 B) and the 5th
+    // bit in qh (32 B) with the u1/u2 bit pattern per 64-weight chunk. The
+    // value is d*(sc)*q5 - dmin*(m), so the min term folds through the Q8KBlock
+    // bsums exactly like Q4_K, and the 5-bit expansion packs into the unsigned
+    // operand slot of _mm256_maddubs_epi16 against the Q8_K x-vector.
+    void matMulVecBatchQ5K_Q8K_AVX2(const uint8_t *W_q5k, const float *X,
+                                    uint32_t seqLen, uint32_t rows,
+                                    uint32_t cols, float *out);
+
+    // Register-tiled batch GEMM for a single IQ4_XS weight matrix over a batch
+    // of tokens (qwen35 FFN gate/up/down, 136 B/block). Decomposes like Q4_K
+    // with 8 sub-blocks, but each sub-block i has scale dl = d*(ls-32) where
+    // ls comes from scales_h(2B)/scales_l(4B) and is SIGNED (i.e. can be
+    // negative when ls < 32), and the nibbles index kvalues_iq4nl (signed).
+    void matMulVecBatchIQ4XS_Q8K_AVX2(const uint8_t *W_iq4xs, const float *X,
+                                      uint32_t seqLen, uint32_t rows,
+                                      uint32_t cols, float *out);
+
+    // Register-tiled batch GEMM for a single IQ4_NL weight matrix over a batch
+    // of tokens (small qwen35 tensors). IQ4_NL is a 32-weight block (18 B):
+    // d(fp16) + 16 nibble bytes. There are cols/32 blocks per row. The dot is
+    // d * sum nibble*kvalues_iq4nl[nibble], and the nibbles can be expanded to
+    // signed bytes (kvalues_iq4nl is signed) then dotted against the raw x
+    // (no Q8_K quantization needed for 32-elem blocks).
+    void matMulVecBatchIQ4NL_Q8K_AVX2(const uint8_t *W_iq4nl, const float *X,
+                                      uint32_t seqLen, uint32_t rows,
+                                      uint32_t cols, float *out);
+
     // Register-tiled batch GEMM for a single COMPACT (raw GGUF) Q2_K weight
     // matrix over a batch of tokens. Used for the separate LM head after the
     // load-time Q2_K re-quant (Lever C: 84 B/block vs Q6_K's 210 B/block —
