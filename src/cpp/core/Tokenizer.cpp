@@ -68,22 +68,28 @@ namespace tinycoder {
                     {"<pad>", 0},
                     {"<unk>", 3},
             };
-        } else if (architecture == "qwen35moe") {
-            // Qwen35MoE uses tiktoken-style BPE (same as Qwen2)
-            // BOS/EOS=27 (<|endoftext|> equivalent)
-            bosTokenId_ = 27;
-            eosTokenId_ = 27;
-            padTokenId_ = 27;
-            imStartId_ = 151644;// <|im_start|>
-            imEndId_ = 151645;  // <|im_end|>
+        } else if (architecture == "qwen35moe" ||
+                   architecture == "qwen35") {
+            // Qwen35MoE / Qwen35 (Qwen3.8 dense) use tiktoken-style BPE.
+            // WARNING: Qwen3.8-family GGUFs store the special tokens at the END
+            // of the vocabulary (e.g. Qwen3.8-27B-UD: <|endoftext|>=248044,
+            // <|im_start|>=248045, <|im_end|>=248046, pad=248055), NOT at the
+            // Qwen2-era IDs 151643/151644/151645. Hardcoding the Qwen2 IDs here
+            // makes every <|im_start|>/<|im_end|> in a chat prompt encode to
+            // byte-garbage tokens. The authoritative IDs are therefore looked up
+            // from the ACTUAL vocabulary strings after loadFromGGUF populates it
+            // (see loadFromGGUF); the values here are only pre-GGUF placeholders.
+            bosTokenId_ = -1;
+            eosTokenId_ = -1;
+            padTokenId_ = -1;
+            imStartId_ = -1;// <|im_start|> (resolved from vocab)
+            imEndId_ = -1;  // <|im_end|>   (resolved from vocab)
             pretokenizeRegex_ = QWEN2_PATTERN;
 
-            // Qwen35MoE special tokens for encode()
-            specialTokenTexts_ = {
-                    {"<|endoftext|>", 27},
-                    {"<|im_start|>", 151644},
-                    {"<|im_end|>", 151645},
-            };
+            // Intentionally EMPTY: specialTokenTexts_ is derived from the real
+            // vocabulary (reverseVocab_) in loadFromGGUF, so <|im_start|> maps to
+            // whatever ID this GGUF actually uses (248045 for Qwen3.8-27B-UD).
+            specialTokenTexts_.clear();
         } else {
             // Qwen2 default (tiktoken-style BPE)
             bosTokenId_ = 151643;
@@ -232,20 +238,51 @@ namespace tinycoder {
                 file.read(modelType.data(), strLen);
                 // Expected: "gpt2" for BPE tokenizer, "gemma4" or "sentencepiece" for SentencePiece
             } else if (key == "tokenizer.ggml.bos_token_id") {
-                // Read BOS token ID (INT32)
-                int32_t bosId;
-                file.read(reinterpret_cast<char *>(&bosId), sizeof(int32_t));
-                bosTokenId_ = bosId;
+                // Read BOS token ID (UINT32 or INT32 — different GGUF writers
+                // use different scalar types for the same key)
+                uint32_t bosId;
+                file.read(reinterpret_cast<char *>(&bosId), sizeof(uint32_t));
+                bosTokenId_ = static_cast<int32_t>(bosId);
             } else if (key == "tokenizer.ggml.eos_token_id") {
-                // Read EOS token ID (INT32)
-                int32_t eosId;
-                file.read(reinterpret_cast<char *>(&eosId), sizeof(int32_t));
-                eosTokenId_ = eosId;
+                // Read EOS token ID (UINT32 or INT32)
+                uint32_t eosId;
+                file.read(reinterpret_cast<char *>(&eosId), sizeof(uint32_t));
+                eosTokenId_ = static_cast<int32_t>(eosId);
             } else if (key == "tokenizer.ggml.padding_token_id") {
-                // Read PAD token ID (INT32)
-                int32_t padId;
-                file.read(reinterpret_cast<char *>(&padId), sizeof(int32_t));
-                padTokenId_ = padId;
+                // Read PAD token ID (UINT32 or INT32)
+                uint32_t padId;
+                file.read(reinterpret_cast<char *>(&padId), sizeof(uint32_t));
+                padTokenId_ = static_cast<int32_t>(padId);
+            } else if (key == "tokenizer.ggml.token_type") {
+                // Array of INT32 (or UINT32): per-token type classification.
+                // type 3 = CONTROL special tokens (the authoritative EOG set,
+                // e.g. <|endoftext|>/<|im_end|> in Qwen3.8 vocabs).
+                uint32_t arrType;
+                file.read(reinterpret_cast<char *>(&arrType), sizeof(uint32_t));
+                uint64_t arrLen;
+                file.read(reinterpret_cast<char *>(&arrLen), sizeof(uint64_t));
+                tokenTypes_.resize(static_cast<size_t>(arrLen));
+                if (arrType == 5 || arrType == 4) {// INT32 / UINT32
+                    for (uint64_t j = 0; j < arrLen; ++j) {
+                        int32_t tv;
+                        file.read(reinterpret_cast<char *>(&tv), sizeof(int32_t));
+                        tokenTypes_[static_cast<size_t>(j)] = tv;
+                    }
+                } else {
+                    // Unexpected element type — skip.
+                    tokenTypes_.clear();
+                    uint64_t elemBytes = (arrType == 8) ? 8// string: cannot skip fixed
+                                                        : 4;
+                    if (arrType == 8) {
+                        for (uint64_t j = 0; j < arrLen; ++j) {
+                            uint64_t l;
+                            file.read(reinterpret_cast<char *>(&l), sizeof(uint64_t));
+                            file.seekg(static_cast<std::streamoff>(l), std::ios::cur);
+                        }
+                    } else {
+                        file.seekg(static_cast<std::streamoff>(arrLen * elemBytes), std::ios::cur);
+                    }
+                }
             } else {
                 // Skip unknown metadata values
                 switch (valueType) {
@@ -356,15 +393,92 @@ namespace tinycoder {
         // Build byte-to-token-ID mapping for tiktoken-style byte encoding
         buildByteToTokenId();
 
+        // ---- Derive the authoritative special-token IDs from the ACTUAL
+        // vocabulary and token_type, not from architecture hardcodes.
+        // Qwen3.8-family GGUFs place <|endoftext|>/<|im_start|>/<|im_end|> at the
+        // END of the vocab (e.g. 248044/248045/248046 in Qwen3.8-27B-UD), which
+        // differs from the Qwen2-era defaults 151643/151644/151645. Hardcoding
+        // the Qwen2 IDs made every chat-prompt <|im_start|> encode to byte
+        // garbage -> garbage embeddings -> garbage generation.
+        auto findTokenId = [&](const std::string &text) -> int32_t {
+            auto it = reverseVocab_.find(text);
+            return it != reverseVocab_.end() ? it->second : -1;
+        };
+        auto setSpecial = [&](const char *text, int32_t &target) {
+            int32_t id = findTokenId(text);
+            if (id >= 0) {
+                target = id;
+            }
+        };
+
+        // Special-token TEXT->ID mappings used by encode(). Build from the real
+        // vocab for the Qwen3 family (and any vocab that actually contains them).
+        if (specialTokenTexts_.empty() && !vocab_.empty()) {
+            const char *qwenSpecials[] = {
+                    "<|endoftext|>",
+                    "<|im_start|>",
+                    "<|im_end|>",
+                    "<|fim_prefix|>",
+                    "<|fim_middle|>",
+                    "<|fim_suffix|>",
+                    "<|repo_name|>",
+                    "<|file_sep|>",
+            };
+            for (const char *sp: qwenSpecials) {
+                int32_t id = findTokenId(sp);
+                if (id >= 0) {
+                    specialTokenTexts_.emplace_back(sp, id);
+                }
+            }
+            if (!specialTokenTexts_.empty()) {
+                // Update imStart/imEnd from the real IDs (chat-template framing).
+                setSpecial("<|im_start|>", imStartId_);
+                setSpecial("<|im_end|>", imEndId_);
+            }
+        }
+
+        // Derive a conservative EOG set. The explicit eos_token_id (from
+        // tokenizer.ggml.eos_token_id, e.g. <|im_end|>=248046) is authoritative.
+        // We also terminate on <|endoftext|> / <|im_end|> even if the writer did
+        // not mark them CONTROL. We deliberately do NOT treat every CONTROL token
+        // (27 in Qwen3.8-27B-UD, e.g. <|vision_start|>, <|fim_prefix|>) as EOG —
+        // that would stop generation on a sampled vision/audio marker.
+        eogTokens_.clear();
+        if (eosTokenId_ >= 0) {
+            eogTokens_.insert(eosTokenId_);
+        }
+        int32_t endText = findTokenId("<|endoftext|>");
+        if (endText >= 0) {
+            eogTokens_.insert(endText);
+        }
+        int32_t imEnd = findTokenId("<|im_end|>");
+        if (imEnd >= 0) {
+            eogTokens_.insert(imEnd);
+        }
+
         // Set up special tokens
         specialTokens_.insert(bosTokenId_);
         specialTokens_.insert(eosTokenId_);
         specialTokens_.insert(padTokenId_);
+        for (const auto &p: specialTokenTexts_) {
+            specialTokens_.insert(p.second);
+        }
+        for (int32_t eog: eogTokens_) {
+            specialTokens_.insert(eog);
+        }
 
         std::cout << "[TinyCoder] Tokenizer loaded: " << vocab_.size() << " tokens, "
                   << scores_.size() << " scores, "
-                  << (foundMerges ? mergeStrings.size() : 0) << " merges"
-                  << std::endl;
+                  << (foundMerges ? mergeStrings.size() : 0) << " merges, "
+                  << "bos=" << bosTokenId_ << " eos=" << eosTokenId_
+                  << " pad=" << padTokenId_ << " eog={";
+        bool first = true;
+        for (int32_t e: eogTokens_) {
+            if (!first) std::cout << ",";
+            std::cout << e;
+            first = false;
+        }
+        std::cout << "}" << std::endl;
 
         return true;
     }

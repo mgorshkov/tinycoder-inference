@@ -32,7 +32,9 @@
 #include <thread>
 #include <vector>
 
-#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
+#if (defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || \
+     defined(_M_IX86)) &&                                           \
+        !defined(__CUDACC__)
 #include <immintrin.h>
 #endif
 
@@ -44,7 +46,9 @@ namespace tinycoder {
     /// memory-order pipeline stalls while spinning). On other architectures it
     /// is a no-op. Used by the persistent-worker scheduler's spin barrier.
     inline void spinPause() {
-#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
+#if (defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || \
+     defined(_M_IX86)) &&                                           \
+        !defined(__CUDACC__)
         _mm_pause();
 #else
         // Portable fallback: a compiler barrier that prevents the loop from

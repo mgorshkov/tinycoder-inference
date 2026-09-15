@@ -43,6 +43,14 @@ namespace tinycoder {
     ///
     /// The API intentionally mirrors the subset of std::vector used by the model
     /// loader and kernels, so call sites change only by type.
+    ///
+    /// Besides the owning (heap) mode, the buffer supports a NON-OWNING
+    /// external mode via setExternal(): the pointer simply aliases memory owned
+    /// elsewhere (e.g. a file-backed mmap kept alive by the Model's persistent
+    /// GGUFLoader). data()/size()/empty() are transparent, so every kernel call
+    /// site works unchanged, while zero bytes are copied at load time. Copying
+    /// an external buffer shares the pointer (the real owner outlives the
+    /// Model); copying an owned buffer deep-copies exactly as before.
     template<typename T, size_t ALIGN = 64>
     class AlignedVector {
     public:
@@ -50,20 +58,20 @@ namespace tinycoder {
         static_assert((ALIGN & (ALIGN - 1)) == 0, "alignment must be a power of two");
 
         AlignedVector() = default;
-        ~AlignedVector() { deallocate(); }
+        ~AlignedVector() { releaseStorage(); }
 
-        AlignedVector(const AlignedVector &other) { assign(other.data_, other.n_); }
+        AlignedVector(const AlignedVector &other) { refFrom(other); }
         AlignedVector(AlignedVector &&other) noexcept { moveFrom(other); }
 
         AlignedVector &operator=(const AlignedVector &other) {
             if (this != &other) {
-                assign(other.data_, other.n_);
+                refFrom(other);
             }
             return *this;
         }
         AlignedVector &operator=(AlignedVector &&other) noexcept {
             if (this != &other) {
-                deallocate();
+                releaseStorage();
                 moveFrom(other);
             }
             return *this;
@@ -78,6 +86,30 @@ namespace tinycoder {
             return *this;
         }
 
+        /// @brief Adopt an EXTERNAL (non-owning) buffer.
+        ///
+        /// The caller guarantees the memory at [ptr, ptr + count) outlives this
+        /// AlignedVector. For the model loader this is the Model's persistent
+        /// GGUFLoader mmap: the quantized weight section stays file-backed and
+        /// zero bytes are copied at load time (the previous heap-copy path
+        /// doubled the 36.9 GB model and OOM-killed the process). This
+        /// AlignedVector never frees this memory; any previous owned storage is
+        /// released, and any previous external reference is dropped.
+        void setExternal(const T *ptr, size_t count) {
+            releaseStorage();
+            if (ptr == nullptr || count == 0) {
+                data_ = nullptr;
+                n_ = 0;
+                return;
+            }
+            data_ = const_cast<T *>(ptr);
+            n_ = count;
+            external_ = true;
+        }
+
+        /// @brief true when this buffer aliases memory it does not own.
+        bool external() const noexcept { return external_; }
+
         /// @brief Resize the buffer and leave contents uninitialized.
         void resize(size_t n) {
             if (n == n_) {
@@ -87,7 +119,12 @@ namespace tinycoder {
         }
 
         /// @brief Fill the buffer from a contiguous range [first, last).
+        /// Deep-copies into freshly allocated aligned (owned) storage.
         void assign(const T *first, const T *last) {
+            if (first == nullptr || last == nullptr || first == last) {
+                releaseStorage();
+                return;
+            }
             const size_t count = static_cast<size_t>(last - first);
             allocate(count);
             if (count > 0) {
@@ -111,13 +148,30 @@ namespace tinycoder {
         const T &operator[](size_t i) const noexcept { return data_[i]; }
 
         void clear() {
-            deallocate();
-            n_ = 0;
+            releaseStorage();
         }
 
     private:
+        /// @brief Adopt the contents of another buffer without transferring
+        /// ownership: shares the pointer of an external (non-owning) source,
+        /// deep-copies an owned source.
+        void refFrom(const AlignedVector &other) {
+            if (other.external_) {
+                releaseStorage();
+                data_ = other.data_;
+                n_ = other.n_;
+                external_ = true;
+                return;
+            }
+            if (other.n_ == 0 || other.data_ == nullptr) {
+                releaseStorage();
+                return;
+            }
+            assign(other.data_, other.data_ + other.n_);
+        }
+
         void allocate(size_t n) {
-            deallocate();
+            releaseStorage();
             n_ = n;
             if (n_ == 0) {
                 data_ = nullptr;
@@ -152,15 +206,30 @@ namespace tinycoder {
             }
         }
 
+        /// @brief Release whatever storage this buffer refers to: free owned
+        /// (heap) memory, or drop an external (borrowed) reference without
+        /// touching the memory itself. Never frees a borrowed pointer.
+        void releaseStorage() {
+            if (external_) {
+                external_ = false;
+                data_ = nullptr;
+                n_ = 0;
+            } else {
+                deallocate();
+            }
+        }
+
         void moveFrom(AlignedVector &other) noexcept {
             data_ = other.data_;
             n_ = other.n_;
+            external_ = other.external_;
             other.data_ = nullptr;
             other.n_ = 0;
+            other.external_ = false;
         }
 
         T *data_ = nullptr;
         size_t n_ = 0;
+        bool external_ = false;
     };
-
 }// namespace tinycoder
