@@ -1,9 +1,7 @@
 // tiny_logits_probe.cpp
 //
-// Dump TinyCoder's per-token logits for a prompt, apples-to-apples with
-// llama_ref_probe's "[ar] final logits (last prompt token) top-10" block.
-// Loads the FULL model (like the unit tests) so this is slow (~5-6 min on
-// the 35B-A3B Q8_0) — run with TINYCODER_GPU=0/1 to switch engines.
+// Loads the FULL model (like the unit tests) so this is slow (~5-6 min on the
+// 35B-A3B Q8_0) — run with TINYCODER_GPU=0/1 to switch engines.
 //
 // Build:
 //   g++ -O2 -std=c++17 tools/tiny_logits_probe.cpp -I include -Isrc/cpp/core

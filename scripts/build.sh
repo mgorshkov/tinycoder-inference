@@ -9,7 +9,7 @@
 #   3. Runs CTest when the tests are enabled.
 #
 # CUDA (GPU offload) is the DEFAULT build path — the engine is developed and
-# benchmarked against the llama.cpp GPU baseline with -DENABLE_CUDA=ON.  On a
+# benchmarked against the reference GPU baseline with -DENABLE_CUDA=ON.  On a
 # machine without nvcc/CUDA, pass --no-cuda (or --cpu) to request a CPU-only
 # build instead of failing the configure.
 #

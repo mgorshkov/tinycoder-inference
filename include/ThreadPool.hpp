@@ -93,22 +93,12 @@ namespace tinycoder {
         bool isInitialized() const { return initialized_; }
 
         /// @brief Recommended initial thread count.
-        ///
-        /// Defaults to the number of LOGICAL CPUs (8 on the i7-4790K reference
-        /// host) — measured 2026-08-28 to be a clear WIN over llama.cpp's
-        /// physical-core default (4) even after the task-graph levers (dynamic
-        /// chunk work-stealing + last-arriver cooperative act quantize):
-        /// 24.06/24.01 tok/s at 8t vs 21.68/21.60 at 4t on the 64-token
-        /// questions. The finer 8-way row split plus the pooled HT lanes keeps
-        /// DRAM busier than 4 dedicated cores on this 2-channel DDR3-1600
-        /// memory-bound shape. physicalThreadCount() (llama.cpp's policy)
-        /// remains available for A/B; `TINYCODER_THREADS` overrides at runtime.
+        //
+        // The finer 8-way row split plus the pooled HT lanes keeps DRAM busier
+        // than 4 dedicated cores on this 2-channel DDR3-1600 memory-bound
+        // shape.
         static size_t recommendedThreadCount();
 
-        /// @brief Number of physical cores (HT siblings folded), detected like
-        /// llama.cpp's common_cpu_get_num_physical_cores() (distinct
-        /// /sys/.../topology/thread_siblings masks on Linux; logical/2
-        /// elsewhere).
         static size_t physicalThreadCount();
 
         /// @brief Enable/disable CPU affinity pinning for worker threads.
@@ -168,17 +158,10 @@ namespace tinycoder {
                 uint32_t start2, uint32_t end2,
                 const std::function<void(uint32_t)> &phase2);
 
-        /// @brief Parallel-for with dynamic chunked work-stealing (llama.cpp
-        /// `ggml_compute_forward_mul_mat_one_chunk` style dispatch).
-        ///
-        /// Workers (and the main thread) pull [chunkSize]-sized index chunks from
-        /// a single shared atomic via `fetch_add(chunkSize)` instead of running a
-        /// statically partitioned contiguous slab. This keeps DRAM saturated at
-        /// the tail of memory-bound kernels: no thread can idle on a long static
-        /// slab while others finish their share, so the last sub-chunk of work is
-        /// stolen by whoever is free (the phase-boundary bubble llama.cpp's
-        /// `atomic_fetch_add` scheduling removes).
-        ///
+        // Workers (and the main thread) pull [chunkSize]-sized index chunks
+        // from a single shared atomic via `fetch_add(chunkSize)` instead of
+        // running a statically partitioned contiguous slab.
+        //
         /// Intended for single-token generation kernels (the fused gate+up+down
         /// FFN, ranked lever 1 in plans/generation_optimizations.md) where tile
         /// counts are small (hundreds) and per-tile cost is weight-stream-bound
@@ -189,16 +172,11 @@ namespace tinycoder {
 
         /// @brief Single-launch two-phase parallel-for with chunked work-stealing
         /// (the steal counterpart of parallelForSlab2).
-        ///
-        /// Same two-phase protocol as parallelForSlab2 (phase1 → `between` on the
-        /// main thread → phase2, one task publication, spin-flag phase
-        /// transition), but each phase pulls [chunk1/chunk2]-sized index chunks
-        /// from the shared atomic instead of running static slabs. For the fused
-        /// FFN kernel this replaces the static 4- or 8-way row partition of
-        /// parallelForSlab2 — llama.cpp's single-token `nr0x nr1` loop steals
-        /// 64-row work chunks dynamically, which is where its 4-thread edge over
-        /// TinyCoder's static slabs comes from (measured 19.2 vs 29.4 tok/s at 4
-        /// threads, plans/generation_optimizations.md lever 1).
+        //
+        // Same two-phase protocol as parallelForSlab2 (phase1 → `between` on
+        // the main thread → phase2, one task publication, spin-flag phase
+        // transition), but each phase pulls [chunk1/chunk2]-sized index chunks
+        // from the shared atomic instead of running static slabs.
         void parallelForSteal2(
                 uint32_t start1, uint32_t end1, uint32_t chunk1,
                 const std::function<void(uint32_t)> &phase1,
@@ -287,12 +265,8 @@ namespace tinycoder {
         uint32_t mainSlabStart1_ = 0;
         uint32_t mainSlabEnd1_ = 0;
 
-        // Chunked work-stealing task data (parallelForSteal / parallelForSteal2):
-        // when stealTask_ is true, workers (and the main thread) pull
-        // [stealChunkSize_]-sized index chunks from nextIndex_ via fetch_add
-        // (llama.cpp ggml_compute_forward_mul_mat_one_chunk style) instead of
-        // running a static slab or a 1-item fetch_add. Phase-1 chunk size is
-        // phaseChunk1_, phase-2 chunk size phaseChunk2_ (parallelForSteal2).
+        // Phase-1 chunk size is phaseChunk1_, phase-2 chunk size phaseChunk2_
+        // (parallelForSteal2).
         bool stealTask_ = false;
         bool twoPhaseStealTask_ = false;
         uint32_t stealChunk_ = 1;

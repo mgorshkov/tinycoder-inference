@@ -394,14 +394,10 @@ TEST_F(GPUCpuCompareTest, SequentialDecodeArgmaxAgrees) {
     }
 }
 
-/// @brief Kernel-level Q8K parity: run the GPU kQuantizeQ8K + kQGemvQ8K
-/// kernels on ONE real weight row and a deterministic activation, and compare
-/// against the CPU reference (matMulVecFusedQ8K, the path the CPU forward uses).
-/// This isolates the Q8K integer-dot kernels from the rest of the forward
-/// pass: a mismatch here means the GPU kernel itself diverges from llama's
-/// vec_dot_iq*_q8_K; a match here points the blame at the surrounding
-/// attention/KV-cache/layer plumbing instead.
-///
+// @brief Kernel-level Q8K parity: run the GPU kQuantizeQ8K + kQGemvQ8K kernels
+// on ONE real weight row and a deterministic activation, and compare against
+// the CPU reference (matMulVecFusedQ8K, the path the CPU forward uses).
+//
 /// Runs on the first `kRows` rows of layer-0 attnQ (IQ2_S), attnO (IQ3_S),
 /// ffnGate (IQ3_XXS) -- the three quant types that use the Q8K decode path.
 TEST_F(GPUCpuCompareTest, Q8_0KernelParityWithCPU) {

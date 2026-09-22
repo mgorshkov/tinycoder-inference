@@ -108,7 +108,7 @@ int main(int argc, char **argv) {
     }
 
     // Reproduce Model::formatChat() for qwen35moe: system + user + assistant
-    // header.  Note: with the llama-completion "$" wrap applied by formatChat
+    // header.  Note: with the reference CLI "$" wrap applied by formatChat
     // for qwen35moe, the actual string fed to tokenize() is:
     //   <|im_start|>user\n$<system+user turns><|im_end|>\n<|im_start|>assistant\n
     const std::string question =

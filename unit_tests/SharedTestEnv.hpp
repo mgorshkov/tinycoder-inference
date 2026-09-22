@@ -65,7 +65,7 @@ public:
                       << " tokens" << std::endl;
 
             // ---- Bench-parity page-cache warmup (2026-09-15) ----
-            // tinycoder_bench measures WARM (llama-bench tgen protocol: a
+            // tinycoder_bench measures WARM (the reference benchmark tgen protocol: a
             // warmup prefill+decode rep runs before the timed reps), while this
             // gtest previously measured COLD first-touch of the weight pages.
             // On a 35 GB qwen35moe model in a ~29 GB-RAM machine the cold/warm

@@ -1,29 +1,8 @@
 // -----------------------------------------------------------------------------
-// tinycoder_bench — llama-bench-parity generation benchmark.
-//
-// WHY THIS EXISTS (2026-08-29):
-//   The gtest Q2 (SampleQuestionTest) measures a SINGLE COLD 64-token run with
-//   SAMPLING (temp 0.7, topK 40, topP 0.9, repeatPenalty 1.1). llama-bench's
-//   `tg64` is the mean of WARM REPEAT runs with GREEDY decoding (temp 0) and a
-//   FIXED token stream. The two were previously quoted side-by-side in the plan
-//   (plans/generation_optimizations.md §6.6/§6.7), which is a measurement
-//   confound: the cold first run pays page-cache + thread-pool startup and the
-//   sampled token stream (and therefore the KV-cache position pattern) differs
-//   run-to-run.
-//
-//   This harness reproduces llama-bench's tg protocol exactly so TinyCoder
-//   numbers are comparable to `llama-bench -p 64 -n 64`:
-//     - fixed 64-token prompt (llama-bench's pp64/tg64 uses a 64-token prompt)
-//     - GREEDY decode: plain argmax over logits, repeatPenalty = 1.0 (llama-bench
-//       defaults: repeat_penalty 1.0, no topK/topP, temp 0)
-//     - timing EXCLUDES prefill: only the decode loop (per-token forward)
-//       is timed, exactly like llama-bench's tgen
-//     - warmup run first (llama-bench runs a warmup batch), then N reps,
-//       reporting mean ± stdev over reps (llama-bench reports mean/stddev of
-//       the reps).
+// tinycoder_bench — prefill/generation benchmark.
 //
 // Usage:
-//   tinycoder_bench [--model <path>] [--n-prompts 64] [--n-gen 64]
+//   tinycoder_bench [--model <path>] [--n-prompts 512] [--n-gen 128]
 //                   [--reps 5] [--threads N]
 //   TINYCODER_THREADS=N env var is honored by ThreadPool::recommendedThreadCount.
 // -----------------------------------------------------------------------------
@@ -44,9 +23,9 @@ namespace {
 
     struct BenchOpts {
         std::string modelPath;
-        int32_t nPrompts = 64;  // prompt token count (llama-bench pp64)
-        int32_t nGen = 64;      // generated token count (llama-bench tg64)
-        int32_t reps = 5;       // warm repeats (llama-bench default 5)
+        int32_t nPrompts = 512; // prompt token count
+        int32_t nGen = 128;     // generated token count
+        int32_t reps = 5;       // warm repeats
         int32_t threads = 0;    // 0 = recommendedThreadCount()
         bool gpu = false;       // --gpu: use the CUDA offload engine
     };
@@ -58,10 +37,6 @@ namespace {
     }
 
     std::vector<int32_t> buildPrompt(int32_t nTokens) {
-        // llama-bench uses a fixed pool of random latin tokens to build the
-        // pp64 prompt. Any deterministic 64-token stream is equivalent for
-        // bandwidth measurement purposes; use a fixed seed so reps are
-        // bit-identical AND re-runs are reproducible.
         std::vector<int32_t> t;
         t.reserve(nTokens);
         uint64_t s = 0x5EED123456789ULL;
@@ -91,20 +66,20 @@ namespace {
         int32_t tokens = 0; // generated tokens this rep
     };
 
-    // Run one llama-bench-style benchmark rep: prefill (untimed), then decode
+    // Prefill (untimed), then decode
     // nGen tokens greedily, timing ONLY the decode loop.
     RepResult runOneRep(tinycoder::Model &model, const std::vector<int32_t> &prompt,
                         int32_t nGen, double &prefillMsOut,
                         const int32_t vocabSize) {
         // Prefill on a cleared cache, timed separately as a diagnostic
-        // (EXCLUDED from the decode rate, exactly like llama-bench's tgen).
+        // (EXCLUDED from the decode rate).
         model.clearKVCache();
         auto t0 = nowMs();
         auto logits = model.forward(prompt, false);
         auto t1 = nowMs();
         prefillMsOut = t1 - t0;
 
-        // Decode loop — THE measured region (llama-bench tgen).
+        // Decode loop — THE measured region.
         double tDec0 = nowMs();
         int32_t tok = argmaxTop(logits.data(), vocabSize);
         int32_t gen = 0;
@@ -125,8 +100,8 @@ namespace {
         std::fprintf(stderr,
                      "Usage: %s [options]\n"
                      "  --model <path>   GGUF model (default: $TINYCODER_MODEL_PATH)\n"
-                     "  --n-prompts N    prompt token count (default 64)\n"
-                     "  --n-gen N        generated token count (default 64)\n"
+                     "  --n-prompts N    prompt token count (default 512)\n"
+                     "  --n-gen N        generated token count (default 128)\n"
                      "  --reps N         warm repeat count (default 5)\n"
                      "  --threads N      thread pool size (default: logical CPUs)\n"
 #ifdef USE_CUDA
@@ -221,7 +196,7 @@ int main(int argc, char **argv) {
                  "timing, warmup+reps)\n\n",
                  opt.nPrompts, opt.nGen, opt.reps, threads);
 
-    // ---- Warmup rep (llama-bench runs a warmup batch first) ----
+    // ---- Warmup rep ----
     // The warmup is the COLD first-touch pass (page cache miss): on a 35 GB
     // qwen35moe model in <35 GB RAM it is 15-23x slower than the warm reps and
     // matches the COLD numbers the question tests used to report — the exact
@@ -259,7 +234,7 @@ int main(int argc, char **argv) {
                      ppRate);
     }
 
-    // ---- Aggregate (mean ± stdev over reps, like llama-bench) ----
+    // ---- Aggregate (mean ± stdev over reps) ----
     double mean = 0.0;
     for (double v: tokPerSec) mean += v;
     mean /= static_cast<double>(opt.reps);

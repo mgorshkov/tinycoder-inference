@@ -50,9 +50,8 @@ namespace tinycoder {
         /// K-quant block size constant used in dequantization functions.
         static constexpr uint32_t QK_K = 256;
 
-        /// IQ4_NL / IQ4_XS 4-bit lookup table (same nibble mapping as llama.cpp
-        /// `kvalues_iq4nl`). Both formats index this table with 4-bit weights:
-        ///   value = scale * kvalues_iq4nl[nibble]
+        // Both formats index this table with 4-bit weights: value = scale *
+        // kvalues_iq4nl[nibble]
         static constexpr int8_t kvalues_iq4nl[16] = {
                 -127, -104, -83, -65, -49, -35, -22, -10,
                 1, 13, 25, 38, 53, 69, 89, 113};
@@ -269,12 +268,9 @@ namespace tinycoder {
             return result;
         }
 
-        /// @brief Dequantize a Q8_1 block (32 weights, 36 bytes per block).
-        /// Block layout: d(fp16,2) + s(fp16,2) + qs(int8,32) = 36 bytes (block_q8_1).
-        /// Per-weight value = q * d. The `s` field is a precomputed sum (d * sum(q))
-        /// used only for cross-type activation compensation in llama.cpp, never as
-        /// a per-weight reconstructor — as a weight (src0) matrix it is
-        /// dequantized exactly like Q8_0 but with the extra 2-byte s field.
+        // @brief Dequantize a Q8_1 block (32 weights, 36 bytes per block).
+        // Block layout: d(fp16,2) + s(fp16,2) + qs(int8,32) = 36 bytes
+        // (block_q8_1). Per-weight value = q * d.
         static void dequantizeQ8_1Block(const uint8_t *blockData, float *out) {
             float d_val = halfToFloat(*(const uint16_t *) (blockData + 0));
             const int8_t *qs = reinterpret_cast<const int8_t *>(blockData + 4);
@@ -1801,12 +1797,8 @@ namespace tinycoder {
             return static_cast<float>(dot);
         }
 
-        /// @brief Fused dot product for IQ2_XXS block (256 weights, 66 bytes).
-        /// Block layout: d(fp16,2) + qs[32 x uint16] = 66 bytes. Mirrors llama
-        /// dequantize_row_iq2_xxs: per 32-weight sub-block, aux32 = two uint32
-        /// words from qs[4*ib32..]; the low bytes aux8[0..3] are grid indices
-        /// (0-255) into iq2xxs_grid; db = d*(0.5+(aux32[1]>>28))*0.25; signs
-        /// ksigns_iq2xs[(aux32[1] >> 7*l) & 127].
+        // @brief Fused dot product for IQ2_XXS block (256 weights, 66 bytes).
+        // Block layout: d(fp16,2) + qs[32 x uint16] = 66 bytes.
         static float dotProductIQ2_XXS(const uint8_t *blockData, const float *x) {
             float d_val = halfToFloat(*(const uint16_t *) (blockData + 0));
             const uint8_t *qs = blockData + 2;
@@ -1889,15 +1881,11 @@ namespace tinycoder {
             return static_cast<float>(dot);
         }
 
-        /// @brief True when ggmlType has a llama-parity Q8_K integer dot path
-        /// (IQ2_S / IQ3_XXS / IQ3_S). llama.cpp's CPU mul_mat quantizes the
-        /// activation vector to Q8_K (the vec_dot_type of these types) once per
-        /// matmul and accumulates with exact integer math in
-        /// vec_dot_iq*_q8_K, which is numerically different from a float
-        /// dequant-dot (up to ~5% on real activations). Mirror it here.
-        // TEMP-DIAG: TINYCODER_DISABLE_Q8K_DOT=1 forces the float dequant-dot
-        // path for IQ2_S/IQ3_XXS/IQ3_S so we can A/B it against the GPU's
-        // kQGemv float-dot decode kernels (which never quantize activations).
+        // @brief True when ggmlType has a reference-parity Q8_K integer dot
+        // path (IQ2_S / IQ3_XXS / IQ3_S). Mirror it here. TEMP-DIAG:
+        // TINYCODER_DISABLE_Q8K_DOT=1 forces the float dequant-dot path for
+        // IQ2_S/IQ3_XXS/IQ3_S so we can A/B it against the GPU's kQGemv
+        // float-dot decode kernels (which never quantize activations).
         static bool supportsQ8KDot(uint32_t ggmlType) {
             if (std::getenv("TINYCODER_DISABLE_Q8K_DOT") != nullptr) {
                 return false;
@@ -1906,13 +1894,9 @@ namespace tinycoder {
                    ggmlType == GGML_TYPE_IQ3_S;
         }
 
-        /// @brief Q8_K integer dot product for one IQ2_S block, mirroring
-        /// llama.cpp's ggml_vec_dot_iq2_s_q8_K_generic exactly
-        /// (quants.c): integer bsum accumulation, d = fp16(x.d)*y.d,
-        /// result = 0.125f * sumf.
-        /// Block layout: d(fp16,2) + qs[64] + qh[8] + scales[8] (82 bytes);
-        /// signs at qs+QK_K/8. Per (ib32,l): sub-scale ls1/ls2 from the
-        /// nibbles of scales[ib32]; grid index = qs[l] | ((qh[ib32] << (8-2l)) & 0x300).
+        // Block layout: d(fp16,2) + qs[64] + qh[8] + scales[8] (82 bytes);
+        // signs at qs+QK_K/8. Per (ib32,l): sub-scale ls1/ls2 from the nibbles
+        // of scales[ib32]; grid index = qs[l] | ((qh[ib32] << (8-2l)) & 0x300).
         static float dotProductIQ2_S_Q8K(const uint8_t *blockData, const Q8KBlock *q8) {
             const float d = halfToFloat(*(const uint16_t *) (blockData + 0)) * q8->d;
             const uint8_t *qs0 = blockData + 2;
@@ -1920,9 +1904,6 @@ namespace tinycoder {
             const uint8_t *scales = blockData + 74;
             const int8_t *yq = q8->qs;
 
-            // Mirror llama's ggml_vec_dot_iq2_s_q8_K generic loop exactly:
-            //   q8 advances 16 per ib32 (2 sub-blocks of 4 l × 8 j);
-            //   sumi1 uses yq[ib32*32 + 0..15], sumi2 uses yq[ib32*32 + 16..31].
             int bsum = 0;
             for (uint32_t ib32 = 0; ib32 < QK_K / 32; ++ib32) {
                 const uint8_t *qs = qs0 + ib32 * 4;
@@ -1945,26 +1926,19 @@ namespace tinycoder {
                 }
                 bsum += ls1 * sumi1 + ls2 * sumi2;
             }
-            // Unscaled d*bsum: the caller accumulates sumf (float) across the
-            // row's blocks and applies the 0.125f scale once, exactly as llama's
-            // ggml_vec_dot_iq2_s_q8_K_generic does for a multi-block row.
             return d * static_cast<float>(bsum);
         }
 
-        /// @brief Q8_K integer dot product for one IQ3_XXS block, mirroring
-        /// llama.cpp's ggml_vec_dot_iq3_xxs_q8_K_generic exactly:
-        /// result = 0.25f * sumf.
-        /// Block layout: d(fp16,2) + qs[96] (98 bytes); scales_and_signs at
-        /// qs+QK_K/4. Per ib32: ls = 2*(aux32>>28)+1, signs
-        /// ksigns_iq2xs[(aux32 >> 7*l) & 127], grid1/grid2 from IQ3XXS_GRID.
+        // Block layout: d(fp16,2) + qs[96] (98 bytes); scales_and_signs at
+        // qs+QK_K/4. Per ib32: ls = 2*(aux32>>28)+1, signs ksigns_iq2xs[(aux32
+        // >> 7*l) & 127], grid1/grid2 from IQ3XXS_GRID.
         static float dotProductIQ3_XXS_Q8K(const uint8_t *blockData, const Q8KBlock *q8) {
             const float d = halfToFloat(*(const uint16_t *) (blockData + 0)) * q8->d;
             const uint8_t *q3 = blockData + 2;
             const uint8_t *gas = q3 + QK_K / 4;
             const int8_t *yq = q8->qs;
 
-            // llama's generic loop advances q8 by 8 per l (32 per ib32), so
-            // sub-block ib32 uses yq[ib32*32 .. ib32*32+31].
+            // ib32*32+31].
             int32_t bsum = 0;
             uint32_t aux32;
             for (uint32_t ib32 = 0; ib32 < QK_K / 32; ++ib32) {
@@ -1993,12 +1967,9 @@ namespace tinycoder {
             return d * static_cast<float>(bsum);
         }
 
-        /// @brief Q8_K integer dot product for one IQ3_S block, mirroring
-        /// llama.cpp's ggml_vec_dot_iq3_s_q8_K_generic exactly:
-        /// result = sumf (no trailing scale).
-        /// Block layout: d(fp16,2) + qs[64] + qh[8] + signs[32] + scales[4]
-        /// (110 bytes). Per pair of 32-entry halves: ls1/ls2 from scales[ib/2]
-        /// nibbles; grid idx1/idx2 with the qh bit at bit 8.
+        // Block layout: d(fp16,2) + qs[64] + qh[8] + signs[32] + scales[4] (110
+        // bytes). Per pair of 32-entry halves: ls1/ls2 from scales[ib/2]
+        // nibbles; grid idx1/idx2 with the qh bit at bit 8.
         static float dotProductIQ3_S_Q8K(const uint8_t *blockData, const Q8KBlock *q8) {
             const float d = halfToFloat(*(const uint16_t *) (blockData + 0)) * q8->d;
             const uint8_t *qs = blockData + 2;
@@ -2042,12 +2013,9 @@ namespace tinycoder {
                 signs += 4;
                 bsum += sumi * ls2;
             }
-            // Unscaled d*bsum (no trailing scale for IQ3_S in llama).
             return d * static_cast<float>(bsum);
         }
 
-        /// @brief Trailing row scale applied by llama's vec_dot_iq*_q8_K once
-        /// per row: IQ2_S -> 0.125f, IQ3_XXS -> 0.25f, IQ3_S -> 1.0f.
         static float q8KDotRowScale(uint32_t ggmlType) {
             switch (ggmlType) {
                 case GGML_TYPE_IQ2_S:
@@ -2061,12 +2029,7 @@ namespace tinycoder {
             }
         }
 
-        /// @brief Dispatch to the per-block Q8_K integer dot (unscaled d*bsum).
-        /// @param blockData Weight block (IQ2_S / IQ3_XXS / IQ3_S)
-        /// @param q8        Q8_K-quantized activation block (from quantizeQ8K)
-        /// Mirrors llama.cpp vec_dot_iq*_q8_K inner accumulation:
-        /// d = fp16(block.d) * q8->d, integer bsum; the trailing 0.125/0.25/1.0
-        /// scale is applied once per row by the caller (q8KDotRowScale).
+        // @brief Dispatch to the per-block Q8_K integer dot (unscaled d*bsum).
         static float dotProductFusedQ8K(uint32_t ggmlType, const uint8_t *blockData,
                                         const Q8KBlock *q8, uint32_t blockSize) {
             uint32_t fullBlockSize = ggmlBlockSize(ggmlType);
@@ -2095,14 +2058,11 @@ namespace tinycoder {
             }
         }
 
-        /// @brief Fully llama-parity matrix-vector multiply for IQ2_S /
-        /// IQ3_XXS / IQ3_S matrices: quantize the activation x to Q8_K once,
-        /// then per output row accumulate sumf (float) over the row's blocks via
-        /// the integer dots and apply the trailing scale once. This reproduces
-        /// llama.cpp's ggml_cpu mul_mat + vec_dot_iq*_q8_K bit-for-bit
-        /// (including the float sumf rounding), which is numerically different
-        /// from a float dequant-dot (up to ~5% on real activations).
-        /// Weight layout: data[j * blocksPerRow * typeSize + b * typeSize].
+        // @brief Fully reference-parity matrix-vector multiply for IQ2_S /
+        // IQ3_XXS / IQ3_S matrices: quantize the activation x to Q8_K once,
+        // then per output row accumulate sumf (float) over the row's blocks via
+        // the integer dots and apply the trailing scale once. Weight layout:
+        // data[j * blocksPerRow * typeSize + b * typeSize].
         static void matMulVecFusedQ8K(uint32_t ggmlType, const uint8_t *data,
                                       const float *x, uint32_t rows, uint32_t cols,
                                       float *result) {
@@ -2130,18 +2090,15 @@ namespace tinycoder {
                     const uint8_t *blockData = rowData + static_cast<uint64_t>(b) * typeSize;
                     uint32_t start = b * blockSize;
                     uint32_t n = std::min(blockSize, cols - start);
-                    // Integer dot (unscaled d*bsum), float-accumulated across
-                    // blocks exactly like llama's `sumf += d * bsum;`.
                     sumf += dotProductFusedQ8K(ggmlType, blockData, &q8[b], n);
                 }
                 result[j] = scale * sumf;
             });
         }
 
-        /// @brief Batched matMulVecFusedQ8K over seqLen tokens sharing the same
-        /// weight matrix. Each token's x row is quantized to Q8_K once; every
-        /// output row reproduces llama's vec_dot_iq*_q8_K accumulation.
-        /// out[s * rows + j] = scale * sumf over the row's blocks.
+        // @brief Batched matMulVecFusedQ8K over seqLen tokens sharing the same
+        // weight matrix. out[s * rows + j] = scale * sumf over the row's
+        // blocks.
         static void matMulVecBatchQ8K(uint32_t ggmlType, const uint8_t *data,
                                       const float *X, uint32_t seqLen,
                                       uint32_t rows, uint32_t cols, float *out) {
@@ -2304,11 +2261,6 @@ namespace tinycoder {
         static void matMulVecFused(uint32_t ggmlType, const uint8_t *data,
                                    const float *x, uint32_t rows, uint32_t cols,
                                    float *result) {
-            // IQ2_S / IQ3_XXS / IQ3_S: llama.cpp CPU mul_mat quantizes the
-            // activation to Q8_K and uses exact integer vec_dot_iq*_q8_K
-            // accumulation, which differs numerically from a float dequant-dot
-            // (up to ~5% on real activations). Route through the llama-parity
-            // path so Q/K/FFN results match llama bit-for-bit.
             if (supportsQ8KDot(ggmlType)) {
                 matMulVecFusedQ8K(ggmlType, data, x, rows, cols, result);
                 return;
@@ -2389,7 +2341,7 @@ namespace tinycoder {
         static void matMulVecFusedCacheBlocked(uint32_t ggmlType, const uint8_t *data,
                                                const float *x, uint32_t rows,
                                                uint32_t cols, float *result) {
-            // IQ2_S / IQ3_XXS / IQ3_S route through the llama-parity Q8_K
+            // IQ2_S / IQ3_XXS / IQ3_S route through the reference-parity Q8_K
             // integer path (see matMulVecFused).
             if (supportsQ8KDot(ggmlType)) {
                 matMulVecFusedQ8K(ggmlType, data, x, rows, cols, result);
@@ -2968,14 +2920,12 @@ namespace tinycoder {
 
         /// @brief Fused gate+up matrix-vector multiply for COMPACT (raw) Q2_K
         /// data — single-token (generation) fast path.
-        ///
-        /// Identical maths to matMulVecFusedGateUpQ2_K_PrePacked_Q8 but reads the
-        /// raw 84-byte Q2_K blocks (scales[16], qs[64] packed 2-bit, fp16 d/dmin)
-        /// and unpacks the 2-bit quants to bytes on the fly inside the kernel.
-        /// Generation is DRAM-bandwidth-bound and gate+up is the dominant
-        /// per-token cost; the compact layout is 84 B/block vs 276 B/block for the
-        /// prepacked copy — a ~3.3x reduction in weight traffic (matches llama.cpp).
-        ///
+        //
+        // Identical maths to matMulVecFusedGateUpQ2_K_PrePacked_Q8 but reads
+        // the raw 84-byte Q2_K blocks (scales[16], qs[64] packed 2-bit, fp16
+        // d/dmin) and unpacks the 2-bit quants to bytes on the fly inside the
+        // kernel.
+        //
         /// @param gateData Raw (compact) Q2_K data for the gate matrix
         /// @param upData   Raw (compact) Q2_K data for the up matrix
         /// @param x        Input vector (size cols)

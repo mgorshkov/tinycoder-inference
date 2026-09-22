@@ -237,8 +237,7 @@ namespace tinycoder {
             }
 
             // ---- Build device layer descriptors for the offloaded prefix ----
-            // Default: offload ALL layers (full model on GPU). $TINYCODER_NGL
-            // overrides with a partial offload count (llama.cpp -ngl style).
+            // Default: offload ALL layers (full model on GPU).
             uint32_t nGpu = cfg.numLayers;
             if (cfg.architecture == ARCH_QWEN35MOE) {
                 // qwen35moe: FULL offload ONLY — the user's requirement ("make
@@ -256,10 +255,7 @@ namespace tinycoder {
             } else if (cfg.architecture == ARCH_QWEN35) {
                 // qwen35 is the only architecture whose host-side dispatch
                 // (Model::forward) supports the partial-offload continuation,
-                // so auto-fit is gated to it.  (qwen2 partial offload would
-                // leave the hidden state on the device without a CPU resumer.)
-                // No explicit -ngl: auto-fit the layer count to the GPU's free
-                // VRAM (llama.cpp -ngl auto style).  Estimate per-layer device
+                // so auto-fit is gated to it. Estimate per-layer device
                 // residency (quantized weights + KV slots + recurrent conv/GDN
                 // state) and pack as many layers as fit next to the embedding.
                 // Partial offload skips the separate LM-head upload (the CPU
@@ -496,14 +492,8 @@ namespace tinycoder {
             if (!gpu_.upload(deviceLayers, geom, emb.data.data(), emb.type,
                              embRowBytes, lmHeadQ, lmHeadType, lmHeadRowBytes,
                              err)) {
-                // Failed to fit.  For qwen35moe, retry ONCE in CPU-expert
-                // hybrid mode (llama.cpp `--cpu-moe` style): the 256-expert
-                // matrices (~32B of the model's 35B params) stay in host RAM
-                // and only the top-8 of 256 experts per token are computed on
-                // the CPU, so IQ2_M (~11.5 GB) and Q4_K_M (~22 GB) fit the
-                // 11 GB card while the GPU still runs embedding, GDN/attention,
-                // post-attn norm, KV cache and the LM head.  IQ1_M fits the
-                // full-GPU upload on the first try and never reaches this path.
+                // Failed to fit. IQ1_M fits the full-GPU upload on the first
+                // try and never reaches this path.
                 if (cfg.architecture == ARCH_QWEN35MOE && !moeCpuEnabled_) {
                     // TINYCODER_DUMP_MOE=1: dump the CPU reference L0 MoE
                     // output (routed + shared) so the GPU fast path's tiny

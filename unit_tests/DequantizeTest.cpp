@@ -26,8 +26,6 @@ SOFTWARE.
  * TinyCoder Dequantization Unit Test
  *
  * Tests the GGML dequantization functions against known constants.
- * These test vectors are derived from the reference implementation
- * to verify correctness of the dequantization routines.
  *
  * Each test creates a known quantized block with specific values and
  * verifies that dequantization produces the expected float values.

@@ -14,7 +14,7 @@ cmake_minimum_required(VERSION 3.18.0)
 #   cmake --build build --config Release
 #   ctest --test-dir build            # when BUILD_TESTS=ON
 # ---------------------------------------------------------------------------
-project(tinycoder_inference VERSION 0.3.0 DESCRIPTION "High-Performant local inference engine" LANGUAGES CXX)
+project(tinycoder_inference VERSION 0.4.0 DESCRIPTION "High-Performant local inference engine" LANGUAGES CXX)
 enable_testing()
 
 # ---- Options ----
@@ -30,36 +30,12 @@ option(ENABLE_AVX512_VBMI2 "Enable AVX-512 VBMI2 (byte compress/expand; Ice Lake
 option(ENABLE_AMX "Enable AMX (Advanced Matrix Extensions) optimizations" OFF)
 option(ENABLE_OPENMP "Enable OpenMP parallelization" ON)
 option(BUILD_SHARED_LIBS "Build shared library" OFF)
-# Fused gate+up+down FFN kernel scheduling: ON uses dynamic chunked
-# work-stealing (llama.cpp ggml_compute_forward_mul_mat_one_chunk style,
-# lever 1 in plans/generation_optimizations.md); OFF restores the static slab
-# dispatch. Measured 2026-08-27 (i7-4790K, 64-token questions, 49/49 parity):
-# steal is faster at BOTH thread counts - 4 threads 19.44-19.88 -> 21.56-22.50
-# tok/s (+11-14%, the parity levers' main unlock) and 8 threads 26.06-26.20 ->
-# 26.33-26.55 (+~1%) - so ON is the default. Flip OFF only to A/B the slab.
 option(TINYCODER_FFN_STEAL "Fused FFN kernel uses chunked work-stealing scheduling" ON)
-# CPU affinity for worker threads. ON (default, 2026-08-28 re-measured) pins each
-# participating thread (workers + main) to a DISTINCT logical CPU so no two
-# threads share an HT lane on the memory-bound generation kernels. Measured on
-# the reference host (i7-4790K, 8 logical CPUs) with this distinct-logical-CPU
-# distribution (not the old physical-core-cramming modulo): interleaved A/B
-# 25.73/25.79/25.76 tok/s (ON) vs 25.59/25.65/25.63 (OFF) - a small but
-# reproducible +0.5% with 49/49 parity, at both 4 and 8 threads. The earlier OFF
-# default was against the wrong (physical-core-cram) distribution. Runtime
-# override: $TINYCODER_AFFINITY=0/1; the bridge also respects this now.
+# CPU affinity for worker threads.
 option(TINYCODER_AFFINITY "Pin worker threads to distinct logical CPUs" ON)
-# Fused FFN act->Q8_K quantize scheduling. ON (default) runs the shared-act
-# quantize cooperatively INSIDE phase 1 via per-block last-arriver counters
-# (the llama.cpp `from_float` pattern - plans/generation_optimizations.md O1
-# re-attempt at 4 threads): each 256-row act block is quantized by whichever
-# thread stores its final 16-row tile, so the quantize ALU overlaps the rest
-# of phase-1's DRAM streaming instead of serializing on the main thread
-# between the phases. OFF restores the pre-O1 serial `between` callback (the
-# A/B baseline). Bit-exact (identical quantized bytes), 49/49 parity holds.
+# Fused FFN act->Q8_K quantize scheduling.
 option(TINYCODER_COOP_QUANTIZE "Fused FFN act quantize uses cooperative last-arriver scheduling" ON)
-# Work-stealing chunk size (in tiles) for the fused FFN kernel. llama.cpp's
-# single-token mul_mat dynamic work-stealing benefits from a larger chunk at low
-# thread counts (4): smaller chunks add atomic-fetch_add contention. 8-12 at 4
+# Work-stealing chunk size (in tiles) for the fused FFN kernel. 8-12 at 4
 # threads reduces that overhead.
 set(TINYCODER_STEAL_CHUNK "4" CACHE STRING "Fused FFN work-stealing chunk size (tiles)")
 option(BUILD_TESTS "Build unit tests and benchmarks" ON)
@@ -153,6 +129,7 @@ set(TINYCODER_HEADERS
     include/GGMLDequantize.hpp
     include/GGUFLoader.hpp
     include/GPUCompute.hpp
+    include/Int8Pack.hpp
     include/IQ3XXS.hpp
     include/LMHead.hpp
     include/LMHeadCUDA.hpp
@@ -186,10 +163,6 @@ if(TINYCODER_FFN_STEAL)
     set(SIMD_MATMUL_AVX2_FLAGS "${SIMD_MATMUL_AVX2_FLAGS} -DTINYCODER_STEAL_CHUNK=${TINYCODER_STEAL_CHUNK}")
 endif()
 if(TINYCODER_COOP_QUANTIZE)
-    # O1 cooperative quantize A/B: define TINYCODER_USE_COOP_QUANTIZE so the
-    # fused FFN's act->Q8_K quantize runs inline in phase-1 workers via the
-    # last-arriver counters (llama.cpp from_float) instead of the serial
-    # main-thread `between` callback.
     set(SIMD_MATMUL_AVX2_FLAGS "${SIMD_MATMUL_AVX2_FLAGS} -DTINYCODER_USE_COOP_QUANTIZE")
 endif()
 if(SIMD_MATMUL_AVX2_FLAGS)
@@ -290,7 +263,7 @@ endif()
 # ---- Unit Tests (Google Test) + benchmarks ----
 if(BUILD_TESTS)
     add_subdirectory(unit_tests)
-    # llama-bench-parity warm generation benchmark (benchmarks/BenchMain.cpp).
+    # reference-benchmark parity warm generation benchmark (benchmarks/BenchMain.cpp).
     # Kept intentionally OUT of unit_tests/: it is a measurement harness, not a
     # parity/correctness test - it would add a gtest-incompatible generate loop.
     add_subdirectory(benchmarks)

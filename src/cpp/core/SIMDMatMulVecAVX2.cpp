@@ -268,10 +268,6 @@ namespace tinycoder::simd {
             sumSq += static_cast<double>(x[i]) * static_cast<double>(x[i]);
         }
         // ggml computes scale = 1/sqrtf(mean + eps) -- eps INSIDE the sqrt.
-        // Previously the eps was added OUTSIDE (sqrt(mean) + eps), which
-        // systematically over-flattens every normalized vector and diverges
-        // from llama.cpp on every RMSNorm op (visible as a ~0.19% norm scale
-        // at the FIRST qwen35 layer, compounding across 64 layers).
         float invRms = 1.0f / (std::sqrt(static_cast<float>(sumSq / static_cast<double>(n)) + eps));
 
         __m256 invRmsVec = _mm256_set1_ps(invRms);
@@ -2954,6 +2950,105 @@ namespace tinycoder::simd {
         });
     }
 
+    // ---- AVX2 register-tiled batch GEMM for a single F32 matrix over a batch ----
+    //
+    // Router kernel. Computes out[s*rows + j] = sum_i X[s*cols + i] * W[j*cols + i]
+    // for all tokens s and output rows j, where W is a ROW-MAJOR fp32 matrix
+    // (the qwen35moe ffnGateInpMoe router is F32 [expertCount x hiddenSize]).
+    // Replaces the per-token scalar fp64-accumulation loop in
+    // QuantizedMatrix::matMulVec, which was the dominant CPU cost of the hybrid
+    // GPU callback (~16.6 ms/token decode, ~17.4 ms/token prefill on a 256x2048
+    // router x 40 layers).
+    //
+    // Design (mirrors the Q8_K/Q4_K batch kernels):
+    //   - Rows are processed in tiles of 8 (parallelForSlab over tiles), so the
+    //     x-vector is loaded once per (token, 8-lane group) and reused across
+    //     the 8 tile rows.
+    //   - Each (row, token) output accumulates into four __m256 FMA chains
+    //     (32 independent FMA lanes per chain step, classic latency-hiding),
+    //     horizontal-summed exactly once at the end.
+    //   - For prefill (seqLen > 1) the weight rows are streamed once and reused
+    //     across all seqLen tokens (weight-stationary, the prefill GEMM
+    //     optimization).
+    //
+    // Numerical stance: float FMA accumulation (vs the scalar fp64 loop). The
+    // router's output feeds only the top-k EXPERT SELECTION (probs = softmax,
+    // partial_sort) — tiny logit deltas from fp32-vs-fp64 rounding cannot flip a
+    // well-separated top-8, and the GPU-vs-CPU parity tests use top-10
+    // membership, not bit-equality. All router computations (pure-CPU path,
+    // hybrid CPU callback, decode and prefill) funnel through
+    // QuantizedMatrix::matMulVec, so batch-vs-sequential and CPU-vs-hybrid
+    // parity are preserved BY CONSTRUCTION (every path uses this same kernel).
+    void matMulVecBatchF32_AVX2(const float *W_f32, const float *X,
+                                uint32_t seqLen, uint32_t rows, uint32_t cols,
+                                float *out) {
+        static constexpr uint32_t BATCH_SIZE = 8;
+        if (seqLen == 0 || rows == 0 || cols == 0) {
+            return;
+        }
+        uint32_t numTiles = (rows + BATCH_SIZE - 1) / BATCH_SIZE;
+        ThreadPool::instance().parallelForSlab(0, numTiles, [&](uint32_t tile) {
+            uint32_t rowStart = tile * BATCH_SIZE;
+            uint32_t batchSize = std::min(BATCH_SIZE, rows - rowStart);
+
+            // Vector lanes: cols / 8 full __m256 groups; tail handled by the
+            // scalar epilogue.
+            const uint32_t vecGroups = cols >> 3;
+            const uint32_t tail = cols & 7u;
+
+            for (uint32_t r = 0; r < batchSize; ++r) {
+                const float *wrow = W_f32 +
+                                    static_cast<size_t>(rowStart + r) * cols;
+                for (uint32_t s = 0; s < seqLen; ++s) {
+                    const float *xrow = X + static_cast<size_t>(s) * cols;
+                    __m256 acc0 = _mm256_setzero_ps();
+                    __m256 acc1 = _mm256_setzero_ps();
+                    __m256 acc2 = _mm256_setzero_ps();
+                    __m256 acc3 = _mm256_setzero_ps();
+                    uint32_t i = 0;
+                    for (; i + 31 < vecGroups * 8; i += 32) {
+                        // 4 independent FMAs per step = 32 multiply-accumulates
+                        // in flight per accumulator chain pair.
+                        acc0 = _mm256_fmadd_ps(_mm256_loadu_ps(xrow + i),
+                                               _mm256_loadu_ps(wrow + i),
+                                               acc0);
+                        acc1 = _mm256_fmadd_ps(_mm256_loadu_ps(xrow + i + 8),
+                                               _mm256_loadu_ps(wrow + i + 8),
+                                               acc1);
+                        acc2 = _mm256_fmadd_ps(_mm256_loadu_ps(xrow + i + 16),
+                                               _mm256_loadu_ps(wrow + i + 16),
+                                               acc2);
+                        acc3 = _mm256_fmadd_ps(_mm256_loadu_ps(xrow + i + 24),
+                                               _mm256_loadu_ps(wrow + i + 24),
+                                               acc3);
+                    }
+                    for (; i + 7 < vecGroups * 8; i += 8) {
+                        acc0 = _mm256_fmadd_ps(_mm256_loadu_ps(xrow + i),
+                                               _mm256_loadu_ps(wrow + i),
+                                               acc0);
+                    }
+                    // Horizontal sum of the 4 chains.
+                    __m256 sv01 = _mm256_add_ps(acc0, acc1);
+                    __m256 sv23 = _mm256_add_ps(acc2, acc3);
+                    __m256 sv = _mm256_add_ps(sv01, sv23);
+                    __m128 hi = _mm256_extractf128_ps(sv, 1);
+                    __m128 lo = _mm256_castps256_ps128(sv);
+                    __m128 sum128 = _mm_hadd_ps(_mm_add_ps(lo, hi),
+                                                _mm_add_ps(lo, hi));
+                    sum128 = _mm_hadd_ps(sum128, sum128);
+                    float v = _mm_cvtss_f32(sum128);
+                    // Scalar tail (cols % 8): accumulated separately so the
+                    // vector part is never polluted by a partial-lane group.
+                    for (uint32_t k = 0; k < tail; ++k) {
+                        v += xrow[vecGroups * 8 + k] *
+                             wrow[vecGroups * 8 + k];
+                    }
+                    out[static_cast<size_t>(s) * rows + rowStart + r] = v;
+                }
+            }
+        });
+    }
+
     // ---- AVX2 register-tiled batch GEMM for a single Q8_K matrix over a batch ----
     //
     // Prefill kernel. Computes out[s*rows + j] = sum_i X[s*cols + i] * W[j*cols + i]
@@ -3025,9 +3120,6 @@ namespace tinycoder::simd {
 
                     for (uint32_t r = 0; r < batchSize; ++r) {
                         const tinycoder::Q8KBlock &w = *wblocks[r];
-                        // Raw int8 dot accumulated in int32 lanes: because both
-                        // operands are signed, substitute (|x|, w*sign(x)) so the
-                        // unsigned operand slot of maddubs is safe (llama.cpp trick).
                         __m256i sumi = _mm256_setzero_si256();
                         for (int i = 0; i < 8; ++i) {
                             __m256i wv = _mm256_loadu_si256(
@@ -3064,11 +3156,8 @@ namespace tinycoder::simd {
 
     // ---- AVX2 register-tiled batch GEMM for a single COMPACT Q3_K matrix over a batch ----
     //
-    // attnO and ffnDown are stored as Q3_K in the GGUF (110 bytes per 256-element
-    // block = 0.43 B/elem). Generation is DRAM-bandwidth-bound, so reading these
-    // compact blocks directly (instead of rebuilding and streaming Q8_K copies at
-    // 292 B/block = 1.14 B/elem) cuts the weight traffic ~2.65x, matching
-    // llama.cpp's working set for these two large matmuls.
+    // attnO and ffnDown are stored as Q3_K in the GGUF (110 bytes per
+    // 256-element block = 0.43 B/elem).
     //
     // Q3_K block layout (dequantizeQ3_KBlock):
     //   hm[32]    @0     sign mask (bit s selects sub-block s, never advanced)
@@ -4005,13 +4094,6 @@ namespace tinycoder::simd {
     // 8 routed experts per layer (the dominant decode cost) fell to the
     // ~0.3 GFLOP/s scalar path.
     //
-    // Integer dot (llama.cpp's vec_dot_q8_0_q8_0, which uses int8 activations
-    // when available): for each 32-wide block, y = d * ( qs_w · qs_x ) with the
-    // block's x segment quantized to int8. The x block is quantized on the fly
-    // (xmax/xd sign-fold like llama's quantize_row_q8_0): w_eff = w + 128
-    // (range [0,255]) is maddubs-dotted against the SIGNED int8 x in the
-    // signed slot — both operands are exact integers, so there is no float
-    // round-trip in the inner product at all (only the d*d8 scale is fp32).
     //
     // Because blocks are 32-wide, this kernel — unlike the 256-wide K-quant
     // kernels — is ALSO usable for single-token mat-vec over an arbitrary
@@ -4107,9 +4189,6 @@ namespace tinycoder::simd {
                             std::memset(xqs + b * BLOCK_SIZE, 0, BLOCK_SIZE);
                             continue;
                         }
-                        // llama quantize_row_q8_0: iscale = -127/max, xq =
-                        // min(127, lrintf(x*iscale)) — sign folded so -128 never
-                        // occurs.
                         const float iscale = -127.0f / maxv;
                         for (uint32_t j = 0; j < BLOCK_SIZE; ++j) {
                             int v = static_cast<int>(std::lrintf(iscale * xs[b * BLOCK_SIZE + j]));
@@ -4145,12 +4224,7 @@ namespace tinycoder::simd {
                                                    b * BLOCK_SIZE));
                         const __m256i wq = _mm256_loadu_si256((const __m256i *) qs);
                         // Both operands are SIGNED int8, so maddubs' unsigned
-                        // slot cannot take xqb directly. Use the sign-
-                        // substitution identity (same as the Q8_K x Q8_K kernel
-                        // and llama's vec_dot_q8_0_q8_0):
-                        //   dot(xq, qs) = dot(|xq|, qs * sign(xq))
-                        // |xq| in [0,127] is safe in slot A (unsigned), and
-                        // qs*sign(xq) is signed (slot B). The full 32-wide
+                        // slot cannot take xqb directly. The full 32-wide
                         // integer dot is EXACT — only the fp32 d*d8 scale
                         // approximates (identical math to vec_dot_q8_0_q8_0).
                         const __m256i xabs = _mm256_sign_epi8(xqb, xqb);
@@ -4897,11 +4971,9 @@ namespace tinycoder::simd {
             // byte there would be reinterpreted as value+256, corrupting the
             // product (e.g. x=-5, w=3 would compute 251*3 instead of -15).
             //
-            // Fix (same trick as llama.cpp): substitute (x, w) with
-            // (|x|, w*sign(x)). |x| is non-negative so it is safe in the
-            // unsigned slot, and |x| * (w*sign(x)) == x*w exactly. Per-byte
-            // products are bounded by 127*127, so the int16 intermediate in
-            // maddubs cannot saturate.
+            // |x| is non-negative so it is safe in the unsigned slot, and |x| *
+            // (w*sign(x)) == x*w exactly. Per-byte products are bounded by
+            // 127*127, so the int16 intermediate in maddubs cannot saturate.
             __m256i xv = _mm256_loadu_si256((const __m256i *) &x->qs[i]);
             __m256i wv = _mm256_loadu_si256((const __m256i *) &w->qs[i]);
             __m256i xabs = _mm256_sign_epi8(xv, xv);
@@ -5043,19 +5115,12 @@ namespace tinycoder::simd {
         float *act = actBuf.data();
 
 #if defined(TINYCODER_USE_COOP_QUANTIZE)
-        // Cooperative act→Q8_K quantize machinery — llama.cpp `from_float`
-        // LAST-ARRIVER pattern (plans/generation_optimizations.md lever O1
-        // re-attempt at 4 threads, 2026-08-28).
-        //
         // Each 256-row Q8_K block of `act` is produced by 16 phase-1 tiles
         // (BATCH_SIZE == 16 rows each). Instead of the serial `between`
         // callback (main thread quantizes ALL blocks after barrier-1 while
         // every worker spins on phase2Ready_), every phase-1 tile increments
         // its block's arrival counter as soon as it stores; the 16th (LAST)
-        // arriver runs that block's quantize inline. The quantize ALU thus
-        // overlaps the rest of phase-1's DRAM streaming on other threads
-        // instead of forming a serial bubble between the phases — llama.cpp's
-        // from_float does exactly this per block with a `++cnt == nb` check.
+        // arriver runs that block's quantize inline.
         //
         // Ordering: the acq_rel fetch_add chain orders the other 15 tiles'
         // act[] writes before the last arriver's quantize reads; the pool's
@@ -5216,7 +5281,7 @@ namespace tinycoder::simd {
         // matrices), unpack each compact Q2_K block's 2-bit planes on the fly,
         // and keep the per-tile gate/up accumulators in __m256 registers.
         //
-        // SEQUENTIAL-STREAMING LAYOUT (llama.cpp-style, lever A): each thread
+        // SEQUENTIAL-STREAMING LAYOUT (reference-style, lever A): each thread
         // owns a contiguous slab of ROWS; within a row it iterates BLOCKS
         // sequentially (r-outer / b-inner). This gives each thread ONE
         // contiguous 84-byte-block stream per matrix (gate / up) instead of the
@@ -5367,12 +5432,7 @@ namespace tinycoder::simd {
             uint32_t numTiles = (gRows + BATCH_SIZE - 1) / BATCH_SIZE;
             uint32_t phase2NumTiles = (hRows + BATCH_SIZE - 1) / BATCH_SIZE;
 #if defined(TINYCODER_USE_FFN_STEAL)
-            // Lever 1 (plans/generation_optimizations.md): dynamic chunked
-            // work-stealing dispatch (llama.cpp
-            // ggml_compute_forward_mul_mat_one_chunk style). Each thread pulls
-            // 4-tile chunks via fetch_add(4) instead of running a static slab,
-            // so DRAM stays saturated at the tail - the mechanism behind
-            // llama.cpp's 4-thread edge. Phase 2 steals 4 tiles at a time.
+            // Phase 2 steals 4 tiles at a time.
             ThreadPool::instance().parallelForSteal2(
                     0, numTiles, /*chunk1=*/TINYCODER_STEAL_CHUNK,
 #else
@@ -5502,9 +5562,6 @@ namespace tinycoder::simd {
                             const uint8_t *upRow = upData +
                                                    static_cast<uint64_t>(rowStart + r) * gRowStride;
 
-                            // Per-row accumulators: one __m256 per matrix, 8 partial
-                            // lanes (32 elements each), register-resident across the
-                            // WHOLE block stream; hsum ONCE at the store below (llama
                             for (uint32_t b = 0; b < gBlocksPerRow; ++b) {
                                 // Prefetch one block ahead (sequential stream).
                                 // T1 (L2-leaning) keeps the gate/up stream out of the
@@ -5559,15 +5616,15 @@ namespace tinycoder::simd {
                             act[rowStart + r] = gVal / (1.0f + std::exp(-gVal)) * uVal;
                         }
 #if defined(TINYCODER_USE_COOP_QUANTIZE)
-                        // Cooperative quantize — llama.cpp `from_float` LAST-ARRIVER
-                        // pattern (lever O1 re-attempt, 2026-08-28). This tile stored
-                        // act rows [rowStart, rowStart+batchSize), all within act block
-                        // coopB = rowStart/256 (BLOCK_SIZE divides BATCH_SIZE exactly).
-                        // Increment the block's arrival counter (acq_rel: the RMW chain
-                        // orders the other 15 tiles' act[] writes before this read);
-                        // the expected-th arriver quantizes the whole block inline,
-                        // overlapping the quantize ALU with other threads' phase-1 DRAM
-                        // streaming instead of a serial `between` bubble after barrier-1.
+                        // This tile stored act rows [rowStart,
+                        // rowStart+batchSize), all within act block coopB =
+                        // rowStart/256 (BLOCK_SIZE divides BATCH_SIZE exactly).
+                        // Increment the block's arrival counter (acq_rel: the
+                        // RMW chain orders the other 15 tiles' act[] writes
+                        // before this read); the expected-th arriver quantizes
+                        // the whole block inline, overlapping the quantize ALU
+                        // with other threads' phase-1 DRAM streaming instead of
+                        // a serial `between` bubble after barrier-1.
                         const uint32_t coopB = rowStart / BLOCK_SIZE;
                         const uint32_t prev = actArrivals[coopB].fetch_add(
                                 1, std::memory_order_acq_rel);

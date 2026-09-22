@@ -112,10 +112,7 @@ namespace tinycoder::simd {
             bool applySwish);
 
     // Register-tiled fused gate+up matvec for COMPACT (raw GGUF) Q2_K weights,
-    // single token (generation). Single-token fused gate+up is the dominant
-    // per-token cost and is DRAM-bandwidth-bound; the compact 84-byte Q2_K
-    // blocks (vs 276-byte prepacked) cut the weight traffic ~3.3x, matching
-    // llama.cpp's working set. The 2-bit quants are unpacked to bytes on the
+    // single token (generation). The 2-bit quants are unpacked to bytes on the
     // fly inside the kernel, producing exactly the element indices that the
     // prepacked layout would have (so the math is identical).
     void matMulVecFusedGateUpQ2_K_Compact_Q8_AVX2(
@@ -172,6 +169,20 @@ namespace tinycoder::simd {
                                     uint32_t seqLen, uint32_t rows,
                                     uint32_t cols, float *out);
 
+    // Register-tiled batch GEMM for a single F32 (fp32) weight matrix over a
+    // batch of tokens. Used for the qwen35moe ROUTER (ffnGateInpMoe is an F32
+    // [expertCount x hiddenSize] host matrix); the previous per-token scalar
+    // double-accumulation loop in QuantizedMatrix::matMulVec was the dominant
+    // CPU cost in the hybrid GPU callback (~16.6 ms/token decode, ~17.4 ms/token
+    // prefill). For each tile of 8 rows the weight rows are streamed once and
+    // reused across all seqLen tokens; the x-vector is loaded once per
+    // (token, 8-lane group) and reused across the 8 tile rows, and the partial
+    // sums stay in __m256 FMA accumulators (horizontal-summed once per output).
+    // Requires cols > 0; handles the cols % 8 scalar tail.
+    void matMulVecBatchF32_AVX2(const float *W_f32, const float *X,
+                                uint32_t seqLen, uint32_t rows, uint32_t cols,
+                                float *out);
+
     // Register-tiled batch GEMM for a single Q4_K weight matrix over a batch of
     // tokens (prefill). Used for the attnV projection (Q4_K has no prepacked
     // batch kernel otherwise). For each tile of 8 rows the per-block Q4_K scale/
@@ -184,15 +195,13 @@ namespace tinycoder::simd {
 
     // Register-tiled batch GEMM for a single COMPACT (raw GGUF) Q3_K weight
     // matrix over a batch of tokens. Used for attnO and ffnDown, which are
-    // stored as Q3_K in the model file (110 bytes/block = 0.43 B/elem vs
-    // 1.14 B/elem for the Q8_K copies that would otherwise be streamed).
-    // Generation is DRAM-bandwidth-bound, so reading the compact blocks
-    // directly cuts the weight traffic ~2.65x, matching llama.cpp's working
-    // set. The 2-bit planes unpack identically to the compact Q2_K kernel;
-    // the Q3_K sign mask (hm) is folded into the planes as w_eff = q2 + 4*hm
-    // (value = d_all*(sc-32)*(w_eff - 4)), and the per-16-group signed scales
-    // (sc-32) are broadcast by the same q3k shuffle table as the prepacked
-    // Q2_K kernels. The offset term -4*(sc-32)*bsum folds through the Q8KBlock
+    // stored as Q3_K in the model file (110 bytes/block = 0.43 B/elem vs 1.14
+    // B/elem for the Q8_K copies that would otherwise be streamed). The 2-bit
+    // planes unpack identically to the compact Q2_K kernel; the Q3_K sign mask
+    // (hm) is folded into the planes as w_eff = q2 + 4*hm (value =
+    // d_all*(sc-32)*(w_eff - 4)), and the per-16-group signed scales (sc-32)
+    // are broadcast by the same q3k shuffle table as the prepacked Q2_K
+    // kernels. The offset term -4*(sc-32)*bsum folds through the Q8KBlock
     // bsums.
     void matMulVecBatchQ3K_Q8K_AVX2(const uint8_t *W_q3k, const float *X,
                                     uint32_t seqLen, uint32_t rows,
@@ -246,15 +255,12 @@ namespace tinycoder::simd {
                                       uint32_t seqLen, uint32_t rows,
                                       uint32_t cols, float *out);
 
-    // Register-tiled batch GEMM for a single Q8_0 weight matrix over a batch
-    // of tokens. Q8_0 is a 32-weight block (34 B): d(fp16) + 32 int8 weights.
-    // There are cols/32 blocks per row. x is quantized to int8 per 32-block
-    // (llama quantize_row_q8_0 sign-fold) and the per-16-group dots run through
-    // _mm256_maddubs_epi16 against w+128 (exact integer math, fp32 d*d8 scale
-    // only). Unlike the 256-wide K-quant kernels this is ALSO usable for
-    // single-token mat-vec over an arbitrary contiguous row range — the MoE
-    // expert path (QuantizedMatrix::matMulVecRows) — so cols only needs
-    // % 32 == 0.
+    // Register-tiled batch GEMM for a single Q8_0 weight matrix over a batch of
+    // tokens. Q8_0 is a 32-weight block (34 B): d(fp16) + 32 int8 weights.
+    // There are cols/32 blocks per row. Unlike the 256-wide K-quant kernels
+    // this is ALSO usable for single-token mat-vec over an arbitrary contiguous
+    // row range — the MoE expert path (QuantizedMatrix::matMulVecRows) — so
+    // cols only needs % 32 == 0.
     void matMulVecBatchQ8_0_Q8K_AVX2(const uint8_t *W_q8_0, const float *X,
                                      uint32_t seqLen, uint32_t rows,
                                      uint32_t cols, float *out);

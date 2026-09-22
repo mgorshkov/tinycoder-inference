@@ -759,11 +759,9 @@ namespace tinycoder {
         mmapLen_ = mapLength;
         tensorData_ = static_cast<const uint8_t *>(mapResult) + pageOffset;
 
-        // The mapped weights are already file-backed on PMD (2 MB) pages via the
-        // page-cache readahead path — exactly the huge-page layout llama.cpp gets
-        // from its own mmap loader (see MemHints.hpp). No additional hint needed;
-        // MADV_HUGEPAGE would only hand khugepaged a ~16 GB range to collapse
-        // during load/inference (MemHints.hpp §6.10 measured regression).
+        // No additional hint needed; MADV_HUGEPAGE would only hand khugepaged a
+        // ~16 GB range to collapse during load/inference (MemHints.hpp §6.10
+        // measured regression).
 
         // ---- Load-time page-cache prefetch (2026-09-16) ----
         // The mmap is faulted in lazily: pages are read from disk only on first

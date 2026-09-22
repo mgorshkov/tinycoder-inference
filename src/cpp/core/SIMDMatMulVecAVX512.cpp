@@ -255,7 +255,7 @@ namespace tinycoder::simd {
     // maddubs product is 0 either way), keeping results bit-identical.
     static inline __m512i signEPI8_AVX512(__m512i a, __m512i b) {
         const __m512i zero = _mm512_setzero_si512();
-        __mmask64 neg = _mm512_cmpgt_epi8_mask(zero, b); // mask where b < 0
+        __mmask64 neg = _mm512_cmpgt_epi8_mask(zero, b);// mask where b < 0
         return _mm512_mask_blend_epi8(neg, a, _mm512_sub_epi8(zero, a));
     }
 
@@ -271,11 +271,8 @@ namespace tinycoder::simd {
             // _mm512_maddubs_epi16 treats its FIRST operand as unsigned bytes
             // and the second as signed bytes. Both qs arrays are signed int8,
             // so raw signed values cannot go into the unsigned slot (a negative
-            // byte would be reinterpreted as value+256). Substitute (x, w) with
-            // (|x|, w*sign(x)): |x| is safe in the unsigned slot and
-            // |x| * (w*sign(x)) == x*w exactly (same trick as llama.cpp).
-            // Products are bounded by 127*127, so the int16 intermediate in
-            // maddubs cannot saturate.
+            // byte would be reinterpreted as value+256). Products are bounded
+            // by 127*127, so the int16 intermediate in maddubs cannot saturate.
             __m512i xv = _mm512_loadu_si512((const __m512i *) &x->qs[i]);
             __m512i wv = _mm512_loadu_si512((const __m512i *) &w->qs[i]);
             // xabs = |xv| (VPABSB, AVX-512BW); the sign trick uses

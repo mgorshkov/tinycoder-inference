@@ -103,10 +103,6 @@ namespace {
             sumSq += static_cast<double>(x[i]) * static_cast<double>(x[i]);
         }
         // ggml computes scale = 1/sqrtf(mean + eps) -- eps INSIDE the sqrt.
-        // Previously the eps was added OUTSIDE (sqrt(mean) + eps), which
-        // systematically over-flattens every normalized vector and diverges
-        // from llama.cpp on every RMSNorm op (visible as a ~0.19% norm scale
-        // at the FIRST qwen35 layer, compounding across 64 layers).
         float invRms = 1.0f / (std::sqrt(static_cast<float>(sumSq / static_cast<double>(n)) + eps));
         for (uint32_t i = 0; i < n; ++i) {
             out[i] = x[i] * invRms * weight[i];
@@ -1106,6 +1102,38 @@ namespace tinycoder {
         }
 #endif
         (void) W_q8k;
+        (void) X;
+        (void) seqLen;
+        (void) rows;
+        (void) cols;
+        (void) out;
+        return false;
+    }
+
+    // ---- matMulVecBatchF32_SIMD ----
+    // Register-tiled batch GEMM for a single F32 (fp32) weight matrix over a
+    // batch of tokens. Used for the qwen35moe ROUTER (ffnGateInpMoe is an F32
+    // [expertCount x hiddenSize] host matrix): the previous per-token scalar
+    // fp64-accumulation loop in QuantizedMatrix::matMulVec was the dominant CPU
+    // cost of the hybrid GPU callback. Dispatches to the vector (AVX2) kernel
+    // when available; returns false so the caller falls back to the scalar
+    // fp64 reference loop on hosts without a vector kernel.
+    bool matMulVecBatchF32_SIMD(const float *W_f32, const float *X,
+                                uint32_t seqLen, uint32_t rows, uint32_t cols,
+                                float *out) {
+        static std::atomic<int> s_level{-1};
+        int level = s_level.load(std::memory_order_acquire);
+        if (level < 0) {
+            level = static_cast<int>(np::internal::max_simd_level());
+            s_level.store(level, std::memory_order_release);
+        }
+#if defined(__AVX2__) && defined(__FMA__)
+        if (level >= static_cast<int>(np::internal::SimdLevel::AVX2)) {
+            simd::matMulVecBatchF32_AVX2(W_f32, X, seqLen, rows, cols, out);
+            return true;
+        }
+#endif
+        (void) W_f32;
         (void) X;
         (void) seqLen;
         (void) rows;

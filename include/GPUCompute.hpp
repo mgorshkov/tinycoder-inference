@@ -34,14 +34,11 @@ SOFTWARE.
 namespace tinycoder::gpu {
 
     /// @brief One quantized weight matrix uploaded to the device.
-    ///
-    /// `q` holds the raw GGUF quantized bytes (Q2_K/Q3_K/Q4_K/Q6_K/IQ2_XS/
-    /// IQ3_S/Q5_K/...) so single-token generation streams the compact block
-    /// layout straight from VRAM (the same memory traffic llama.cpp's CUDA
-    /// GEMV uses).  There are NO persistent FP16 twins anymore: the cuBLAS
-    /// tensor-core batch-GEMM prefill path dequantizes ONE matrix per layer
-    /// on-device into the reusable wF16_ scratch (see dequantMatrixF16),
-    /// which keeps 7B+ models inside 11 GB of VRAM.
+    //
+    // There are NO persistent FP16 twins anymore: the cuBLAS tensor-core
+    // batch-GEMM prefill path dequantizes ONE matrix per layer on-device into
+    // the reusable wF16_ scratch (see dequantMatrixF16), which keeps 7B+ models
+    // inside 11 GB of VRAM.
     struct DeviceMatrix {
         void *q = nullptr;        // raw quantized bytes (row-major block layout)
         uint32_t rows = 0;        // output rows
@@ -49,6 +46,14 @@ namespace tinycoder::gpu {
         uint32_t type = 0;        // GGML_TYPE_* enum
         uint32_t blocksPerRow = 0;// number of 256-elem blocks per row
         uint32_t rowBytes = 0;    // q row stride in bytes
+        // Persistent fp16 twin (prefill fast path): NULL unless the uploader
+        // decided a persistent fp16 copy of THIS matrix fits VRAM (small
+        // dense models only — 1.5B q2_k is ~1.5x the quantized bytes, 7B+
+        // models leave this NULL because the full twin set would OOM the
+        // 11 GB card).  When set, dequantMatrixF16() returns it directly and
+        // the per-layer streaming dequant kernel is skipped entirely.
+        void *f16Twin = nullptr;
+        uint64_t f16TwinBytes = 0;
         bool empty_ = false;
         bool hasQ() const { return q != nullptr; }
     };
@@ -102,8 +107,6 @@ namespace tinycoder::gpu {
         uint32_t intermediateSize = 8960;
         uint32_t numLayers = 28;
         uint32_t numGpuLayers = 0;// 0 = offload all layers; >0 = offload only the
-                                  // first N layers (llama.cpp -ngl style partial
-                                  // offload, CPU handles the rest)
         uint32_t numAttentionHeads = 12;
         uint32_t numKVHeads = 2;
         uint32_t headDim = 128;
@@ -183,30 +186,26 @@ namespace tinycoder::gpu {
         /// in upload() from geom.numGpuLayers, clamped to numLayers).
         uint32_t numGpuLayers() const { return geom_.numGpuLayers; }
 
-        /// @brief CPU-expert hybrid callback (qwen35moe, llama.cpp `--cpu-moe`
-        /// style).  The adapter registers ONE callback; the GPU driver
-        /// dispatches on expertCacheBuilt():
-        ///   * cache built -> the callback runs the fp32 reference ROUTER
-        ///     (ffnGateInpMoe @ ffnNorm + softmax + top-k + renormalize) into
-        ///     the public host mirrors moeRouterIdxHost_/moeRouterWgtHost_;
-        ///     the per-expert FFNs run on the GPU through the per-layer expert
-        ///     cache (buildExpertCache/ensureExpertCached), so the host does
-        ///     ~µs of router work and the GPU does the entire expert FFN at
-        ///     VRAM bandwidth (no more ~32 MB/layer host-RAM streaming).
-        ///   * cache NOT built (device allocation failure fallback) -> the
-        ///     callback runs the FULL routed expert FFNs on the CPU into
-        ///     ffnOut (the old --cpu-moe path).
-        /// The CPU router is what keeps batch == single-token expert selection
-        /// bit-identical: the fp32 reference math (ffnGateInpMoe @ norm) is
-        /// identical for batch, decode and the pure-CPU path, so a borderline
-        /// expert cannot flip between prefills.
-        /// @param layer GPU layer index [0, numGpuLayers)
-        /// @param ffnNorm post-attn RMSNorm input (seqLen * hiddenSize floats,
-        ///        host)
-        /// @param ffnOut routed-expert FFN output (seqLen * hiddenSize floats,
-        ///        host; UNUSED when the expert cache is built)
-        /// @param seqLen number of tokens
-        /// @return false aborts the forward with an error
+        // The adapter registers ONE callback; the GPU driver dispatches on
+        // expertCacheBuilt(): * cache built -> the callback runs the fp32
+        // reference ROUTER (ffnGateInpMoe @ ffnNorm + softmax + top-k +
+        // renormalize) into the public host mirrors
+        // moeRouterIdxHost_/moeRouterWgtHost_; the per-expert FFNs run on the
+        // GPU through the per-layer expert cache
+        // (buildExpertCache/ensureExpertCached), so the host does ~µs of router
+        // work and the GPU does the entire expert FFN at VRAM bandwidth (no
+        // more ~32 MB/layer host-RAM streaming). * cache NOT built (device
+        // allocation failure fallback) -> the callback runs the FULL routed
+        // expert FFNs on the CPU into ffnOut (the old --cpu-moe path). The CPU
+        // router is what keeps batch == single-token expert selection
+        // bit-identical: the fp32 reference math (ffnGateInpMoe @ norm) is
+        // identical for batch, decode and the pure-CPU path, so a borderline
+        // expert cannot flip between prefills. @param layer GPU layer index [0,
+        // numGpuLayers) @param ffnNorm post-attn RMSNorm input (seqLen *
+        // hiddenSize floats, host) @param ffnOut routed-expert FFN output
+        // (seqLen * hiddenSize floats, host; UNUSED when the expert cache is
+        // built) @param seqLen number of tokens @return false aborts the
+        // forward with an error
         using MoeCpuFn = std::function<bool(uint32_t layer, const float *ffnNorm,
                                             float *ffnOut, uint32_t seqLen)>;
         void setMoeCpuFn(MoeCpuFn fn) { moeCpuFn_ = std::move(fn); }
@@ -323,6 +322,30 @@ namespace tinycoder::gpu {
         float debugQGemvRow(uint32_t type, const uint8_t *wRow,
                             uint32_t blocksPerRow, const float *x,
                             uint32_t cols, uint32_t rowBytes);
+
+        /// @brief Debug: run the int8 tensor-core MMQ GEMM/GEMV
+        /// (kQuantizeQ8K + kMmqGemm_8x8x16, mma.s8.m8n8k16) on an already-packed
+        /// IQ3_XXS matrix and a batch of activations.  This is the SAME kernel
+        /// for prefill (seq > 1) and decode (seq == 1) -- one warp per
+        /// (8-token x 8-row) output tile, one block per 8-row weight tile
+        /// spanning 64 tokens.
+        /// @param wPacked int8 B cells from Int8Pack::packMma
+        ///        (ceil(rows/8) * ceil(cols/16) * 128 bytes)
+        /// @param wScales per-(n8-tile, k16-tile, n-row) group scales from
+        ///        Int8Pack::packMma (ceil(rows/8) * ceil(cols/16) * 8 floats)
+        /// @param rows, cols PACKED matrix geometry (cols must be a multiple of
+        ///        32 so a weight k16-tile never straddles a 32-group)
+        /// @param x seq-row-major fp32 activation (seq * cols)
+        /// @param seq Number of activation rows (prefill batch / 1 for decode)
+        /// @param out seq-row-major fp32 output (seq * rows)
+        /// @param outXq Optional: receives the GPU-quantized Q8_K activations
+        ///        (seq * ceil(cols/256) * kQ8K_STRIDE bytes) so the caller can
+        ///        recompute the reference on the EXACT bytes the kernel used.
+        /// @return false (out untouched) if this GPU has no int8 m8n8k16
+        ///        tensor-core mma (pre-Turing) or CUDA is unavailable.
+        bool debugMmqGemm(const int8_t *wPacked, const float *wScales,
+                          uint32_t rows, uint32_t cols, const float *x,
+                          uint32_t seq, float *out, uint8_t *outXq);
 
         /// @brief Debug: quantize x with kQuantizeQ8_0x32 and emit the
         /// per-block float contributions kQGemvQ8_0xQ8K would accumulate.
@@ -441,13 +464,9 @@ namespace tinycoder::gpu {
             // and the Q half feeds the per-head Q RMSNorm + attention.
             float *q35QGate = nullptr;
             // Q8_K-quantized activation scratch for the decode (seqLen==1) GEMV
-            // of the IQ2_S/IQ3_XXS/IQ3_S matrices.  llama.cpp's CUDA backend
-            // quantizes the fp32 activation to Q8_K (vec_dot_type) and uses
-            // integer vec-dots (vec_dot_iq*_q8_K); the exact integer
-            // accumulation is numerically different from a float dequant-dot
-            // (up to ~5%), which flips near-tie argmax at knife-edge positions.
-            // Layout per block (stride kQ8K_STRIDE in GPUCompute.cu):
-            //   int8 qs[256] + int16 bsums[16] + float d.
+            // of the IQ2_S/IQ3_XXS/IQ3_S matrices. Layout per block (stride
+            // kQ8K_STRIDE in GPUCompute.cu): int8 qs[256] + int16 bsums[16] +
+            // float d.
             uint8_t *q8k = nullptr;// [blocksPerRow * kQ8K_STRIDE] Q8_K activation
             // [seqLen][hidden] RMSNorm output.  The norm results must NOT be
             // written back into `hidden`: `hidden` is the residual stream the
@@ -505,18 +524,15 @@ namespace tinycoder::gpu {
             uint32_t seqCap = 0;
         };
 
-        // ---- Qwen35MoE (qwen35moe) GPU expert cache ----
-        // When the 256-expert matrices cannot all fit in VRAM (hybrid mode,
-        // llama.cpp `--cpu-moe` style), ONLY the router + shared expert are
-        // uploaded.  The routed expert GEMVs are the decode hot path and MUST
-        // NOT stream ~32 MB/layer from host RAM every token (that pages on
-        // models larger than the page cache and leaves the GPU idle).  This
-        // cache holds the RECENTLY-USED experts on the device so steady-state
-        // decode hits VRAM bandwidth: direct-mapped by (layer, e % ways), each
-        // slot stores the 3 expert slices (ffnGateExps/ffnUpExps rows
-        // [e*expertFF, (e+1)*expertFF), ffnDownExpsMoe rows [e*H, (e+1)*H)).
-        // Misses upload the ~4 MB slices synchronously (once per expert); with
-        // stable routing the hit rate saturates after the first token.
+        // The routed expert GEMVs are the decode hot path and MUST NOT stream
+        // ~32 MB/layer from host RAM every token (that pages on models larger
+        // than the page cache and leaves the GPU idle). This cache holds the
+        // RECENTLY-USED experts on the device so steady-state decode hits VRAM
+        // bandwidth: direct-mapped by (layer, e % ways), each slot stores the 3
+        // expert slices (ffnGateExps/ffnUpExps rows [e*expertFF,
+        // (e+1)*expertFF), ffnDownExpsMoe rows [e*H, (e+1)*H)). Misses upload
+        // the ~4 MB slices synchronously (once per expert); with stable routing
+        // the hit rate saturates after the first token.
         struct ExpertSlot {
             // SLOT-MAJOR arena layout (2026-09-14): slot s owns the CONTIGUOUS
             // range [s*slotBytes, (s+1)*slotBytes) = [gate][up][down] (slotBytes
@@ -572,14 +588,15 @@ namespace tinycoder::gpu {
         static constexpr uint32_t kExpertCacheWays = 2;    // ways per set
         static constexpr uint32_t kExpertCacheSlots =
                 kExpertCacheSets * kExpertCacheWays;// 64 per layer
-        // Runtime set count (env TINYCODER_MOE_WAYS = SETS, default 16; slots =
+        // Runtime set count (env TINYCODER_MOE_WAYS = SETS, default 32; slots =
         // sets*2).  An A/B tool: more sets shrink conflicts (more VRAM), fewer
-        // sets shrink VRAM (more conflicts).  16 sets = 32 slots = ~4.1 GB for
-        // 40 layers (default footprint); 24 sets = 48 slots ≈ 6.1 GB; 32 sets
-        // = 64 slots ≈ 8.2 GB (fits the 11 GB card after the hybrid retry
-        // FREED the per-expert weight upload, so the expert cache can now
-        // borrow that VRAM).
-        static constexpr uint32_t kExpertCacheSetsDefault = 16;
+        // sets shrink VRAM (more conflicts).  32 sets = 64 slots ≈ 8.2 GB for
+        // 40 layers — the tuned default (2026-09-26): measured +15-16% over 16
+        // sets on the 11 GB card because the hybrid retry FREED the per-expert
+        // weight upload, so the expert cache borrows that VRAM.  16 sets = 32
+        // slots ≈ 4.1 GB was the pre-tune default; 24 sets = 48 slots ≈ 6.1 GB
+        // is a middle ground for smaller cards.
+        static constexpr uint32_t kExpertCacheSetsDefault = 32;
         uint32_t expertCacheSets_ = kExpertCacheSetsDefault;
         ExpertSlot expertCache_[kExpertCacheLayers];
         int32_t expertCacheTag_[kExpertCacheLayers][kExpertCacheSets]
@@ -688,8 +705,15 @@ namespace tinycoder::gpu {
 
         bool allocated_ = false;
         DeviceLayer *layers_ = nullptr;// device-backed descriptors
-        float *kvK_ = nullptr;         // [nGpuLayers][maxSeqLen*kHeads*headDim]
-        float *kvV_ = nullptr;
+        void *kvK_ = nullptr;          // [nGpuLayers][maxSeqLen*kHeads*headDim]
+        void *kvV_ = nullptr;          // element type = fp32, or fp16 when kvHalf_
+        // ---- fp16 KV cache (TINYCODER_KV16, dense arch, default ON 2026-10-01) ----
+        // The O(context) decode attention + RoPE/KV-store DRAM traffic dominates
+        // long-context decode (20.27 ms of the 24.99 ms layer loop at pp1024).
+        // Storing K/V as fp16 halves that traffic.  Only the dense qwen2 path
+        // (architecture == 0) uses it; qwen35 keeps fp32 (its GDN/full-attention
+        // kernels index kvK_/kvV_ as float*).
+        bool kvHalf_ = false;
         // Qwen35 recurrent-state buffers: per GPU layer, conv state
         // [(convKernel-1) * convChannels] and gdn state [nVHeads*headV*headV]
         // (fp32; persistent across tokens, reset on clearKVCache).
@@ -711,6 +735,17 @@ namespace tinycoder::gpu {
         void *wF16_ = nullptr;
         uint64_t wF16Bytes_ = 0;
         const void *wF16SrcQ_ = nullptr;// matrix source whose dequant is in wF16_
+        // Persistent per-matrix FP16 prefill twins (2026-09-29): when the VRAM
+        // budget at upload allows (see upload()'s twinBytesRemaining_), each
+        // uploaded matrix gets a one-time kDequantF16 twin (same kernel, same
+        // bytes, bit-identical GEMM input).  dequantMatrixF16() then returns
+        // the twin directly and the per-layer streaming dequant (+ its ~4x
+        // DRAM traffic) is skipped during prefill.  Default ON for models that
+        // fit; TINYCODER_PREFILL_TWINS=0 disables (streaming path).
+        bool twinEnabled_ = false;
+        uint64_t twinBytesRemaining_ = 0;
+        uint64_t twinBytesAlloc_ = 0;
+        uint32_t twinMatrices_ = 0;
         // Reusable Q8_K activation scratch for the decode GEMV of the IQ2_S /
         // IQ3_XXS / IQ3_S matrices AND the Q8_0 x Q8_32 integer GEMV
         // (kQuantizeQ8_0x32/kQGemvQ8_0xQ8K — bit-exact with the CPU's
@@ -720,6 +755,13 @@ namespace tinycoder::gpu {
         // the largest blocksPerRow.
         uint8_t *q8k_ = nullptr;
         uint64_t q8kBytes_ = 0;
+        // Pinned host staging for the logits D2H (2026-10-10): the caller's
+        // logits buffer is pageable, so a direct async D2H runs through the
+        // driver's slow staged path (~4 GB/s measured).  Device -> pinned
+        // (~20 GB/s) + host memcpy is ~2x faster.  Grown on demand; freed in
+        // destroy().
+        float *lmPinned_ = nullptr;
+        uint64_t lmPinnedFloats_ = 0;
         // Dedicated Q8_32-quantized activation scratch for the DECODE MoE
         // expert fast path: holds Q8(s.norm) for the WHOLE per-layer rank loop
         // (all 8 ranks' gate/up pre-GEMVs read it).  The general q8k_ cannot
@@ -762,19 +804,16 @@ namespace tinycoder::gpu {
         // the FULL-GPU path's top-k selection D2H.
         std::vector<float> moeLogitsHost_;
         // Host mirror of the per-(token, rank) renormalized routing weights
-        // (qwen35moe).  The per-token MoE fallback needs the token's OWN
-        // weight for the kAddScaled1 scaling; the same cudaMemcpyAsync that
-        // fills moeIdxHost_ copies these bytes so the fallback never reads a
-        // device pointer on the host (that would be undefined behavior).
-        // NOTE: moeWgtHost_ itself is declared in the PUBLIC Option-D block.
-        // CPU-expert hybrid (qwen35moe, llama.cpp `--cpu-moe` style): DOUBLE-
-        // BUFFERED host mirrors of the per-layer post-attn RMSNorm input and
-        // routed-expert FFN output used for the GPU<->CPU handoff when
-        // moeCpuFn_ is set.  Ping-pong: while the CPU computes layer L's
-        // experts into buffer A, the GPU's g_stream2 copy engine streams layer
-        // L+1's norm into buffer B, so the per-layer handoff needs no hard
-        // stream sync beyond the ping-pong event pair.  Grown on demand, reused
-        // across layers, freed via the normal member lifetime.
+        // (qwen35moe). The per-token MoE fallback needs the token's OWN weight
+        // for the kAddScaled1 scaling; the same cudaMemcpyAsync that fills
+        // moeIdxHost_ copies these bytes so the fallback never reads a device
+        // pointer on the host (that would be undefined behavior). NOTE:
+        // moeWgtHost_ itself is declared in the PUBLIC Option-D block.
+        // Ping-pong: while the CPU computes layer L's experts into buffer A,
+        // the GPU's g_stream2 copy engine streams layer L+1's norm into buffer
+        // B, so the per-layer handoff needs no hard stream sync beyond the
+        // ping-pong event pair. Grown on demand, reused across layers, freed
+        // via the normal member lifetime.
         std::vector<std::vector<float>> moeNormHost_;  // [2][seqLen*H]
         std::vector<std::vector<float>> moeFfnOutHost_;// [2][seqLen*H]
         // Handoff event RINGS (created lazily on first hybrid forward), indexed
@@ -810,6 +849,106 @@ namespace tinycoder::gpu {
         MoeCpuFn moeCpuFn_;
         size_t kvPos_ = 0;
         bool scratchAlloc_ = false;
+
+        // ---- CUDA-graph decode acceleration (TINYCODER_GPU_GRAPH=1) ---- The
+        // decode path (seqLen==1) launches ~15 tiny kernels per layer x 28
+        // layers + LM head + H2D/D2H ~ every token. Captured graphs freeze
+        // kernel arguments, so all position-dependent values (RoPE cos/sin
+        // index, KV cache write offset, attention causal end) must be read from
+        // DEVICE memory at kernel time: * s.tokens        -- updated via
+        // cudaMemcpyAsync before replay * graphPos_       -- a device uint32
+        // holding pos, updated via cudaMemcpyAsync before replay; kernels read
+        // it through the graph-frozen pointer. The kernels kRoPEQ /
+        // kStoreKVRope / kWarpAttention already accept `pos` as a plain value;
+        // the graph variants below take a const uint32_t* instead. q8k_ /
+        // scratch are pre-allocated and stable, so no cudaMalloc can occur
+        // during replay (which would invalidate a captured graph).
+        uint32_t *graphPos_ = nullptr;// device uint32 (updated per replay)
+        uint32_t graphPosHost_ = 0;   // stable host staging for the async H2D
+        void *graphExec_ = nullptr;   // cudaGraphExec_t (opaque; CUDA-free header)
+        void *graph_ = nullptr;       // cudaGraph_t (opaque; CUDA-free header)
+        bool graphBuilt_ = false;     // graphExec_ is valid for this model+geom
+        // Capture the decode (seqLen==1) forward into a CUDA graph.
+        // Falls back to the regular path on any capture error; the graph is
+        // rebuilt automatically if the geometry (rows/blocks) changes (model
+        // reload).  TINYCODER_GPU_GRAPH=0 disables (default: ON when the
+        // model is a dense qwen2/gemma-style arch -- graph capture assumes
+        // the deterministic decode dependency chain; qwen35/qwen35moe paths
+        // are NOT captured).
+        // Set while the decode forward is being RECORDED into graphExec_ (the
+        // eager body runs once to record; during recording the body skips the
+        // host cudaStreamSynchronize error-check points and uses the
+        // kRoPEQPos/kStoreKVRopePos/kWarpAttentionPos variants).
+        bool graphCaptureActive_ = false;
+        // Set if a capture attempt failed: subsequent decode forwards go eager.
+        bool graphCaptureFailed_ = false;
+        // Pre-allocate the Graph-time decode buffers (q8k_ etc.) before the
+        // first capture so no cudaMalloc happens during recording.
+        bool ensureGraphScratch();
+        // Instantiates graphExec_ from the current graph_ and cleans graph_.
+        bool instantiateGraph();
+        // Capture the decode (seqLen==1) forward into a CUDA graph.
+        // Falls back to the regular path on any capture error; the graph is
+        // rebuilt automatically if the geometry (rows/blocks) changes (model
+        // reload).  TINYCODER_GPU_GRAPH=0 disables (default: ON when the
+        // model is a dense qwen2/gemma-style arch -- graph capture assumes
+        // the deterministic decode dependency chain; qwen35/qwen35moe paths
+        // are NOT captured).  pos is the token's position; it is written to
+        // graphPos_ (blocking H2D) BEFORE cudaStreamBeginCapture so the
+        // recorded kernels see the right value at first launch.
+        bool captureDecodeGraph(uint32_t pos);
+        // Replay the captured decode graph (which contains kernels only --
+        // no memcpys / position values): the caller has already H2D'd the
+        // tokens into s.tokens; this updates the graphPos_ device scalar,
+        // cudaGraphLaunch, syncs, then D2H's the logits from scratch_.logits
+        // into the caller's buffer.
+        bool replayDecodeGraph(uint32_t pos, float *logitsOut,
+                               std::string &errMsg);
+        // Destroy the captured decode graph + capture state WITHOUT freeing
+        // graphPos_ (which is scratch-independent and survives rebuilds).
+        // A captured graph freezes the ADDRESSES of every kernel argument
+        // (scratch buffers, KV cache, weights), so it MUST be torn down
+        // whenever those addresses can change: scratch reallocation in
+        // ensureScratch() is the one vector (replaying a graph over freed
+        // scratch is an illegal memory access).  The next eligible decode
+        // recaptures automatically (graphBuilt_/graphCaptureFailed_ reset).
+        void destroyGraph();
+
+        // ---- Split-KV decode attention (TINYCODER_ATTN_SPLIT) ----
+        // The eager decode attention launches ONE warp per (token, q-head):
+        // at batch==1 that is nHeads (=12) warps for the whole 68-SM GPU, each
+        // scanning the full cachePos range, so decode attention is latency- not
+        // bandwidth-bound and costs a hard O(context) wall (measured 0.76 ms @
+        // pp16 -> 20.27 ms @ pp1024 over 28 layers = 81% of the layer loop at
+        // 1K context, while the GEMVs stay flat at ~3.6 ms).  The split path
+        // tiles the KV range into attnChunk_-sized windows and launches
+        // nHeads*attnChunks_ warps, folding each window into a flash-attention
+        // (m,l,acc) partial that a combine kernel merges.  Same online softmax
+        // math, different reduction grouping; top-k logit identity preserved.
+        // Device-resident, pointer-stable across CUDA-graph capture.
+        //   partAcc: [seqLen][nHeads][attnChunks_][hd]      (hd = NV*32)
+        //   partM/L: [seqLen][nHeads][attnChunks_]
+        // TINYCODER_ATTN_SPLIT=0 disables; TINYCODER_ATTN_SPLIT_CHUNK overrides
+        // the default 16-row window.
+        //
+        // CHUNK-SIZE DEFAULT (2026-10-10, measured, ADOPTED): 64 -> 16. At the
+        // the reference benchmark pp512 protocol the 12 q-heads x 8 chunks of
+        // the old 64-row window were only 96 warps on 68 SMs (~1.4 warps/SM),
+        // leaving the attention latency-bound: kv/attn/rope grew 1.34 -> 1.57
+        // ms/token from pp16 to pp1024 while every GEMV stayed flat. Sweeping
+        // the window (pp512/tg32, reps 3): 128 -> 130.8, 64 -> 153.9, 32 ->
+        // 168.1, 16 -> 173.1, 12 -> 172.6, 8 -> 170.5, 4 -> 159.4, 2 -> 128.1,
+        // 1 -> 92.3 tok/s. 16 rows is the peak (peak warp count 12x32 = 384
+        // warps = 5.6/SM) and wins UNIFORMLY over every context length measured
+        // (tok/s, reps 3): pp16 171.7 -> 175.6, pp128 155.7 -> 174.7, pp512
+        // 154.4 -> 173.1, pp1024 153.2 -> 170.9 -- i.e. Combine-kernel overhead
+        // dominates below 16 rows (each extra chunk is another nHeads-wide
+        // combine pass).
+        float *attnPartialAcc_ = nullptr;
+        float *attnPartialM_ = nullptr;
+        float *attnPartialL_ = nullptr;
+        uint32_t attnChunk_ = 16;// KV rows per split window (chunk size)
+        uint32_t attnChunks_ = 0;// ceil(maxSeqLen / attnChunk_)
 
         bool ensureScratch(uint32_t seqLen, std::string &errMsg);
         void destroyScratch();

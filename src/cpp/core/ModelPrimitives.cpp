@@ -94,14 +94,10 @@ namespace tinycoder {
         uint32_t neededPos = pos + std::max(qSeqLen, kSeqLen);
         ensureRoPETables(neededPos);
 
-        // NEOX (rotate-half) pairing, matching llama.cpp for qwen2/qwen3:
-        // ggml's rotate_pairs(n_dims, n_dims/2) rotates the pair
-        // (head[j], head[j + headDim/2]) with the angle index j
-        // (theta = pos * freq_base^(-2j/headDim)). The previous interleaved
-        // pairing (head[2j], head[2j+1]) is the WRONG transform for the
-        // NEOX RoPE that Qwen models are trained with — it is identity at
-        // pos 0 so single-token dumps never caught it, but every pos>0 Q/K
-        // projection was rotated incorrectly, corrupting multi-token
+        // The previous interleaved pairing (head[2j], head[2j+1]) is the WRONG
+        // transform for the NEOX RoPE that Qwen models are trained with — it is
+        // identity at pos 0 so single-token dumps never caught it, but every
+        // pos>0 Q/K projection was rotated incorrectly, corrupting multi-token
         // attention (garbage generations on all qwen2 sample questions).
         for (uint32_t s = 0; s < qSeqLen; ++s) {
             uint32_t p = pos + s;
@@ -163,9 +159,7 @@ namespace tinycoder {
             const float *vs = vSrc + static_cast<size_t>(s) * kvSize;
             float *kd = kDst + static_cast<size_t>(cachePos + s) * kvSize;
             float *vd = vDst + static_cast<size_t>(cachePos + s) * kvSize;
-            // NEOX (rotate-half) pairing: rotate the pair (kh[j], kh[j+pairs])
-            // with angle index j — matches llama's rotate_pairs(n_dims/2) used
-            // for qwen2/qwen3. (Interleaved (2j,2j+1) was wrong for pos>0.)
+            // (Interleaved (2j,2j+1) was wrong for pos>0.)
             for (uint32_t h = 0; h < kHeads; ++h) {
                 const float *kh = ks + static_cast<size_t>(h) * headDim;
                 float *kdh = kd + static_cast<size_t>(h) * headDim;

@@ -27,11 +27,7 @@ SOFTWARE.
 //
 // Qwen3.8-27B is a dense hybrid transformer: 48 gated-delta-net recurrent
 // layers + 16 full-attention layers + 1 MTP (Multi-Token Prediction) block.
-// Reference: llama.cpp src/models/qwen35.cpp + delta-net-base.cpp.
 //
-// Layer classification (llama.cpp is_recr_impl):
-//   is_recr(i) = (i < n_layer) && ((i+1) % full_attention_interval != 0)
-//   n_layer = n_layer_all - nextn_predict_layers (64 for Qwen3.8-27B).
 //
 // Full-attention layer (i+1)%4 == 0:
 //   attn_norm -> Q+G fused projection (attn_q, outputs [nHeads*2*headDim])
@@ -129,15 +125,11 @@ namespace tinycoder {
         // is computed inline here. The standard rope tables are unused for qwen35.
         //
         // CRITICAL: ggml's ggml_mrope_cache_init() seeds theta_base with the
-        // token POSITION (ggml_compute_forward_rope_flt passes p = pos[i2]),
-        // so the angular frequency of pair k is  theta(k) = p * theta_scale^k
+        // token POSITION (ggml_compute_forward_rope_flt passes p = pos[i2]), so
+        // the angular frequency of pair k is  theta(k) = p * theta_scale^k
         // (freq_base enters ONLY through theta_scale = freq_base^(-2/n_dims)).
         // The cache must therefore START theta at 1.0f -- NOT at freq_base
-        // (1e7). Seeding it with thetaBase injected an extra factor of 1e7 into
-        // every angle, pseudo-randomizing cos/sin and scrambling every
-        // full-attention layer (the recurrent layers 0-2 matched llama exactly
-        // because they contain no RoPE; layer 3 -- the first full-attention
-        // layer -- was the first to diverge).
+        // (1e7).
         std::vector<float> cosCache(static_cast<size_t>(neededPos) * nDimsHalf);
         std::vector<float> sinCache(static_cast<size_t>(neededPos) * nDimsHalf);
         for (uint32_t p = 0; p < neededPos; ++p) {
@@ -187,7 +179,6 @@ namespace tinycoder {
     // -----------------------------------------------------------------------
     // Full-attention layer for qwen35: fused Q+gate projection, per-head Q/K
     // norms, MRoPE, attention with sigmoid(gate), output projection.
-    // Mirrors llama.cpp qwen35 graph::build_layer_attn.
     // -----------------------------------------------------------------------
     void Model::forwardQwen35FullAttention(uint32_t layer,
                                            const LayerWeights &w, float *hidden,
@@ -434,8 +425,6 @@ namespace tinycoder {
         z.resize(dInner);
         beta.resize(nVHeads);
         gateV.resize(nVHeads);
-        // Debug hook: retain softplus(alpha + dt.bias) per value head (used by
-        // debugQwen35Layer0Intm to fingerprint llama's a_softplus-0 tensor).
         scratch.q35Alpha.resize(nVHeads);
         convInput.resize(static_cast<size_t>(convKernel) * convChannels);
         convOut.resize(convChannels);
@@ -635,7 +624,6 @@ namespace tinycoder {
     // -----------------------------------------------------------------------
     // One full qwen35 layer (both recurrent and full-attention variants),
     // including the post-attention-norm + SwiGLU FFN + residual structure.
-    // Mirrors llama.cpp qwen35 graph::graph layer loop.
     // -----------------------------------------------------------------------
     void Model::forwardQwen35Layer(uint32_t layer, float *hidden, float *attnNorm,
                                    float *attnProj, float *q, float *k, float *v,
@@ -644,9 +632,6 @@ namespace tinycoder {
                                    uint32_t hiddenSize, uint32_t nHeads,
                                    uint32_t nKVHeads, uint32_t headDim,
                                    uint32_t intermediateSize) {
-        // The MTP (NextN) block (layer >= n_layer) is NOT executed in the main
-        // decode pass — llama.cpp runs it only via the separate
-        // LLM_GRAPH_TYPE_DECODER_MTP draft graph (llama.cpp qwen35.cpp:158).
         // Guard against any caller iterating over the full numLayers range.
         const uint32_t nLayer = config_.numLayers - config_.nextnPredictLayers;
         if (layer >= nLayer) {
@@ -692,15 +677,12 @@ namespace tinycoder {
             q35TRec = std::chrono::steady_clock::now();
         }
 
-        // ---- Post-attention norm + FFN + residual ----
-        // The FFN residual connects to the tensor BEFORE the post-attention norm
-        // (llama.cpp: ffn_residual = cur after the attention residual).
-        // TINYCODER_DUMP_NORM=1: dump the CPU's pre-post-norm hidden at L0
-        // (row 0 of the batch) so it can be compared against the GPU's
-        // `[gpu l0]` hidden dump -- this discriminates a wrong GDN/recurrent
-        // output (hidden differs) from a wrong kRMSNormRow/postAttnNorm
-        // (hidden agrees, norm differs).  Row 0 uses ZERO recurrent state on
-        // both sides, so it is the cleanest probe of the GDN math.
+        // TINYCODER_DUMP_NORM=1: dump the CPU's pre-post-norm hidden at L0 (row
+        // 0 of the batch) so it can be compared against the GPU's `[gpu l0]`
+        // hidden dump -- this discriminates a wrong GDN/recurrent output
+        // (hidden differs) from a wrong kRMSNormRow/postAttnNorm (hidden
+        // agrees, norm differs). Row 0 uses ZERO recurrent state on both sides,
+        // so it is the cleanest probe of the GDN math.
         {
             const char *dnH = std::getenv("TINYCODER_DUMP_NORM");
             if (layer == 0 && dnH != nullptr && dnH[0] != '\0' &&
@@ -737,10 +719,8 @@ namespace tinycoder {
         }
 
         if (config_.architecture == ARCH_QWEN35MOE && config_.expertCount > 0) {
-            // ---- Routed MoE FFN (qwen35moe) ----
-            // llama.cpp qwen35moe build_layer_ffn: softmax-router top-8 experts
-            // (renormalized weights) + sigmoid-gated shared expert.  The `layer`
-            // index feeds the Option-D usage profiler (no-op when unarmed).
+            // The `layer` index feeds the Option-D usage profiler (no-op when
+            // unarmed).
             computeQwen35MoE(ffnNorm, ffnOut, seqLen, hiddenSize,
                              intermediateSize, w, layer);
         } else {
@@ -841,13 +821,12 @@ namespace tinycoder {
 
         for (uint32_t pos = 0; pos < seqLen; ++pos) {
             const int32_t tokenId = tokens[pos];
-            // Mirror llama.cpp's AR decode: token i is decoded at position i.
-            // The real forward() advances kvCache_.pos += seqLen AFTER the layer
-            // loop; this debug method decodes one token at a time, so it must
-            // set the position explicitly BEFORE each token, otherwise every
-            // token would use position 0 and KV slot 0 (full-attention layers
-            // would attend only to themselves, corrupting every layer >= 3 —
-            // the first full-attention layer).
+            // The real forward() advances kvCache_.pos += seqLen AFTER the
+            // layer loop; this debug method decodes one token at a time, so it
+            // must set the position explicitly BEFORE each token, otherwise
+            // every token would use position 0 and KV slot 0 (full-attention
+            // layers would attend only to themselves, corrupting every layer >=
+            // 3 — the first full-attention layer).
             kvCache_.pos = pos;
             // Cut to a single token: re-use the first slot of each scratch buffer
             // (seqLen == 1 semantics — exactly what forward() does for decode).
@@ -877,14 +856,6 @@ namespace tinycoder {
         return perLayer;
     }
 
-    // -----------------------------------------------------------------------
-    // Debug bisection: fingerprint every layer-0 recurrent intermediate for
-    // the LAST token of a sequence, mirroring llama_ref_probe.cpp's
-    // "[ar] layer-0 recurrent intermediates" captures (the probe's intm map
-    // is overwritten on every eval, so it holds the last token's values).
-    // Runs the REAL shared forward math (forwardQwen35Layer) token-by-token
-    // for layer 0 so the conv/GDN recurrent state accumulates exactly like
-    // llama's AR decode; then fingerprints the retained scratch buffers.
     // -----------------------------------------------------------------------
     std::vector<std::pair<std::string, std::vector<float>>>
     Model::debugQwen35Layer0Intm(const std::vector<int32_t> &tokens) {
@@ -927,9 +898,7 @@ namespace tinycoder {
             return out;
         }
 
-        // Run ONLY layer 0 for every token (recurrent conv/GDN state
-        // accumulates across tokens exactly like llama's AR decode). The
-        // scratch buffers retain the LAST token's values afterwards.
+        // The scratch buffers retain the LAST token's values afterwards.
         for (size_t pos = 0; pos < tokens.size(); ++pos) {
             const int32_t tokenId = tokens[pos];
             if (tokenId >= 0 &&
