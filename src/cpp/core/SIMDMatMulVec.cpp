@@ -786,15 +786,44 @@ namespace tinycoder {
             switch (level) {
 #if defined(__AVX2__) && defined(__FMA__)
                 case SimdLevel::AVX2:
+                case SimdLevel::AVX512:
+                    // AVX-512 CPUs execute the AVX2 kernel natively (AVX-512 is a
+                    // superset of AVX2); there is no AVX-512-specific variant of
+                    // this batch kernel, so reuse the AVX2 implementation instead
+                    // of the zero no-op fallback.
                     impl = simd::matMulVecBatchQ2_K_PrePacked_Q8_AVX2;
                     break;
 #endif
                 default:
-                    // Fallback to scalar row-by-row approach
-                    // Fallback: use row-by-row approach via function pointer
-                    // This will be overwritten on first call with actual implementation
-                    impl = [](const uint8_t *, const float *, uint32_t, uint32_t, float *) {
-                        // No fallback available - results will be zero
+                    // Scalar fallback: quantize x to Q8_K once per call, then
+                    // per-row/block dot via dotProductQ2_K_PrePacked_Q8_Scalar.
+                    // Any CPU without the AVX2 kernel gets correct (not zero) output.
+                    impl = [](const uint8_t *prepackedData, const float *x,
+                              uint32_t rows, uint32_t cols, float *result) {
+                        static constexpr uint32_t BLOCK = 256;
+                        static constexpr uint32_t PREPACKED_BLOCK_BYTES = 276;
+                        uint32_t blocksPerRow = (cols + BLOCK - 1) / BLOCK;
+                        std::vector<float> xCopy(cols +
+                                                 (blocksPerRow * BLOCK - cols));
+                        std::memcpy(xCopy.data(), x, cols * sizeof(float));
+                        std::memset(xCopy.data() + cols, 0,
+                                    (xCopy.size() - cols) * sizeof(float));
+                        std::vector<Q8KBlock> q8(blocksPerRow);
+                        for (uint32_t b = 0; b < blocksPerRow; ++b) {
+                            GGMLDequantize::quantizeQ8K(xCopy.data() + b * BLOCK,
+                                                        BLOCK, &q8[b]);
+                        }
+                        for (uint32_t j = 0; j < rows; ++j) {
+                            const uint8_t *row =
+                                    prepackedData + static_cast<uint64_t>(j) * blocksPerRow *
+                                                            PREPACKED_BLOCK_BYTES;
+                            double dot = 0.0;
+                            for (uint32_t b = 0; b < blocksPerRow; ++b) {
+                                dot += dotProductQ2_K_PrePacked_Q8_Scalar(
+                                        row + b * PREPACKED_BLOCK_BYTES, &q8[b]);
+                            }
+                            result[j] = static_cast<float>(dot);
+                        }
                     };
                     break;
             }
@@ -821,13 +850,52 @@ namespace tinycoder {
             switch (level) {
 #if defined(__AVX2__) && defined(__FMA__)
                 case SimdLevel::AVX2:
+                case SimdLevel::AVX512:
+                    // AVX-512 CPUs execute the AVX2 kernel natively (AVX-512 is a
+                    // superset of AVX2); there is no AVX-512-specific variant of
+                    // this batch kernel, so reuse the AVX2 implementation instead
+                    // of the zero no-op fallback.
                     impl = simd::matMulVecBatchGateUpQ2_K_PrePacked_Q8_AVX2;
                     break;
 #endif
                 default:
-                    // No fallback available - results will be zero
-                    impl = [](const uint8_t *, const uint8_t *, const float *,
-                              uint32_t, uint32_t, float *, float *) {};
+                    // Scalar fallback for single-token gate+up: quantize x to
+                    // Q8_K once and use the per-block prepacked scalar dot per
+                    // row of both matrices. Correct on any CPU.
+                    impl = [](const uint8_t *gatePrepacked, const uint8_t *upPrepacked,
+                              const float *x, uint32_t rows, uint32_t cols,
+                              float *gateOut, float *upOut) {
+                        static constexpr uint32_t BLOCK = 256;
+                        static constexpr uint32_t PREPACKED_BLOCK_BYTES = 276;
+                        uint32_t blocksPerRow = (cols + BLOCK - 1) / BLOCK;
+                        std::vector<float> xCopy(cols +
+                                                 (blocksPerRow * BLOCK - cols));
+                        std::memcpy(xCopy.data(), x, cols * sizeof(float));
+                        std::memset(xCopy.data() + cols, 0,
+                                    (xCopy.size() - cols) * sizeof(float));
+                        std::vector<Q8KBlock> q8(blocksPerRow);
+                        for (uint32_t b = 0; b < blocksPerRow; ++b) {
+                            GGMLDequantize::quantizeQ8K(xCopy.data() + b * BLOCK,
+                                                        BLOCK, &q8[b]);
+                        }
+                        for (uint32_t j = 0; j < rows; ++j) {
+                            const uint8_t *grow =
+                                    gatePrepacked + static_cast<uint64_t>(j) * blocksPerRow *
+                                                            PREPACKED_BLOCK_BYTES;
+                            const uint8_t *urow =
+                                    upPrepacked + static_cast<uint64_t>(j) * blocksPerRow *
+                                                          PREPACKED_BLOCK_BYTES;
+                            double gd = 0.0, ud = 0.0;
+                            for (uint32_t b = 0; b < blocksPerRow; ++b) {
+                                gd += dotProductQ2_K_PrePacked_Q8_Scalar(
+                                        grow + b * PREPACKED_BLOCK_BYTES, &q8[b]);
+                                ud += dotProductQ2_K_PrePacked_Q8_Scalar(
+                                        urow + b * PREPACKED_BLOCK_BYTES, &q8[b]);
+                            }
+                            gateOut[j] = static_cast<float>(gd);
+                            upOut[j] = static_cast<float>(ud);
+                        }
+                    };
                     break;
             }
             s_impl.store(impl, std::memory_order_release);
@@ -856,18 +924,64 @@ namespace tinycoder {
             switch (level) {
 #if defined(__AVX2__) && defined(__FMA__)
                 case SimdLevel::AVX2:
+                case SimdLevel::AVX512:
+                    // AVX-512 CPUs execute the AVX2 kernel natively (AVX-512 is a
+                    // superset of AVX2); there is no AVX-512-specific variant of
+                    // this batch kernel, so reuse the AVX2 implementation instead
+                    // of the zero no-op fallback.
                     impl = simd::matMulVecBatchGateUpQ2_K_PrePacked_Q8_Batch_AVX2;
                     break;
 #endif
                 default:
-                    // This kernel only has an AVX2 implementation (used by prefill
-                    // gate+up). The caller (matMulVecFusedGateUp_Batch) only invokes
-                    // it when cols % 256 == 0. Any non-AVX2 host should already have
-                    // been handled by the prepack presence; to keep semantics safe,
-                    // leave outputs zeroed as the previous fallback did.
-                    impl = [](const uint8_t *, const uint8_t *, const float *,
-                              uint32_t, uint32_t, uint32_t, float *, float *,
-                              bool) {};
+                    // Scalar fallback for gate+up batch: quantize each token's x
+                    // to Q8_K once and use the per-block prepacked scalar dot for
+                    // every row of both matrices. Correct on any CPU (no more
+                    // zero no-op fallback).
+                    impl = [](const uint8_t *gatePrepacked, const uint8_t *upPrepacked,
+                              const float *X, uint32_t seqLen, uint32_t rows,
+                              uint32_t cols, float *gateOut, float *upOut,
+                              bool applySwish) {
+                        static constexpr uint32_t BLOCK = 256;
+                        static constexpr uint32_t PREPACKED_BLOCK_BYTES = 276;
+                        uint32_t blocksPerRow = (cols + BLOCK - 1) / BLOCK;
+                        for (uint32_t s = 0; s < seqLen; ++s) {
+                            const float *x = X + static_cast<uint64_t>(s) * cols;
+                            std::vector<float> xCopy(cols +
+                                                     (blocksPerRow * BLOCK - cols));
+                            std::memcpy(xCopy.data(), x, cols * sizeof(float));
+                            std::memset(xCopy.data() + cols, 0,
+                                        (xCopy.size() - cols) * sizeof(float));
+                            std::vector<Q8KBlock> q8(blocksPerRow);
+                            for (uint32_t b = 0; b < blocksPerRow; ++b) {
+                                GGMLDequantize::quantizeQ8K(xCopy.data() + b * BLOCK,
+                                                            BLOCK, &q8[b]);
+                            }
+                            for (uint32_t j = 0; j < rows; ++j) {
+                                const uint8_t *grow =
+                                        gatePrepacked + static_cast<uint64_t>(j) * blocksPerRow *
+                                                                PREPACKED_BLOCK_BYTES;
+                                const uint8_t *urow =
+                                        upPrepacked + static_cast<uint64_t>(j) * blocksPerRow *
+                                                              PREPACKED_BLOCK_BYTES;
+                                double gd = 0.0, ud = 0.0;
+                                for (uint32_t b = 0; b < blocksPerRow; ++b) {
+                                    gd += dotProductQ2_K_PrePacked_Q8_Scalar(
+                                            grow + b * PREPACKED_BLOCK_BYTES, &q8[b]);
+                                    ud += dotProductQ2_K_PrePacked_Q8_Scalar(
+                                            urow + b * PREPACKED_BLOCK_BYTES, &q8[b]);
+                                }
+                                float g = static_cast<float>(gd);
+                                float u = static_cast<float>(ud);
+                                gateOut[s * rows + j] = g;
+                                upOut[s * rows + j] = u;
+                                if (applySwish) {
+                                    // Fuse SwiGLU: gateOut = silu(gateOut) * upOut
+                                    gateOut[s * rows + j] =
+                                            (g / (1.0f + std::exp(-g))) * u;
+                                }
+                            }
+                        }
+                    };
                     break;
             }
             s_impl.store(impl, std::memory_order_release);
@@ -894,13 +1008,49 @@ namespace tinycoder {
             switch (level) {
 #if defined(__AVX2__) && defined(__FMA__)
                 case SimdLevel::AVX2:
+                case SimdLevel::AVX512:
+                    // AVX-512 CPUs execute the AVX2 kernel natively (AVX-512 is a
+                    // superset of AVX2); there is no AVX-512-specific variant of
+                    // this batch kernel, so reuse the AVX2 implementation instead
+                    // of the zero no-op fallback.
                     impl = simd::matMulVecBatchQ2_K_PrePacked_Q8_Batch_AVX2;
                     break;
 #endif
                 default:
-                    // No fallback available - results will be zero
-                    impl = [](const uint8_t *, const float *, uint32_t, uint32_t,
-                              uint32_t, float *) {};
+                    // Scalar fallback for single-matrix Q2_K batch (e.g. attn Q/K,
+                    // ffnDown): quantize each token's x to Q8_K once and use the
+                    // per-block prepacked scalar dot per row. Correct on any CPU.
+                    impl = [](const uint8_t *prepackedData, const float *X,
+                              uint32_t seqLen, uint32_t rows, uint32_t cols,
+                              float *out) {
+                        static constexpr uint32_t BLOCK = 256;
+                        static constexpr uint32_t PREPACKED_BLOCK_BYTES = 276;
+                        uint32_t blocksPerRow = (cols + BLOCK - 1) / BLOCK;
+                        for (uint32_t s = 0; s < seqLen; ++s) {
+                            const float *x = X + static_cast<uint64_t>(s) * cols;
+                            std::vector<float> xCopy(cols +
+                                                     (blocksPerRow * BLOCK - cols));
+                            std::memcpy(xCopy.data(), x, cols * sizeof(float));
+                            std::memset(xCopy.data() + cols, 0,
+                                        (xCopy.size() - cols) * sizeof(float));
+                            std::vector<Q8KBlock> q8(blocksPerRow);
+                            for (uint32_t b = 0; b < blocksPerRow; ++b) {
+                                GGMLDequantize::quantizeQ8K(xCopy.data() + b * BLOCK,
+                                                            BLOCK, &q8[b]);
+                            }
+                            for (uint32_t j = 0; j < rows; ++j) {
+                                const uint8_t *row =
+                                        prepackedData + static_cast<uint64_t>(j) * blocksPerRow *
+                                                                PREPACKED_BLOCK_BYTES;
+                                double dot = 0.0;
+                                for (uint32_t b = 0; b < blocksPerRow; ++b) {
+                                    dot += dotProductQ2_K_PrePacked_Q8_Scalar(
+                                            row + b * PREPACKED_BLOCK_BYTES, &q8[b]);
+                                }
+                                out[s * rows + j] = static_cast<float>(dot);
+                            }
+                        }
+                    };
                     break;
             }
             s_impl.store(impl, std::memory_order_release);
