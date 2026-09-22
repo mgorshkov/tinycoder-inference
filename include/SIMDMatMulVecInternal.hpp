@@ -172,6 +172,20 @@ namespace tinycoder::simd {
                                     uint32_t seqLen, uint32_t rows,
                                     uint32_t cols, float *out);
 
+    // Register-tiled batch GEMM for a single F32 (fp32) weight matrix over a
+    // batch of tokens. Used for the qwen35moe ROUTER (ffnGateInpMoe is an F32
+    // [expertCount x hiddenSize] host matrix); the previous per-token scalar
+    // double-accumulation loop in QuantizedMatrix::matMulVec was the dominant
+    // CPU cost in the hybrid GPU callback (~16.6 ms/token decode, ~17.4 ms/token
+    // prefill). For each tile of 8 rows the weight rows are streamed once and
+    // reused across all seqLen tokens; the x-vector is loaded once per
+    // (token, 8-lane group) and reused across the 8 tile rows, and the partial
+    // sums stay in __m256 FMA accumulators (horizontal-summed once per output).
+    // Requires cols > 0; handles the cols % 8 scalar tail.
+    void matMulVecBatchF32_AVX2(const float *W_f32, const float *X,
+                                uint32_t seqLen, uint32_t rows, uint32_t cols,
+                                float *out);
+
     // Register-tiled batch GEMM for a single Q4_K weight matrix over a batch of
     // tokens (prefill). Used for the attnV projection (Q4_K has no prepacked
     // batch kernel otherwise). For each tile of 8 rows the per-block Q4_K scale/

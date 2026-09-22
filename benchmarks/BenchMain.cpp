@@ -11,9 +11,10 @@
 //   sampled token stream (and therefore the KV-cache position pattern) differs
 //   run-to-run.
 //
-//   This harness reproduces llama-bench's tg protocol exactly so TinyCoder
-//   numbers are comparable to `llama-bench -p 64 -n 64`:
-//     - fixed 64-token prompt (llama-bench's pp64/tg64 uses a 64-token prompt)
+//   This harness reproduces llama-bench's default protocol exactly so TinyCoder
+//   numbers are comparable to `llama-bench -p 512 -n 128`:
+//     - fixed 512-token prompt (llama-bench's default is pp512)
+//     - 128 generated tokens (llama-bench's default is tg128)
 //     - GREEDY decode: plain argmax over logits, repeatPenalty = 1.0 (llama-bench
 //       defaults: repeat_penalty 1.0, no topK/topP, temp 0)
 //     - timing EXCLUDES prefill: only the decode loop (per-token forward)
@@ -23,7 +24,7 @@
 //       the reps).
 //
 // Usage:
-//   tinycoder_bench [--model <path>] [--n-prompts 64] [--n-gen 64]
+//   tinycoder_bench [--model <path>] [--n-prompts 512] [--n-gen 128]
 //                   [--reps 5] [--threads N]
 //   TINYCODER_THREADS=N env var is honored by ThreadPool::recommendedThreadCount.
 // -----------------------------------------------------------------------------
@@ -44,8 +45,8 @@ namespace {
 
     struct BenchOpts {
         std::string modelPath;
-        int32_t nPrompts = 64;  // prompt token count (llama-bench pp64)
-        int32_t nGen = 64;      // generated token count (llama-bench tg64)
+        int32_t nPrompts = 512; // prompt token count (llama-bench pp512)
+        int32_t nGen = 128;     // generated token count (llama-bench tg128)
         int32_t reps = 5;       // warm repeats (llama-bench default 5)
         int32_t threads = 0;    // 0 = recommendedThreadCount()
         bool gpu = false;       // --gpu: use the CUDA offload engine
@@ -125,8 +126,8 @@ namespace {
         std::fprintf(stderr,
                      "Usage: %s [options]\n"
                      "  --model <path>   GGUF model (default: $TINYCODER_MODEL_PATH)\n"
-                     "  --n-prompts N    prompt token count (default 64)\n"
-                     "  --n-gen N        generated token count (default 64)\n"
+                     "  --n-prompts N    prompt token count (default 512)\n"
+                     "  --n-gen N        generated token count (default 128)\n"
                      "  --reps N         warm repeat count (default 5)\n"
                      "  --threads N      thread pool size (default: logical CPUs)\n"
 #ifdef USE_CUDA
