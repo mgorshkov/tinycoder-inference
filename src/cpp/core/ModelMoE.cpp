@@ -363,19 +363,48 @@ namespace tinycoder {
         const uint32_t eu = expertUsedCount;
         if (expertCount == 0 || eu == 0) return;
 
-        std::vector<float> routerLogits(expertCount);
         std::vector<float> probs(expertCount);
         std::vector<std::pair<float, uint32_t>> scored(expertCount);
+        // Router logits for ALL tokens in one dispatch when the router matrix
+        // is F32 (the qwen35moe case): matMulVecBatchF32_SIMD is the
+        // weight-stationary register-tiled AVX2 kernel (the weight rows are
+        // streamed once and reused across all seqLen tokens, and each 8-row
+        // tile accumulates into four __m256 FMA chains, parallelized over
+        // tiles across the pool).  This replaced the per-token scalar fp64
+        // matMulVec loop (the dominant CPU cost of the hybrid GPU callback:
+        // ~17.4 ms/token prefill).  The selection math below is unchanged and
+        // runs per token on the same flat [seqLen][expertCount] logits layout
+        // the per-token loop used, so every router path (batched prefill,
+        // single-token decode, pure-CPU reference) produces bit-identical
+        // selections.  Non-F32 routers (Q8_0 etc.) and forceScalar fall back
+        // to the per-token matMulVec below.
+        std::vector<float> routerLogits(static_cast<size_t>(seqLen) *
+                                        expertCount);
+        const bool routerBatched =
+                w.ffnGateInpMoe.type == GGML_TYPE_F32 && !forceScalarPath() &&
+                matMulVecBatchF32_SIMD(
+                        reinterpret_cast<const float *>(
+                                w.ffnGateInpMoe.data.data()),
+                        ffnNorm, seqLen, expertCount, hiddenSize,
+                        routerLogits.data());
+        if (!routerBatched) {
+            for (uint32_t s = 0; s < seqLen; ++s) {
+                const float *x = ffnNorm + static_cast<size_t>(s) * hiddenSize;
+                w.ffnGateInpMoe.matMulVec(
+                        x, routerLogits.data() + static_cast<size_t>(s) * expertCount);
+            }
+        }
         for (uint32_t s = 0; s < seqLen; ++s) {
-            const float *x = ffnNorm + static_cast<size_t>(s) * hiddenSize;
-            w.ffnGateInpMoe.matMulVec(x, routerLogits.data());
+            const float *routerLogitsS =
+                    routerLogits.data() + static_cast<size_t>(s) * expertCount;
             float maxL = -std::numeric_limits<float>::infinity();
             for (uint32_t e = 0; e < expertCount; ++e) {
-                maxL = std::max(maxL, routerLogits[e]);
+                maxL = std::max(maxL, routerLogitsS[e]);
             }
             double sumExp = 0.0;
             for (uint32_t e = 0; e < expertCount; ++e) {
-                probs[e] = std::exp(static_cast<double>(routerLogits[e]) - maxL);
+                probs[e] =
+                        std::exp(static_cast<double>(routerLogitsS[e]) - maxL);
                 sumExp += probs[e];
             }
             const float invSum = static_cast<float>(1.0 / sumExp);
