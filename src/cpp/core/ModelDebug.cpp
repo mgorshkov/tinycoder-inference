@@ -380,12 +380,9 @@ namespace tinycoder {
                                             quantizedEmbeddings_.hiddenSize, logits.data());
             }
         } else {
-            // Plan §3: prefer the compact Q6_K raw kernel when the separate LM
-            // head is stored as Q6_K (0.82 B/elem vs 1.14 B/elem for the Q8_K
-            // copy below — ~28% less per-token LM-head memory traffic, matching
-            // llama.cpp's working set). Falls back to the pre-quantized Q8_K
-            // copy (int8 _mm256_maddubs_epi16 kernels with the hidden vector
-            // quantized once per token, ~2x vs on-the-fly dequantization).
+            // Falls back to the pre-quantized Q8_K copy (int8
+            // _mm256_maddubs_epi16 kernels with the hidden vector quantized
+            // once per token, ~2x vs on-the-fly dequantization).
             if (lmHead_.type == GGML_TYPE_Q6_K && lmHead_.cols % 256 == 0) {
                 matMulVecBatchQ6K_SIMD(lmHead_.data.data(), hidden.data(), 1,
                                        lmHead_.rows, lmHead_.cols, logits.data());

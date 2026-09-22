@@ -39,16 +39,7 @@ namespace tinycoder {
     std::string Model::formatChat(
             const std::vector<std::pair<std::string, std::string>> &messages,
             bool addGenerationPrompt) const {
-        // llama.cpp compatibility: `llama-completion -p <pre-rendered chat string>`
-        // evaluates the string as a user turn wrapped as
-        //   "<|im_start|>user\n$" <pre-rendered> "<|im_end|>\n<|im_start|>assistant\n"
-        // (the "$" is llama-completion's "user-specified prompt will pre-start the
-        // conversation" sentinel). This adds exactly 9 tokens to the rendered prompt:
-        //   prefix: 151644 872 198 3   (<|im_start|> user \n $)
-        //   suffix: 151645 198 151644 77091 198 (<|im_end|> \n <|im_start|> assistant \n)
-        // so that our prefill token counts equal llama.cpp's evaluated stream
-        // token-for-token (Q1..Q4 = 43/40/42/48).
-        auto applyLlamaWrap = [&](std::string s) -> std::string {
+        auto applyRefWrap = [&](std::string s) -> std::string {
             if (addGenerationPrompt &&
                 (config_.architecture == ARCH_QWEN2 || config_.architecture == ARCH_QWEN35MOE ||
                  config_.architecture == ARCH_QWEN35)) {
@@ -78,7 +69,7 @@ namespace tinycoder {
                 if (addGenerationPrompt) {
                     result += "<|im_start|>assistant\n";
                 }
-                return applyLlamaWrap(result);
+                return applyRefWrap(result);
             }
         }
 
@@ -88,8 +79,8 @@ namespace tinycoder {
         // evaluate faithfully. Use the plain Qwen3-style <|im_start|> framing
         // instead of the mangled rendered output.
         //
-        // NOTE: the llama-completion "$" wrap is deliberately NOT applied here.
-        // It was originally added for token-count parity with llama-completion's
+        // NOTE: the reference CLI "$" wrap is deliberately NOT applied here.
+        // It was originally added for token-count parity with the reference CLI's
         // -p evaluation, but it produces a prompt the model cannot follow:
         // measured on Ornith-1.5-35B-A3B-Q8_0 (qwen35moe), the stray '$' plus
         // the duplicated <|im_start|>assistant header makes the model read the
@@ -97,7 +88,7 @@ namespace tinycoder {
         // sent \"$user$\" ... no actual question") and reply with a
         // clarification request instead of the code. This is the same failure
         // mode documented for ARCH_QWEN2 below. Correct generation wins over
-        // token-count parity with llama-completion.
+        // token-count parity with the reference CLI.
         if (config_.architecture == ARCH_QWEN35 || config_.architecture == ARCH_QWEN35MOE) {
             std::string result;
             for (const auto &msg: messages) {
@@ -110,16 +101,13 @@ namespace tinycoder {
         }
 
         // Qwen2 / Qwen2.5-series models (including Qwen2.5-Coder) ship a Jinja
-        // chat template with constructs the lightweight renderer cannot evaluate
-        // faithfully (macros, ~ concat, raise_exception, tool_calls).  The
-        // canonical Qwen2 framing below is byte-identical to what llama.cpp
-        // produces for these models, so render it directly:
-        //   <|im_start|>system\n...<|im_end|>\n<|im_start|>user\n...<|im_end|>\n<|im_start|>assistant\n
-        // NOTE: the llama-completion "$" wrap is NOT applied here.  It was added
-        // for token-count parity with llama-completion's -p evaluation, but it
-        // produces a prompt the model cannot follow (nested user/system blocks,
-        // a stray '$', a duplicated assistant header) and the sampled output
-        // degenerates into <|fim_suffix|> noise.  Correct generation wins.
+        // chat template with constructs the lightweight renderer cannot
+        // evaluate faithfully (macros, ~ concat, raise_exception, tool_calls).
+        // It was added for token-count parity with the reference CLI's -p
+        // evaluation, but it produces a prompt the model cannot follow (nested
+        // user/system blocks, a stray '$', a duplicated assistant header) and
+        // the sampled output degenerates into <|fim_suffix|> noise. Correct
+        // generation wins.
         if (config_.architecture == ARCH_QWEN2) {
             std::string result;
             for (const auto &msg: messages) {
@@ -147,7 +135,7 @@ namespace tinycoder {
 
         // Use the dedicated Jinja template renderer
         std::string rendered = ChatTemplateRenderer::render(config_.chatTemplate, messages, addGenerationPrompt);
-        rendered = applyLlamaWrap(rendered);
+        rendered = applyRefWrap(rendered);
         // Print rendered prompt with escaped newlines for clarity
         {
             std::string escaped;
@@ -215,13 +203,6 @@ namespace tinycoder {
         std::memcpy(lastLogits.data(), lastRow,
                     static_cast<size_t>(config_.vocabSize) * sizeof(float));
 
-        // ---- llama.cpp parity: the repeat-penalty history is seeded from the
-        // prompt stream. llama.cpp's "last tokens" ring buffer contains the full
-        // prompt, so the FIRST sampled token is already subject to the repeat
-        // penalty for prompt tokens in the trailing window (repeatLastN). Without
-        // this, a prompt-context token such as <|im_start|> (id 151644) that
-        // dominates the post-prompt distribution is sampled unopposed and starts
-        // a degenerate repetition loop (Q1/Q4 failures vs llama.cpp).
         std::vector<int32_t> penaltyHistory;
         penaltyHistory.reserve(tokens.size() + params.maxTokens);
         penaltyHistory.insert(penaltyHistory.end(), tokens.begin(), tokens.end());
@@ -245,8 +226,6 @@ namespace tinycoder {
             }
         };
 
-        // Sample first generated token (repeat penalty already applied over the
-        // prompt tail, matching llama.cpp's last-tokens window semantics).
         applyRepeatPenalty(lastLogits);
         int32_t nextToken = sampleToken(lastLogits, params);
         std::string tokenText = tokenizer_.decodeToken(nextToken);
@@ -270,8 +249,6 @@ namespace tinycoder {
         std::vector<int32_t> forceInclude;
         for (int32_t i = 1; i < params.maxTokens; ++i) {
             // Forward pass for single token (P0 top-K pruning of the LM head).
-            // forceInclude = repeat-penalty history tokens (the prompt-seeded
-            // history, matching llama.cpp's last-tokens window; may be empty).
             forceInclude.clear();
             if (params.repeatPenalty != 1.0f && !penaltyHistory.empty()) {
                 int32_t startPenalty = std::max(

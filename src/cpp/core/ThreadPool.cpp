@@ -53,16 +53,10 @@ namespace tinycoder {
 
         // LOGICAL-CPU count (sysconf(_SC_NPROCESSORS_ONLN) on Linux,
         // std::thread::hardware_concurrency elsewhere) — the measured optimum.
-        // Measured 2026-08-28 AFTER the task-graph levers (dynamic chunk
-        // work-stealing + last-arriver cooperative act quantize): 8 threads
-        // holds a clear edge over llama.cpp's 4-physical default on the
-        // reference host (i7-4790K, 4 physical / 8 logical): 24.06/24.01 (8t)
-        // vs 21.68/21.60 (4t) tok/s with coop-ON, i.e. 8-way parallelism keeps
-        // DRAM saturated even at the physical-core pool's ~equal efficiency —
-        // the fine 8-way row split plus the pooled HT lanes keep the memory
-        // bus busier than 4 dedicated cores on this 2-channel DDR3-1600.
-        // physicalThreadCount() remains available for A/B'ing llama.cpp's
-        // default; set TINYCODER_THREADS to override at runtime.
+        // 8-way parallelism keeps DRAM saturated even at the physical-core
+        // pool's ~equal efficiency — the fine 8-way row split plus the pooled
+        // HT lanes keep the memory bus busier than 4 dedicated cores on this
+        // 2-channel DDR3-1600.
 #if defined(__linux__)
         long nCpus = sysconf(_SC_NPROCESSORS_ONLN);
         if (nCpus > 0) {
@@ -78,12 +72,9 @@ namespace tinycoder {
 
     size_t ThreadPool::physicalThreadCount() {
 #if defined(__linux__)
-        // llama.cpp's common_cpu_get_num_physical_cores() (Linux path): read
-        // /sys/devices/system/cpu/cpuN/topology/thread_siblings for each online
-        // CPU and count DISTINCT sibling masks. Two logical CPUs sharing an HT
-        // lane report identical masks, so the distinct-mask count equals the
-        // number of physical cores (4 on the i7-4790K reference: masks 1,2,4,8
-        // — source-verified in ~/git/llama.cpp/common/common.cpp).
+        // Two logical CPUs sharing an HT lane report identical masks, so the
+        // distinct-mask count equals the number of physical cores (4 on the
+        // i7-4790K reference: masks 1,2,4,8).
         {
             unsigned long long masks[64];
             uint32_t n = 0;
@@ -118,8 +109,6 @@ namespace tinycoder {
             }
         }
 #endif
-        // Fallback (mirrors llama.cpp's Windows cpu_count_math_cpus()): half
-        // the logical count — "hyperthreading isn't useful for linear algebra".
         unsigned int hw = std::thread::hardware_concurrency();
         if (hw > 1) {
             return static_cast<size_t>(hw / 2);
@@ -139,14 +128,10 @@ namespace tinycoder {
         numThreads_ = numThreads;
         numWorkers_ = static_cast<uint32_t>(numThreads - 1);
 
-        // Default from the CMake option (-DTINYCODER_AFFINITY=0/1): OFF (0,
-        // default) lets the OS schedule workers across all logical CPUs, which
-        // is faster at low thread counts on memory-bound generation (matches
-        // llama.cpp's 4-thread behaviour). The TINYCODER_AFFINITY environment
-        // variable ("1"/"0") overrides the baked-in default at runtime so one
-        // binary can A/B the pinning without a recompile. A later
-        // setAffinityEnabled() call (e.g. a caller forcing a specific policy)
-        // still overrides both.
+        // The TINYCODER_AFFINITY environment variable ("1"/"0") overrides the
+        // baked-in default at runtime so one binary can A/B the pinning without
+        // a recompile. A later setAffinityEnabled() call (e.g. a caller forcing
+        // a specific policy) still overrides both.
         bool affinityDefault = false;
 #if defined(TINYCODER_AFFINITY)
         affinityDefault = (TINYCODER_AFFINITY != 0);
@@ -306,8 +291,7 @@ namespace tinycoder {
                     // pure spin — never a cv wait — avoids the lost-wakeup
                     // deadlock where nothing notifies workers blocked on
                     // phase2Ready_ (the main thread releases the flag without
-                    // holding the mutex). This is the "context-switch-free"
-                    // barrier llama.cpp's task graph relies on.
+                    // holding the mutex).
                     while (!phase2Ready_.load(std::memory_order_acquire)) {
                         spinPause();
                     }
@@ -320,12 +304,8 @@ namespace tinycoder {
                     }
                 }
             } else if (stealTask_) {
-                // Dynamic chunked work-stealing (parallelForSteal /
-                // parallelForSteal2): pull [chunk]-sized index chunks from the
-                // shared atomic via fetch_add — llama.cpp's
-                // ggml_compute_forward_mul_mat_one_chunk dispatch. This keeps
-                // DRAM saturated at the tail on memory-bound generation kernels
-                // (no thread idles on a long static slab).
+                // This keeps DRAM saturated at the tail on memory-bound
+                // generation kernels (no thread idles on a long static slab).
                 uint32_t chunk = stealChunk_;
                 while (true) {
                     uint32_t idx = nextIndex_.fetch_add(chunk, std::memory_order_relaxed);
@@ -691,14 +671,12 @@ namespace tinycoder {
             phase1(idx);
         }
 
-        // ---- Barrier 1: all workers finished phase 1 ----
-        // Workers signal by incrementing phase1Arrived_ (their pendingWorkers_
-        // decrement happens only after phase 2). This is an INTRA-KERNEL
-        // barrier: the phase-1 slabs are bounded and roughly balanced, so the
-        // main thread merely spins until all workers arrive. A cv fallback
-        // would deadlock here — nothing notifies the cv when phase1Arrived_ is
-        // incremented. Spinning is the "context-switch-free" barrier llama.cpp
-        // relies on.
+        // ---- Barrier 1: all workers finished phase 1 ---- Workers signal by
+        // incrementing phase1Arrived_ (their pendingWorkers_ decrement happens
+        // only after phase 2). This is an INTRA-KERNEL barrier: the phase-1
+        // slabs are bounded and roughly balanced, so the main thread merely
+        // spins until all workers arrive. A cv fallback would deadlock here —
+        // nothing notifies the cv when phase1Arrived_ is incremented.
         while (phase1Arrived_.load(std::memory_order_acquire) < numWorkers_) {
             spinPause();
         }
@@ -744,13 +722,12 @@ namespace tinycoder {
         reentrantDepth_.store(0, std::memory_order_release);
     }
 
-    // Dynamic chunked work-stealing parallel-for (llama.cpp
-    // ggml_compute_forward_mul_mat_one_chunk style). Each participant (workers +
-    // main thread) pulls [chunkSize]-sized index ranges from the shared atomic
-    // nextIndex_ via fetch_add(chunkSize), so the tail of the index space is
-    // stolen by whichever thread finishes its share first — no static slab can
-    // leave a thread idle while others still work. This keeps DRAM saturated
-    // on memory-bound generation kernels at BOTH thread counts (4 and 8).
+    // Each participant (workers + main thread) pulls [chunkSize]-sized index
+    // ranges from the shared atomic nextIndex_ via fetch_add(chunkSize), so the
+    // tail of the index space is stolen by whichever thread finishes its share
+    // first — no static slab can leave a thread idle while others still work.
+    // This keeps DRAM saturated on memory-bound generation kernels at BOTH
+    // thread counts (4 and 8).
     //
     // chunkSize is in ITEMS (e.g. 4 tiles); the main thread and each worker
     // run the same fetch_add loop, and the final partial chunk (idx+chunk might
@@ -840,11 +817,7 @@ namespace tinycoder {
     // Mirrors parallelForSlab2's two-phase protocol (ONE task publication for
     // phase1 + `between` + phase2, spin-flag phase transition) but each phase
     // pulls [chunk1/chunk2]-sized chunks from the shared atomic instead of
-    // running static slabs. This is the steal variant the fused gate+up+down
-    // kernel uses as lever 1: llama.cpp's single-token mul_mat runs
-    // chunk_size=64 dynamic work-stealing over the nr0×nr1 row space, which is
-    // where its 4-thread efficiency (29.4 vs TinyCoder's 19.2 tok/s) comes
-    // from.
+    // running static slabs.
     //
     // The protocol: workers run phase-1 chunks (task_), signal arrival via
     // phase1Arrived_, spin on phase2Ready_, then run phase-2 chunks

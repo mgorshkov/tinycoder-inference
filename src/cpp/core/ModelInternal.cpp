@@ -174,12 +174,8 @@ namespace tinycoder::detail {
             return;
         }
 
-        // IQ2_S / IQ3_XXS / IQ3_S (llama vec_dot_iq*_q8_K): quantize the shared
-        // activation x to Q8_K once per fused QKV call (reused by Q and K rows),
-        // accumulate integer dots per block and apply the trailing row scale
-        // once per output row — bit-identical to llama's CPU mul_mat. Q8_K
-        // quantization of x is cheap (256 fabs+rounds per block) and amortised
-        // over all Q/K rows.
+        // Q8_K quantization of x is cheap (256 fabs+rounds per block) and
+        // amortised over all Q/K rows.
         const bool q8kQ = GGMLDequantize::supportsQ8KDot(qMat.type);
         const bool q8kK = GGMLDequantize::supportsQ8KDot(kMat.type);
         const uint32_t q8kBlocks = (cols + 255) / 256;
@@ -202,13 +198,11 @@ namespace tinycoder::detail {
             // Small combined matrix: keep the serial block-outer loop (avoids the
             // spin-barrier + atomic dispatch overhead on tiny ranges).
             if (q8kQ || q8kK) {
-                // Q8K types must accumulate sumf in float across the row's
-                // blocks (llama's `sumf += d * bsum;`) and apply the trailing
-                // 0.125/0.25 scale once per row. Since the serial branch loops
-                // block-outer, do a per-row pass for the Q8K projections.
+                // Since the serial branch loops block-outer, do a per-row pass
+                // for the Q8K projections.
                 const float scaleQ = q8kQ ? GGMLDequantize::q8KDotRowScale(qMat.type) : 1.0f;
                 const float scaleK = q8kK ? GGMLDequantize::q8KDotRowScale(kMat.type) : 1.0f;
-                // Q rows (llama-parity accumulation)
+                // Q rows (reference-parity accumulation)
                 for (uint32_t j = 0; j < qRows; ++j) {
                     float sumf = 0.0f;
                     for (uint32_t b = 0; b < blocksPerRowQ; ++b) {
@@ -319,7 +313,7 @@ namespace tinycoder::detail {
                     out = vOut;
                 }
 
-                // Q8K types (IQ2_S / IQ3_XXS / IQ3_S): llama-parity accumulation
+                // Q8K types (IQ2_S / IQ3_XXS / IQ3_S): reference-parity accumulation
                 // — float sumf over the row's blocks, trailing 0.125/0.25 scale
                 // applied once per row. Others keep the float dequant-dot path.
                 const bool q8kRow = GGMLDequantize::supportsQ8KDot(ggmlType);
@@ -498,7 +492,7 @@ namespace tinycoder::detail {
         }
         ScopedProfile sp("matMulVecBatchQuantized");
 
-        // IQ2_S / IQ3_XXS / IQ3_S: llama-parity Q8_K integer dot (quantize each
+        // IQ2_S / IQ3_XXS / IQ3_S: reference-parity Q8_K integer dot (quantize each
         // token's x to Q8_K once, then vec_dot_iq*_q8_K accumulation with the
         // trailing 0.125/0.25 scale applied once per row). Numerically different
         // from the float dequant-dot below (up to ~5%), so must use this path.
@@ -639,11 +633,9 @@ namespace tinycoder::detail {
             return;
         }
 
-        // llama-parity Q8K path: for IQ2_S / IQ3_XXS / IQ3_S weights llama's CPU
-        // mul_mat quantizes the activations to Q8_K and accumulates with exact
-        // integer math (vec_dot_iq*_q8_K). The float dequant-dot diverges ~4.7%
-        // from that, so route these types through matMulVecBatchQ8K (which
-        // evaluates gate and up separately — each with its own Q8_K x-quant).
+        // The float dequant-dot diverges ~4.7% from that, so route these types
+        // through matMulVecBatchQ8K (which evaluates gate and up separately —
+        // each with its own Q8_K x-quant).
         if (GGMLDequantize::supportsQ8KDot(gate.type)) {
             GGMLDequantize::matMulVecBatchQ8K(gate.type, gate.data.data(), X, seqLen,
                                               rows, cols, gateOut);

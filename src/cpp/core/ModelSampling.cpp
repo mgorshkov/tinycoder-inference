@@ -510,11 +510,6 @@ namespace tinycoder {
             rngInitialized_ = true;
         }
 
-        // Use the same generator semantics as llama.cpp's `dist` sampler:
-        // std::mt19937 seeded identically, draw via
-        // std::uniform_real_distribution<float>(0,1) (llama_rng::next_float).
-        // This makes TinyCoder's sampled tokens match llama.cpp token-for-token
-        // whenever the post-filter distributions are equal ("use same generator").
         static std::uniform_real_distribution<float> rngDist(0.0f, 1.0f);
         float r = rngDist(rng_);
         float cumSum = 0.0f;

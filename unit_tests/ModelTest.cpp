@@ -299,12 +299,9 @@ bool SampleQuestionTest::quickMode = false;
 TEST_P(SampleQuestionTest, AnswersQuestion) {
     const auto &qa = GetParam();
 
-    // End-to-end generation checks asserting on sampled keywords. The original
-    // keywords were validated against the IQ3_XXS Qwen2-0.5B reference model;
-    // the Qwen2.5-Coder-7B-Instruct-IQ2_S model was verified (via llama.cpp and
-    // the CPU engine) to answer each question with the expected keyword using
-    // the same chat template. The assertions below are robust: they check the
-    // keyword is PRESENT anywhere in the generated text (not position-locked).
+    // End-to-end generation checks asserting on sampled keywords. The
+    // assertions below are robust: they check the keyword is PRESENT anywhere
+    // in the generated text (not position-locked).
     const auto &cfg = SharedTestEnv::config;
     const bool isGptQwen025B = (cfg.architecture == "qwen2" &&
                                 cfg.hiddenSize == 1024 && cfg.numLayers == 24);
@@ -356,9 +353,8 @@ TEST_P(SampleQuestionTest, AnswersQuestion) {
 
     InferenceParams params;
     params.maxTokens = maxGenTokens;
-    // Temperature sampling with repeat penalty.  The 2.57-bit IQ2_S model's
-    // greedy argmax collapses onto ubiquitous tokens (e.g. ","); sampling lets
-    // the answer emerge (the golden reference run by llama.cpp used sampling).
+    // Temperature sampling with repeat penalty. The 2.57-bit IQ2_S model's
+    // greedy argmax collapses onto ubiquitous tokens (e.g.
     params.temperature = 0.7f;
     params.topP = 0.9f;
     params.topK = 40;
@@ -525,11 +521,7 @@ TEST_F(ModelTest, TracePrefillTokenByToken) {
     }
 }
 
-// ===========================================================================
-// DIAGNOSTIC (temp): dump TinyCoder's per-layer post-FFN hidden norms for the
-// Paris chat prompt, to diff against llama.cpp's `[ar] per-layer` capture and
-// find which layer first diverges.  Runs only on the 1.5B IQ3_XXS-imat model.
-// Single token (151644) at position 0 to match llama's AR path captures.
+// Runs only on the 1.5B IQ3_XXS-imat model.
 // ===========================================================================
 TEST_F(ModelTest, DumpLayerHiddenNormsQwen2) {
     const auto &cfg = SharedTestEnv::config;
@@ -542,8 +534,6 @@ TEST_F(ModelTest, DumpLayerHiddenNormsQwen2) {
     auto &tok = SharedTestEnv::model->tokenizer();
     uint32_t vocabSize = cfg.vocabSize;
 
-    // Matches llama_ref_probe's fnv1a64 exactly: one FNV round per float,
-    // hashing the 32-bit word (memcpy to avoid aliasing/padding issues).
     auto fnv1a = [](const float *v, size_t n) {
         uint64_t h = 1469598103934665603ULL;
         for (size_t i = 0; i < n; ++i) {
@@ -557,7 +547,6 @@ TEST_F(ModelTest, DumpLayerHiddenNormsQwen2) {
 
     const int32_t tokId = 151644;
 
-    // 1) Token embedding row — vs llama tok[0] fnv=28c708690e356a43.
     {
         auto emb = SharedTestEnv::model->debugGetEmbedding(tokId);
         double s = 0.0;
@@ -568,8 +557,6 @@ TEST_F(ModelTest, DumpLayerHiddenNormsQwen2) {
                (unsigned long long) fnv1a(emb.data(), emb.size()));
     }
 
-    // 2) Per-layer post-FFN hidden states (before final RMSNorm) — vs llama's
-    //    [ar] per-layer capture (layer 0 fnv=ab99f24a4f92b8eb ...).
     {
         SharedTestEnv::model->clearKVCache();
         auto perLayer = SharedTestEnv::model->forwardWithPerLayerStates({tokId});
@@ -585,11 +572,6 @@ TEST_F(ModelTest, DumpLayerHiddenNormsQwen2) {
         }
     }
 
-    // 2b) Layer-0 intermediates — vs llama's [ar] layer-0 captures
-    //     (attn_norm-0 fnv=fb052b95b11864c0, Qcur-0 fnv=5d7c06f08573c920,
-    //      Kcur-0 fnv=524e15b66b171ffd, Vcur-0 fnv=6de4b04fc4456dbf,
-    //      ffn_inp-0 fnv=346376922a81d368, ffn_norm-0 fnv=0f49e373692481ef,
-    //      ffn_out-0 fnv=7d6b1dfefaf8d39c, l_out-0 fnv=ab99f24a4f92b8eb).
     {
         SharedTestEnv::model->clearKVCache();
         auto intm = SharedTestEnv::model->debugQwen2Layer0Intm({tokId});
@@ -606,8 +588,6 @@ TEST_F(ModelTest, DumpLayerHiddenNormsQwen2) {
         }
     }
 
-    // 3) Final hidden (after final RMSNorm) + top-5 logits — vs llama's [ar]
-    //    result_norm fnv=b93fe705ddebe39d / post-output_norm embedding.
     {
         SharedTestEnv::model->clearKVCache();
         auto [hidden, logits] = SharedTestEnv::model->debugForwardWithHidden(tokId);

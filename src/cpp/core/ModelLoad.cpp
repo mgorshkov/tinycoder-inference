@@ -648,17 +648,6 @@ namespace tinycoder {
                     return false;
                 }
             } else if (config_.architecture == ARCH_QWEN35MOE) {
-                // ---- Qwen35MoE architecture (gated delta net + MoE FFN) ----
-                // Layer types (llama.cpp qwen35moe.cpp):
-                //   - Recurrent (gated delta net): (i+1) % fullAttentionInterval != 0
-                //     tensors: attn_qkv, attn_gate, ssm_conv1d, ssm_a, ssm_alpha,
-                //              ssm_beta, ssm_dt.bias, ssm_norm, ssm_out
-                //   - Full attention: (i+1) % fullAttentionInterval == 0
-                //     tensors: attn_q (Q+gate fused), attn_k, attn_v, attn_output,
-                //              attn_q_norm, attn_k_norm
-                // Routed experts: ffn_gate_inp (router), ffn_gate_exps/ffn_up_exps
-                //   (or fused ffn_gate_up_exps) + ffn_down_exps, plus gated shared
-                //   expert ffn_*_shexp + ffn_gate_inp_shexp.
                 const bool isRecurrent = detail::isQwen35RecurrentLayer(config_, i);
 
                 // Common norms
@@ -667,10 +656,9 @@ namespace tinycoder {
 
                 // ---- MoE FFN weights (routed experts) ----
                 layers_[i].ffnGateInpMoe = loadQuantized(prefix + "ffn_gate_inp.weight");
-                // llama prefers the fused ffn_gate_up_exps (TENSOR_NOT_REQUIRED); falls
-                // back to separate ffn_gate_exps + ffn_up_exps.  When fused, the
-                // compute path slices rows [e*ff*2, e*ff*2+ff) as gate and
-                // [e*ff*2+ff, (e+1)*ff*2) as up from ffnGateUpExpsMoe.
+                // When fused, the compute path slices rows [e*ff*2, e*ff*2+ff)
+                // as gate and [e*ff*2+ff, (e+1)*ff*2) as up from
+                // ffnGateUpExpsMoe.
                 layers_[i].ffnGateUpExpsMoe = loadQuantized(prefix + "ffn_gate_up_exps.weight");
                 if (layers_[i].ffnGateUpExpsMoe.empty()) {
                     layers_[i].ffnGateExps = loadQuantized(prefix + "ffn_gate_exps.weight");
@@ -727,16 +715,8 @@ namespace tinycoder {
             } else if (config_.architecture == ARCH_QWEN35) {
                 // ---- Qwen35 architecture (dense: gated delta net + full attention) ----
                 //
-                // Layer types (llama.cpp qwen35.cpp):
-                //   - Recurrent (gated delta net): i < nLayer && (i+1) % interval != 0
-                //     tensors: attn_qkv, attn_gate, ssm_conv1d, ssm_a, ssm_alpha,
-                //              ssm_beta, ssm_dt.bias, ssm_norm, ssm_out
-                //   - Full attention: i < nLayer && (i+1) % interval == 0
-                //     tensors: attn_q (Q+gate fused), attn_k, attn_v, attn_output,
-                //              attn_q_norm, attn_k_norm
-                //   - MTP block (i >= nLayer): full attention + nextn.* (not run in
-                //     the main decode pass).
-                // All layers share attn_norm, post_attention_norm, ffn_gate/up/down.
+                // All layers share attn_norm, post_attention_norm,
+                // ffn_gate/up/down.
                 const bool isRecurrent = detail::isQwen35RecurrentLayer(config_, i);
 
                 // Common norms

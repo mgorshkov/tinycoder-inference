@@ -398,6 +398,35 @@ namespace tinycoder {
                                 uint32_t seqLen, uint32_t rows, uint32_t cols,
                                 float *out);
 
+    /// @brief Register-tiled batch GEMM for a single F32 (fp32) weight matrix
+    /// over a batch of tokens, used for the qwen35moe ROUTER (ffnGateInpMoe is
+    /// an F32 [expertCount x hiddenSize] host matrix).
+    ///
+    /// Computes out[s*rows + j] = sum_i X[s*cols + i] * W_f32[j*cols + i] for
+    /// all tokens s and output rows j, where W_f32 is a row-major fp32 matrix.
+    /// On a host with a vector (AVX2) kernel each tile of 8 rows accumulates
+    /// into four independent __m256 FMA chains (32 lanes in flight), streams
+    /// the weight rows once and reuses them across all seqLen tokens
+    /// (weight-stationary prefill); the x-vector is loaded once per
+    /// (token, 8-lane group) and reused across the 8 tile rows. The previous
+    /// path was a per-token scalar fp64-accumulation loop — the dominant CPU
+    /// cost of the hybrid GPU callback (~16.6 ms/token decode, ~17.4 ms/token
+    /// prefill on the 256x2048 router x 40 layers). Router output feeds only
+    /// the top-k expert selection, so the fp32-vs-fp64 rounding delta is
+    /// benign. Returns true if a vector kernel was used, false if the caller
+    /// must fall back to the scalar fp64 reference loop.
+    ///
+    /// @param W_f32  fp32 weights, row-major [rows * cols]
+    /// @param X      Input activations [seqLen, cols] (row-major)
+    /// @param seqLen Number of tokens in the batch
+    /// @param rows   Number of output rows (expertCount)
+    /// @param cols   Number of input columns (hiddenSize)
+    /// @param out    Output [seqLen, rows] (row-major)
+    /// @return true if the vector batch kernel was dispatched
+    bool matMulVecBatchF32_SIMD(const float *W_f32, const float *X,
+                                uint32_t seqLen, uint32_t rows, uint32_t cols,
+                                float *out);
+
     /// @brief Register-tiled batch GEMM for a single Q4_K weight matrix over a
     /// batch of tokens (prefill), used for the attnV projection.
     ///
@@ -423,21 +452,17 @@ namespace tinycoder {
     /// @brief Register-tiled batch GEMM for a single COMPACT (raw GGUF) Q3_K
     /// weight matrix over a batch of tokens, used for the attnO and ffnDown
     /// projections.
-    ///
-    /// Computes out[s*rows + j] = sum_i X[s*cols + i] * W_q3k[j*cols + i] for
-    /// all tokens s and output rows j, where W_q3k is raw Q3_K data (110 bytes
-    /// per 256-element block). Q3_K is how attnO/ffnDown are stored in the model
-    /// file (0.43 B/elem); generation is DRAM-bandwidth-bound, so streaming the
-    /// compact blocks directly (instead of the Q8_K copies at 1.14 B/elem that
-    /// would otherwise be rebuilt and read) cuts the weight traffic ~2.65x,
-    /// matching llama.cpp's working set. On a host with a vector (AVX2) kernel
-    /// the per-block setup (fp16 super scale, per-16-group signed scales,
-    /// expanded 2-bit planes with the sign mask folded in) is hoisted out of the
-    /// token loop (weight-stationary) and the inner 32-element sub-block dots
-    /// run through _mm256_maddubs_epi16 against a Q8_K x-vector. Returns true if
-    /// a vector kernel was used, false if the caller must fall back to the
-    /// generic path.
-    ///
+    //
+    // Computes out[s*rows + j] = sum_i X[s*cols + i] * W_q3k[j*cols + i] for
+    // all tokens s and output rows j, where W_q3k is raw Q3_K data (110 bytes
+    // per 256-element block). On a host with a vector (AVX2) kernel the
+    // per-block setup (fp16 super scale, per-16-group signed scales, expanded
+    // 2-bit planes with the sign mask folded in) is hoisted out of the token
+    // loop (weight-stationary) and the inner 32-element sub-block dots run
+    // through _mm256_maddubs_epi16 against a Q8_K x-vector. Returns true if a
+    // vector kernel was used, false if the caller must fall back to the generic
+    // path.
+    //
     /// @param W_q3k  Q3_K weights, row-major [rows * blocksPerRow] raw blocks
     /// @param X      Input activations [seqLen, cols] (row-major)
     /// @param seqLen Number of tokens in the batch
@@ -457,22 +482,18 @@ namespace tinycoder {
 
     /// @brief Register-tiled batch GEMM for a single COMPACT (raw GGUF) Q6_K
     /// weight matrix over a batch of tokens, used for the separate LM head.
-    ///
-    /// Computes out[s*rows + j] = sum_i X[s*cols + i] * W_q6k[j*cols + i] for
-    /// all tokens s and output rows j, where W_q6k is raw Q6_K data (210 bytes
-    /// per 256-element block). Q6_K is how the separate LM head is stored in the
-    /// model file (0.82 B/elem); generation is DRAM-bandwidth-bound, so
-    /// streaming the compact blocks directly (instead of the Q8_K copies at
-    /// 1.14 B/elem that would otherwise be rebuilt and read) cuts the LM-head
-    /// weight traffic ~28%, matching llama.cpp's working set. On a host with a
-    /// vector (AVX2) kernel the per-block setup (fp16 block scale, per-16-group
-    /// signed int8 scales, expanded 6-bit planes) is hoisted out of the token
-    /// loop (weight-stationary) and the inner 32-element sub-block dots run
-    /// through _mm256_maddubs_epi16 against a Q8_K x-vector. The -32 offset of
-    /// w_eff = w' - 32 folds through the Q8KBlock bsums as a per-lane vector
-    /// (-32*sum_g sc[g]*bsum[g]). Returns true if a vector kernel was used,
-    /// false if the caller must fall back to the generic path.
-    ///
+    //
+    // Computes out[s*rows + j] = sum_i X[s*cols + i] * W_q6k[j*cols + i] for
+    // all tokens s and output rows j, where W_q6k is raw Q6_K data (210 bytes
+    // per 256-element block). On a host with a vector (AVX2) kernel the
+    // per-block setup (fp16 block scale, per-16-group signed int8 scales,
+    // expanded 6-bit planes) is hoisted out of the token loop
+    // (weight-stationary) and the inner 32-element sub-block dots run through
+    // _mm256_maddubs_epi16 against a Q8_K x-vector. The -32 offset of w_eff =
+    // w' - 32 folds through the Q8KBlock bsums as a per-lane vector (-32*sum_g
+    // sc[g]*bsum[g]). Returns true if a vector kernel was used, false if the
+    // caller must fall back to the generic path.
+    //
     /// @param W_q6k  Q6_K weights, row-major [rows * blocksPerRow] raw blocks
     /// @param X      Input activations [seqLen, cols] (row-major)
     /// @param seqLen Number of tokens in the batch
@@ -546,19 +567,16 @@ namespace tinycoder {
                                   uint32_t seqLen, uint32_t rows, uint32_t cols,
                                   float *out);
 
-    /// @brief Register-tiled batch GEMM for a single Q8_0 weight matrix over a
-    /// batch of tokens, used for the qwen35moe routed-expert / shared-expert
-    /// matmuls (Q8_0 model files). Q8_0 is a 32-weight block (34 bytes), so
-    /// unlike the K-quant kernels this requires only cols % 32 == 0 and — being
-    /// defined over 32-wide blocks — is ALSO usable for single-token mat-vec
-    /// over an arbitrary CONTIGUOUS row range (the MoE expert slice the scalar
-    /// matMulVecRows used to handle). Internally: x is quantized to int8 per
-    /// 32-block (llama quantize_row_q8_0 sign-fold) and the per-16-group dots
-    /// run through _mm256_maddubs_epi16 against w+128 — exact integer math
-    /// with a single fp32 d*d8 scale. Restores the multi-core parallelism the
-    /// MoE expert path was missing (its parallelFor2D(1,8) hit the serial
-    /// shortcut in parallelFor). Returns true if a vector kernel was used,
-    /// false if the caller must fall back to the generic scalar path.
+    // @brief Register-tiled batch GEMM for a single Q8_0 weight matrix over a
+    // batch of tokens, used for the qwen35moe routed-expert / shared-expert
+    // matmuls (Q8_0 model files). Q8_0 is a 32-weight block (34 bytes), so
+    // unlike the K-quant kernels this requires only cols % 32 == 0 and — being
+    // defined over 32-wide blocks — is ALSO usable for single-token mat-vec
+    // over an arbitrary CONTIGUOUS row range (the MoE expert slice the scalar
+    // matMulVecRows used to handle). Restores the multi-core parallelism the
+    // MoE expert path was missing (its parallelFor2D(1,8) hit the serial
+    // shortcut in parallelFor). Returns true if a vector kernel was used, false
+    // if the caller must fall back to the generic scalar path.
     bool matMulVecBatchQ8_0_SIMD(const uint8_t *W_q8_0, const float *X,
                                  uint32_t seqLen, uint32_t rows, uint32_t cols,
                                  float *out);

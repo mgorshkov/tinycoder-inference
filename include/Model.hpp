@@ -256,12 +256,9 @@ namespace tinycoder {
             np::Array<float> attnQNormMoe;// headDim (Q norm for Qwen35MoE)
             np::Array<float> attnKNormMoe;// headDim (K norm for Qwen35MoE)
 
-            // ---- Qwen35 (dense) specific: full-attention layers ----
-            // attn_q projects BOTH the query and the gating signal (see llama.cpp
-            // qwen35 build_layer_attn): the first half of each head's slice is Q,
-            // the second half is the gating gate (used with a sigmoid). Q and K get
-            // per-head RMSNorm (attn_q_norm / attn_k_norm) before MRoPE (using the
-            // shared attnQNorm/attnKNorm fields declared above).
+            // Q and K get per-head RMSNorm (attn_q_norm / attn_k_norm) before
+            // MRoPE (using the shared attnQNorm/attnKNorm fields declared
+            // above).
 
             // ---- Qwen35 (dense) specific: recurrent (gated delta net) layers ----
             // ssmConv1d is [ssmConvKernel, convChannels] where
@@ -287,9 +284,7 @@ namespace tinycoder {
 
             // ---- Qwen35MoE: MoE FFN ----
             QuantizedMatrix ffnGateInpMoe;// hiddenSize x expertCount (router)
-            // Fused gate+up experts (llama ffn_gate_up_exps): rows per expert =
-            // expertFF*2; rows [e*ff*2, e*ff*2+ff) = gate, [e*ff*2+ff, (e+1)*ff*2)
-            // = up.  Empty when the GGUF stores separate gate/up tensors.
+            // Empty when the GGUF stores separate gate/up tensors.
             QuantizedMatrix ffnGateUpExpsMoe;
             QuantizedMatrix ffnGateExps;    // expertCount x expertFF x hiddenSize
             QuantizedMatrix ffnUpExps;      // expertCount x expertFF x hiddenSize
@@ -464,24 +459,18 @@ namespace tinycoder {
         std::vector<std::vector<float>>
         debugQwen35PerLayer(const std::vector<int32_t> &tokens);
 
-        /// @brief Debug: fingerprint layer-0 recurrent intermediates for a
-        /// token sequence (mirrors llama_ref_probe captures; the fingerprint
-        /// corresponds to the LAST token of the sequence exactly like the
-        /// probe's always-overwrite intm map). Each entry is {name, values}:
-        /// attn_norm, linear_attn_qkv_mixed, z, beta_sigmoid, a_softplus,
-        /// gate, conv_output_raw, conv_output_silu, q_conv_predelta,
-        /// k_conv_predelta, v_conv_predelta, attn_output, final_output,
-        /// linear_attn_out, attn_residual, attn_post_norm, ffn_out, post_ffn.
+        // Each entry is {name, values}: attn_norm, linear_attn_qkv_mixed, z,
+        // beta_sigmoid, a_softplus, gate, conv_output_raw, conv_output_silu,
+        // q_conv_predelta, k_conv_predelta, v_conv_predelta, attn_output,
+        // final_output, linear_attn_out, attn_residual, attn_post_norm,
+        // ffn_out, post_ffn.
         std::vector<std::pair<std::string, std::vector<float>>>
         debugQwen35Layer0Intm(const std::vector<int32_t> &tokens);
 
-        /// @brief Debug: fingerprint layer-0 intermediates for a qwen2 token
-        /// sequence, mirroring llama_ref_probe's [ar] captures (last token
-        /// of the sequence wins, exactly like the probe's intm map). Uses the
-        /// SAME math as forwardWithPerLayerStates (rpmsNormInPlace/
-        /// matMulVec/deqMatMulVecF16 + attentionFused). Entries: attn_norm-0,
-        /// Qcur-0, Kcur-0, Vcur-0, attn_out-0, attn_proj-0, ffn_inp-0,
-        /// ffn_norm-0, ffn_gate-0, ffn_up-0, ffn_silu-0, ffn_out-0, l_out-0.
+        // Uses the SAME math as forwardWithPerLayerStates (rpmsNormInPlace/
+        // matMulVec/deqMatMulVecF16 + attentionFused). Entries: attn_norm-0,
+        // Qcur-0, Kcur-0, Vcur-0, attn_out-0, attn_proj-0, ffn_inp-0,
+        // ffn_norm-0, ffn_gate-0, ffn_up-0, ffn_silu-0, ffn_out-0, l_out-0.
         std::vector<std::pair<std::string, std::vector<float>>>
         debugQwen2Layer0Intm(const std::vector<int32_t> &tokens);
 
@@ -947,12 +936,12 @@ namespace tinycoder {
         void applyMRoPE(float *q, float *k, uint32_t qSeqLen, uint32_t kSeqLen,
                         uint32_t qHeads, uint32_t kHeads, uint32_t pos);
 
-        /// @brief Process one full-attention qwen35 layer: fused Q+G projection
-        /// (attn_q, first headDim of each 2*headDim head slice is Q, second is
-        /// the gate), shared per-head Q/K RMSNorm weights (attn_q_norm /
-        /// attn_k_norm, [headDim] applied to every head), MRoPE, attention
-        /// (kq_scale = 1/sqrt(headDim)), elementwise sigmoid(gate), attn_output
-        /// projection and residual add. Mirrors llama.cpp qwen35 build_layer_attn.
+        // @brief Process one full-attention qwen35 layer: fused Q+G projection
+        // (attn_q, first headDim of each 2*headDim head slice is Q, second is
+        // the gate), shared per-head Q/K RMSNorm weights (attn_q_norm /
+        // attn_k_norm, [headDim] applied to every head), MRoPE, attention
+        // (kq_scale = 1/sqrt(headDim)), elementwise sigmoid(gate), attn_output
+        // projection and residual add.
         void forwardQwen35FullAttention(uint32_t layer, const LayerWeights &w,
                                         float *hidden, float *attnNorm, float *q,
                                         float *k, float *v, float *attnOut,
@@ -961,13 +950,13 @@ namespace tinycoder {
                                         uint32_t nHeads, uint32_t nKVHeads,
                                         uint32_t headDim);
 
-        /// @brief Process one recurrent (gated delta net) qwen35 layer: attn_qkv,
-        /// attn_gate (z), ssm_beta/ssm_alpha/ssm_dt/ssm_a (gate/decay), conv1d
-        /// with silu, L2-norm'ed q/k repeated over value heads (periodic
-        /// hv % nKHeads), the gated delta net recurrence (per value-head
-        /// [headV, headV] state M stored transposed: M[j][i] = S[i][j]), gated
-        /// RMSNorm with silu(z), ssm_out projection and residual add. Mirrors
-        /// llama.cpp qwen35 build_layer_attn_linear + ggml gated_delta_net.
+        // @brief Process one recurrent (gated delta net) qwen35 layer:
+        // attn_qkv, attn_gate (z), ssm_beta/ssm_alpha/ssm_dt/ssm_a
+        // (gate/decay), conv1d with silu, L2-norm'ed q/k repeated over value
+        // heads (periodic hv % nKHeads), the gated delta net recurrence (per
+        // value-head [headV, headV] state M stored transposed: M[j][i] =
+        // S[i][j]), gated RMSNorm with silu(z), ssm_out projection and residual
+        // add.
         void forwardQwen35Recurrent(uint32_t layer, const LayerWeights &w,
                                     float *hidden, float *attnNorm,
                                     float *attnProj, uint32_t seqLen,

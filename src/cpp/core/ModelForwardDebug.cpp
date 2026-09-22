@@ -1205,13 +1205,9 @@ namespace tinycoder {
         return perLayerStates;
     }
 
-    // -----------------------------------------------------------------------
-    // Debug bisection for qwen2: fingerprint every layer-0 intermediate for the
-    // token sequence, mirroring llama_ref_probe.cpp's [ar] captures (the last
-    // token of the sequence wins, exactly like the probe's always-overwrite
-    // intm map). Uses the SAME operation sequence as forwardWithPerLayerStates
-    // so a divergence in any op (RMSNorm/QKV/RoPE/attention/FFN) maps directly
-    // to the llama reference tensor of the same name.
+    // Uses the SAME operation sequence as forwardWithPerLayerStates so a
+    // divergence in any op (RMSNorm/QKV/RoPE/attention/FFN) maps directly to
+    // the reference tensor of the same name.
     // -----------------------------------------------------------------------
     std::vector<std::pair<std::string, std::vector<float>>>
     Model::debugQwen2Layer0Intm(const std::vector<int32_t> &tokens) {
@@ -1313,8 +1309,6 @@ namespace tinycoder {
                            1, cachePos, totalCacheLen, /*layer=*/0);
             if (pos == seqLen - 1) snapshot("attn_out-0", attnOut.data(), nHeads * headDim);
 
-            // Output projection + residual (Q8K integer dot for IQ3_S to
-            // mirror llama's vec_dot_iq3_s_q8_K; F16 copy only as fallback).
             if (GGMLDequantize::supportsQ8KDot(w.attnO.type)) {
                 GGMLDequantize::matMulVecFusedQ8K(w.attnO.type, w.attnO.data.data(),
                                                   attnOut.data(), w.attnO.rows,
@@ -1344,8 +1338,6 @@ namespace tinycoder {
             swiGLUInPlace(gate.data(), up.data(), intermediateSize);
             if (pos == seqLen - 1) snapshot("ffn_silu-0", gate.data(), intermediateSize);
 
-            // Down projection + residual (Q8K integer dot for IQ3_XXS to
-            // mirror llama's vec_dot_iq3_xxs_q8_K; F16 copy only as fallback).
             if (GGMLDequantize::supportsQ8KDot(w.ffnDown.type)) {
                 GGMLDequantize::matMulVecFusedQ8K(w.ffnDown.type, w.ffnDown.data.data(),
                                                   gate.data(), w.ffnDown.rows,

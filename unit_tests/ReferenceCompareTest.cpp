@@ -26,10 +26,7 @@ SOFTWARE.
  * TinyCoder Reference Comparison Tests
  *
  * These tests dump intermediate values (dequantized weights, matMulVec outputs,
- * hidden states, logits) for step-by-step comparison with reference
- * output. They are designed to help identify the root cause of the garbage
- * output bug by comparing TinyCoder's computation against a known-good
- * reference implementation at each step.
+ * hidden states, logits) for step-by-step comparison with reference output.
  */
 
 #include <chrono>
@@ -240,11 +237,9 @@ static const std::map<QuantModelKey, QuantRefValues> kQuantRefValues = {
                  0.042684f,
          }},
         // -----------------------------------------------------------------------
-        // IQ3_XXS (type 18) — Qwen2.5-Coder-7B-Instruct-IQ3_XXS-imat
-        // (hidden 3584, 28 layers).  Captured 2026-09-08 from the CPU engine
-        // (dequant + matMulVec on layer 1 FFN).  The IQ3_XXS dequant is
-        // byte-identical to llama.cpp and the IQ3_XXS Q8K dot agrees to 1 ulp,
-        // so these stats also act as a regression guard against engine changes.
+        // IQ3_XXS (type 18) — Qwen2.5-Coder-7B-Instruct-IQ3_XXS-imat (hidden
+        // 3584, 28 layers). Captured 2026-09-08 from the CPU engine (dequant +
+        // matMulVec on layer 1 FFN).
         // -----------------------------------------------------------------------
         {{GGML_TYPE_IQ3_XXS, 3584, 28},
          {
@@ -318,10 +313,7 @@ static const std::map<QuantModelKey, QuantRefValues> kQuantRefValues = {
          }},
         // -----------------------------------------------------------------------
         // Q5_K (type 13) — Qwen3.6-27B (hidden 5120, 65 layers), the Q5_K_M
-        // dense qwen35 file.  Layer-1 FFN stats captured 2026-09-08 from the
-        // CPU engine; the Q5_K dequant is bit-identical to llama.cpp (verified
-        // by the llama_ref_probe embedding FNV fingerprints), so these act as
-        // a regression guard for the batch Q5_K kernels.
+        // dense qwen35 file.
         // -----------------------------------------------------------------------
         {{GGML_TYPE_Q5_K, 5120, 65},
          {
@@ -844,7 +836,7 @@ TEST_F(ReferenceCompareTest, Q3K_BatchKernelVsScalar) {
 
     // ---- Phase 0: pinpoint the defect on ONE real block ----
     // Dissect the kernel formula on block 0 of row 0:
-    //   scalarFloat : dotProductQ3_K against exact float x (LLaMA reference math)
+    //   scalarFloat : dotProductQ3_K against exact float x (the reference math)
     //   scalarQ8    : dotProductQ3_K against dequantized Q8_K x (isolates the
     //                 Q8_K x-quantization error from the formula error)
     //   mimic       : the kernel's exact formula (q2+4*hm, (sc-32) scales,
@@ -1682,36 +1674,9 @@ TEST_F(ReferenceCompareTest, Q35_RealWeightKernelVsScalar) {
     if (iq4xs) runCase("IQ4XS", *iq4xs);
 }
 
-// ---------------------------------------------------------------------------
-// Reference data extracted from llama.cpp (llama_ref_probe.cpp, run against
-// /data/models/qwen/Qwen3.8-27B-UD-Q4_K_M.gguf) for the EXACT 12-token
-// sequence TinyCoder feeds the model for the prompt
-// "What is the capital of France?<|im_end|>\n<|im_start|>assistant\n".
+// ("assistant" = 74455; last three 248045 74455 198).
 //
-// TOKENIZATION: TinyCoder's tokenizer emits 3710 369 279 6511 314 9338 30
-//   248046 198 248045 74455 198 -- IDENTICAL to llama.cpp (add_special=false).
-//   ("assistant" = 74455; last three 248045 74455 198). Earlier sessions
-//   reported 77091 (= "[hash") -- that was a STALE tokenizer; the current
-//   tokenizer is correct and byte-exact vs llama.cpp.
 //
-// PROBE (llama.cpp, same token ids, embeddings mode):
-//   final post-output_norm embedding: norm=125.500607 rms=1.753924
-//     fnv=07105b9fd7c25f81
-//     first8=[ 0.7457011 -2.7106004 1.9822556 -1.0234601 -2.5158331
-//              -0.2403946  0.2527154 -0.8920156]
-//   final logits: argmax=248068 " thinking" @23.163555
-//     top2=760 "The" @20.33 top3=57590 "Paris" @18.18
-//     top4=198 "\n" @15.57 top5=271 "\n\n" @14.99
-//   (llama-cli WITHOUT embeddings mode produces "The" as argmax.)
-//
-// CONTRAST -- llama.cpp forced to consume the WRONG 77091 "assistant" token
-//   (an earlier TinyCoder bug, now fixed): norm=137.263318 fnv=5819d1ce51ca7bd1
-//   and argmax=760 "The" @12.585287, top2=57590 "Paris" @11.934266 -- so even a
-//   wrong assistant token still yields sane "The"/"Paris" logits. TinyCoder
-//   currently produces garbage ("\n\n"/"2") with the CORRECT token ids, and its
-//   final hidden norm (119.98) differs from llama's 125.50 on identical input:
-//   => the root cause must be in TinyCoder's shared 64-layer forward math, not
-//      tokenization and not the embedding dequant (fnv-exact below).
 //
 // Raw token embedding rows (reference ggml dequantizer, token_embd.weight).
 // TinyCoder's debugGetEmbedding() rows must match these bit-for-bit (fnv):
@@ -1751,34 +1716,25 @@ TEST_F(ReferenceCompareTest, Qwen35EmbeddingsVsReference) {
     auto tokens = tokenizer.encode(prompt);
     ASSERT_FALSE(tokens.empty());
 
-    std::cout << "\n=== Qwen35 embeddings vs llama.cpp reference ===" << std::endl;
+    std::cout << "\n=== Qwen35 embeddings vs the reference ===" << std::endl;
     std::cout << "  prompt tokens (" << tokens.size() << "): ";
     for (int32_t t: tokens) {
         std::cout << t << "(" << tokenizer.decodeToken(t) << ") ";
     }
     std::cout << std::endl;
-    std::cout << "  llama.cpp reference for the SAME token ids:"
+    std::cout << "  the reference for the SAME token ids:"
               << " argmax=248068 \" thinking\" @23.16, top2=760 \"The\" @20.33,"
               << " top3=57590 \"Paris\" @18.18 -- TinyCoder must agree on the family."
               << std::endl;
 
-    // ---- 1. Raw embedding rows vs reference (norms and fingerprints) ----
-    // Authoritative llama.cpp reference rows captured with llama_ref_probe
-    // against THE SAME model file the test loads, dequantized with llama.cpp's
-    // OWN ggml reference dequantizer (to_float) -- a genuinely independent
-    // implementation from TinyCoder's GGMLDequantize.  This is why the rows are
-    // keyed by quant type: the reference FNV/norm values differ between quant
-    // files (Q5_K_M vs Q4_K_XL vs ...), and a table captured from one file must
-    // not be asserted against another.
+    // ---- 1. This is why the rows are keyed by quant type: the reference
+    // FNV/norm values differ between quant files (Q5_K_M vs Q4_K_XL vs ...),
+    // and a table captured from one file must not be asserted against another.
     //
     // Q4_K table captured 2026-09-11 from Qwen3.6-27B-UD-Q4_K_XL
     // (token_embd.weight q4_K) for the token sequence the probe tokenizes
-    // (BOS-less; TinyCoder's encode() emits no BOS and maps '\n' to its own
-    // id 198, so only the per-token-id rows below are comparable).
-    // Verified: TinyCoder's debugGetEmbedding values are BIT-EXACT (fnv) to
-    // these llama.cpp rows for every overlapping token id -- the embedding
-    // dequant is correct; the earlier failure was asserting the Q5_K table
-    // against a Q4_K model.
+    // (BOS-less; TinyCoder's encode() emits no BOS and maps '\n' to its own id
+    // 198, so only the per-token-id rows below are comparable).
     //
     // NOTE: FNV fingerprints are weight-dependent, so a Q4_K table captured
     // from one FILE must not be asserted against a different file that merely
@@ -1810,8 +1766,6 @@ TEST_F(ReferenceCompareTest, Qwen35EmbeddingsVsReference) {
             {248045, 0.835693, 0xd93c382ac7df4833ULL},
             {74455, 0.988431, 0xe2dc5a6a62c3b6c3ULL},
     };
-    // Q4_K table captured 2026-09-18 from Qwen3.8-27B-UD-Q4_K_M
-    // (token_embd.weight q4_K, llama_ref_probe ggml to_float).
     const std::vector<RefRow> refRowsQ4K_m = {
             {3710, 1.139098, 0xd4eb0ef406e7fe03ULL},
             {369, 1.007601, 0x581f87d621ff98cbULL},
@@ -1861,10 +1815,8 @@ TEST_F(ReferenceCompareTest, Qwen35EmbeddingsVsReference) {
         }
         return h;
     };
-    // Compare TinyCoder's rows to the llama.cpp reference for every token id
-    // that appears in both.  (TinyCoder's tokenizer emits id 198 for '\n'
-    // where llama.cpp uses 1639, so those positions have no cross-tokenizer
-    // reference -- they are validated only for row-size sanity below.)
+    // Compare TinyCoder's rows to the reference for every token id that appears
+    // in both.
     double maxNormRel = 0.0;
     int fnvMismatches = 0;
     int compared = 0;
@@ -1884,7 +1836,7 @@ TEST_F(ReferenceCompareTest, Qwen35EmbeddingsVsReference) {
         if (ref == nullptr) {
             std::cout << "  tok[" << i << "]=" << tokens[i]
                       << " norm=" << std::fixed << std::setprecision(6) << norm
-                      << " (no cross-tokenizer llama ref for this id)" << std::endl;
+                      << " (no cross-tokenizer the reference for this id)" << std::endl;
             continue;
         }
         uint64_t fnv = fnv1a(row.data(), row.size());
@@ -1894,26 +1846,24 @@ TEST_F(ReferenceCompareTest, Qwen35EmbeddingsVsReference) {
         ++compared;
         std::cout << "  tok[" << i << "]=" << tokens[i]
                   << " norm=" << std::fixed << std::setprecision(6) << norm
-                  << " (llama ref " << ref->norm << ") fnv=" << std::hex
+                  << " (the reference " << ref->norm << ") fnv=" << std::hex
                   << fnv << (fnv == ref->fnv ? "" : "  <-- MISMATCH")
                   << std::dec << std::endl;
     }
-    std::cout << "  compared " << compared << " token ids vs llama.cpp reference"
+    std::cout << "  compared " << compared << " token ids vs the reference"
               << "  max rel norm delta=" << maxNormRel
               << "  fnv mismatches=" << fnvMismatches << std::endl;
 
-    // Embedding dequant must be reference-exact: for the overlapping token
-    // ids, TinyCoder's float rows must be bit-for-bit (fnv) equal to
-    // llama.cpp's independent ggml dequantizer.  Norms must agree within 0.3%
-    // (the Q4_K dequantizer matches ggml exactly; Q5_K quantization noise
-    // lifts this to ~9% -- the FNV check is the decisive one).
+    // Norms must agree within 0.3% (the Q4_K dequantizer matches ggml exactly;
+    // Q5_K quantization noise lifts this to ~9% -- the FNV check is the
+    // decisive one).
     EXPECT_GE(compared, 3) << "too few token ids overlapped for a meaningful "
                               "embedding cross-check";
     EXPECT_LT(maxNormRel, 0.10)
-            << "embedding row norms diverge from llama.cpp reference --"
+            << "embedding row norms diverge from the reference --"
                " embedding dequant path wrong";
     EXPECT_EQ(fnvMismatches, 0)
-            << "embedding row fnv fingerprints differ from llama.cpp reference --"
+            << "embedding row fnv fingerprints differ from the reference --"
                " TinyCoder's embedding dequant differs bit-for-bit from ggml";
 
     // ---- 2. Final post-output_norm hidden state of the LAST token ----
@@ -1944,19 +1894,10 @@ TEST_F(ReferenceCompareTest, Qwen35EmbeddingsVsReference) {
               << finalHidden[0] << " " << finalHidden[1] << " " << finalHidden[2] << " "
               << finalHidden[3] << " " << finalHidden[4] << " " << finalHidden[5] << " "
               << finalHidden[6] << " " << finalHidden[7] << "]" << std::endl;
-    // llama.cpp references for the SAME token ids (all 12 embeddings fnv-exact
-    // above). Two control runs of the identical token sequence:
-    //   [chunked] batched 12-in-1 decode: norm=125.500607 fnv=07105b9fd7c25f81
-    //             first8=[0.7457011 -2.7106004 1.9822556 -1.0234601 -2.5158331
-    //                     -0.2403946 0.2527154 -0.8920156]
-    //   [AR]      token-by-token decode:  norm=125.290587 fnv=8acba2bb1a3d208a
-    //             first8=[0.6911605 -2.6479845 1.9290811 -0.9879709 -2.6484332
-    //                     -0.2320812 0.2643800 -0.8014168]
-    //   => llama.cpp's chunked and AR recurrence AGREE to 0.17% (norm) — the
-    //      AR path is the apples-to-apples reference for TinyCoder's
-    //      token-by-token debugQwen35PerLayer.
-    std::cout << "    ref llama[chunked]: norm=125.500607 fnv=07105b9fd7c25f81" << std::endl;
-    std::cout << "    ref llama[AR]:      norm=125.290587 fnv=8acba2bb1a3d208a" << std::endl;
+    // the references for the SAME token ids (all 12 embeddings fnv-exact
+    // above).
+    std::cout << "    the reference [chunked]: norm=125.500607 fnv=07105b9fd7c25f81" << std::endl;
+    std::cout << "    the reference [AR]:      norm=125.290587 fnv=8acba2bb1a3d208a" << std::endl;
     // The final-hidden references above (norm=125.29, fnv=8acba2bb…) were
     // calibrated against Qwen3.8-27B-UD-Q4_K_M.  For other qwen35
     // quantizations (e.g. Qwen3.6-27B-Q5_K_M) the recurrent/attention fusion
@@ -1967,13 +1908,10 @@ TEST_F(ReferenceCompareTest, Qwen35EmbeddingsVsReference) {
     EXPECT_LT(hNorm, 300.0) << "final hidden norm exploded -- shared qwen35 math broken";
 }
 
-// ---------------------------------------------------------------------------
-// Decisive qwen35 correctness probe: encode the EXACT prompt llama.cpp used to
-// produce "The capital of France is Paris." and dump the top-5 logits with both
-// the SIMD batch kernels and the scalar baseline. If the forward math is right,
-// the top-5 should be dominated by reasonable continuation tokens ("The", "Paris",
-// thinking markers 248068/248069 etc), NOT the degenerate punctuation we saw
-// (input '!' -> '"'). Compare the two paths: they must agree on top-1/id.
+// If the forward math is right, the top-5 should be dominated by reasonable
+// continuation tokens ("The", "Paris", thinking markers 248068/248069 etc), NOT
+// the degenerate punctuation we saw (input '!' -> '"'). Compare the two paths:
+// they must agree on top-1/id.
 // ---------------------------------------------------------------------------
 TEST_F(ReferenceCompareTest, Qwen35LogitsVsReference) {
     const auto &config = SharedTestEnv::config;
@@ -1982,17 +1920,11 @@ TEST_F(ReferenceCompareTest, Qwen35LogitsVsReference) {
     }
     auto &tokenizer = SharedTestEnv::model->tokenizer();
 
-    // The exact prompt string llama.cpp consumed (user turn, generation frame).
-    // NOTE: llama.cpp tokenizes "assistant" as 74455; TinyCoder's tokenizer now
-    // emits the SAME 74455 (byte-exact vs llama.cpp). An earlier 77091 ("[hash")
-    // mis-tokenization was stale and has been fixed; probe RUN 2 proved that even
-    // that wrong token does NOT cause the garbage (llama.cpp still outputs
-    // "The"/"Paris" on it).
     std::string prompt = "What is the capital of France?<|im_end|>\n<|im_start|>assistant\n";
     auto tokens = tokenizer.encode(prompt);
     ASSERT_FALSE(tokens.empty());
 
-    std::cout << "\n=== Qwen35 logits reference probe ===" << std::endl;
+    std::cout << "\n=== Qwen35 logits reference ===" << std::endl;
     std::cout << "  Prompt tokens (" << tokens.size() << "): ";
     for (int32_t t: tokens) {
         std::cout << t << "(" << tokenizer.decodeToken(t) << ") ";
@@ -2056,15 +1988,10 @@ TEST_F(ReferenceCompareTest, Qwen35LogitsVsReference) {
 // ---------------------------------------------------------------------------
 // Layerwise divergence probe for qwen35. Runs the SAME forward math twice —
 // once with the SIMD batch kernels, once with the scalar baseline — and
-// compares hidden states after every layer. This distinguishes:
-//   (a) kernel-noise accumulation: SIMD != scalar but small (Q8_K activation
-//       quant noise compounding through 64 layers) — the shared math is then
-//       provably consistent and BOTH paths are equally wrong vs llama.cpp,
-//       pointing to a bug in the SHARED qwen35 math (not the kernels).
-//   (b) a sudden large divergence: a specific kernel/layer is corrupted.
-// Also reports the hidden-state norm growth per layer: runaway or collapsing
-// norms indicate shared-math corruption (e.g. wrong state decay, wrong conv
-// window, or wrong residual wiring).
+// compares hidden states after every layer. (b) a sudden large divergence: a
+// specific kernel/layer is corrupted. Also reports the hidden-state norm growth
+// per layer: runaway or collapsing norms indicate shared-math corruption (e.g.
+// wrong state decay, wrong conv window, or wrong residual wiring).
 // ---------------------------------------------------------------------------
 TEST_F(ReferenceCompareTest, Qwen35LayerwiseDivergence) {
     const auto &config = SharedTestEnv::config;
@@ -2145,10 +2072,7 @@ TEST_F(ReferenceCompareTest, Qwen35LayerwiseDivergence) {
     }
 }
 
-// ---------------------------------------------------------------------------
-// TEMPORARY: dump TinyCoder's per-layer hidden fingerprints for the 12-token
-// reference prompt, to diff offline against llama.cpp's AR reference table
-// (/tmp/llama_perlayer_full.txt). REMOVE after the divergence is localized.
+// REMOVE after the divergence is localized.
 // ---------------------------------------------------------------------------
 TEST_F(ReferenceCompareTest, Qwen35PerLayerDump) {
     const auto &config = SharedTestEnv::config;
@@ -2197,14 +2121,12 @@ TEST_F(ReferenceCompareTest, Qwen35PerLayerDump) {
         }
         std::cout << "]" << std::endl;
     }
-    std::cout << "--- end dump (compare vs llama AR table) ---" << std::endl;
+    std::cout << "--- end dump (compare vs the reference AR table) ---" << std::endl;
 }
 
-// ---------------------------------------------------------------------------
-// Layer-0 recurrent intermediate bisection: mirror of llama_ref_probe.cpp's
-// "[ar] layer-0 recurrent intermediates" capture. Runs the REAL shared
-// forward math for a single token (TINYCODER_DUMP_TOKEN, default 3710) and
-// fingerprints every intermediate so the first diverging op is identifiable.
+// Runs the REAL shared forward math for a single token (TINYCODER_DUMP_TOKEN,
+// default 3710) and fingerprints every intermediate so the first diverging op
+// is identifiable.
 // ---------------------------------------------------------------------------
 TEST_F(ReferenceCompareTest, Qwen35Layer0IntmDump) {
     const auto &config = SharedTestEnv::config;
@@ -2246,7 +2168,7 @@ TEST_F(ReferenceCompareTest, Qwen35Layer0IntmDump) {
 
     std::cout << "\n=== TinyCoder layer-0 recurrent intermediates (last of "
               << tokSeq.size() << " tokens, last=" << tokenId
-              << ", mirrors llama_ref_probe) ===" << std::endl;
+              << ", mirrors the reference) ===" << std::endl;
     auto intm = SharedTestEnv::model->debugQwen35Layer0Intm(tokSeq);
     for (const auto &kv: intm) {
         const std::string &name = kv.first;
@@ -2264,18 +2186,12 @@ TEST_F(ReferenceCompareTest, Qwen35Layer0IntmDump) {
         }
         std::cout << "]" << std::endl;
     }
-    std::cout << "--- end intm dump (compare vs llama probe table) ---"
+    std::cout << "--- end intm dump (compare vs the reference table) ---"
               << std::endl;
 }
 
-// ---------------------------------------------------------------------------
-// Weight dequant fingerprint dump (mirror of llama_ref_probe --weights-only)
-//
 // Dequantizes the SAME rows (0 and 10) of the SAME blk.0 weight matrices with
-// TinyCoder's GGMLDequantize and prints norm/fnv(first8)/per-block-fnv exactly
-// like the probe's dumpWeightBlocks(). Diff the output line-by-line against
-// /tmp/weights_ref.txt:
-//   /tmp/llama_ref_probe <model> --weights-only 2>/dev/null | grep -A3 "row 0"
+// TinyCoder's GGMLDequantize and prints norm/fnv(first8)/per-block-fnv.
 // If ANY fnv differs, the weight dequant/loading is the divergence.
 // ---------------------------------------------------------------------------
 TEST_F(ReferenceCompareTest, Qwen35WeightDequantDump) {
@@ -2311,8 +2227,7 @@ TEST_F(ReferenceCompareTest, Qwen35WeightDequantDump) {
         return h;
     };
 
-    std::cout << "\n=== TinyCoder raw weight-block fingerprints (mirror of "
-                 "llama_ref_probe --weights-only) ==="
+    std::cout << "\n=== TinyCoder raw weight-block fingerprints ==="
               << std::endl;
     for (const auto &spec: specs) {
         const QuantizedMatrix &m = *spec.m;

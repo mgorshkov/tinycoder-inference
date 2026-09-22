@@ -20,13 +20,11 @@
 
 using namespace tinycoder;
 
-// Type-name table.  IMPORTANT: the IDs MUST match the canonical GGML enum in
-// ggml/include/ggml.h (see GGML_TYPE_* in include/GGUFLoader.hpp for the
-// subset this loader implements).  Earlier drafts of this table mislabeled
-// 19-24 (e.g. 22 as "IQ2_M" — a type that does not exist in GGML; 22 is
-// IQ2_S), which led to wrong type names in model censuses.  Rows marked
-// "(fork)" come from llama.cpp forks that add Q4_K_*_XL types; they do not
-// exist in the canonical enum.
+// Type-name table. IMPORTANT: the IDs MUST match the canonical GGML enum in
+// ggml/include/ggml.h (see GGML_TYPE_* in include/GGUFLoader.hpp for the subset
+// this loader implements). Earlier drafts of this table mislabeled 19-24 (e.g.
+// 22 as "IQ2_M" — a type that does not exist in GGML; 22 is IQ2_S), which led
+// to wrong type names in model censuses.
 static const char *typeName(uint32_t t) {
     switch (t) {
     case GGML_TYPE_F32: return "F32";

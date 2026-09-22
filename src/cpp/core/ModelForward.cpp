@@ -61,19 +61,14 @@ namespace tinycoder {
 #ifdef USE_CUDA
         // GPU offload fast path: the GPU engine owns its own KV cache (kvPos_)
         // and is authoritative for the whole session once the first pass
-        // succeeds.  A session is eligible when:
-        //   * it starts fresh from a clean cache (kvCache_.pos == 0), OR
-        //   * the GPU engine already owns the session (gpuSessionActive_ latch;
-        //     decode steps have kvCache_.pos > 0).
-        // clearKVCache() resets both caches and clears the latch, so a new
-        // session re-enters on pos == 0.
-        // Dispatch: qwen2 (dense) fully offloads when it fits in VRAM.  qwen35
-        // runs a hybrid when the model is too large for VRAM: the GPU executes
-        // the first numGpuLayers layers and the CPU continues the rest
-        // (llama.cpp -ngl style); if the full model fits, the GPU also computes
-        // the logits.  Both tied and separate LM heads are supported by the GPU
-        // engine (separate output.weight is uploaded as a dedicated Q6_K
-        // tensor).  Other architectures keep the CPU path.
+        // succeeds. A session is eligible when: * it starts fresh from a clean
+        // cache (kvCache_.pos == 0), OR * the GPU engine already owns the
+        // session (gpuSessionActive_ latch; decode steps have kvCache_.pos >
+        // 0). clearKVCache() resets both caches and clears the latch, so a new
+        // session re-enters on pos == 0. Dispatch: qwen2 (dense) fully offloads
+        // when it fits in VRAM. Both tied and separate LM heads are supported
+        // by the GPU engine (separate output.weight is uploaded as a dedicated
+        // Q6_K tensor). Other architectures keep the CPU path.
         if (!forceCpuForward_ && gpu::gpuEnabled() &&
             (config_.architecture == ARCH_QWEN2 ||
              config_.architecture == ARCH_QWEN35 ||
@@ -146,9 +141,24 @@ namespace tinycoder {
                 }
                 // Fall through to the CPU path below.  The GPU engine's KV cache is
                 // NOT consumed on the fallback (kvPos_ reverts to its pre-pass
-                // value) and the session latch is cleared, so the CPU-side KV
-                // cache (kvCache_) remains authoritative for the remaining steps.
+                // value) and the session latch is cleared.
                 gpuSessionActive_ = false;
+                // The GPU path is now known-bad for this session: latch the CPU
+                // path so subsequent forwards don't retry it (each retry would
+                // fail again and re-enter this branch).  Additionally, if the
+                // GPU owned EARLIER tokens of this session (full offload writes
+                // K/V only into GPU memory; kvCache_.pos is just bookkeeping),
+                // the CPU-side KV cache holds NO data for them -- continuing
+                // would attend over empty/zeroed K/V and emit garbage logits
+                // (observed as "CertainlyCertainlyHereSure..."-style noise).
+                // Re-seat the CPU position to 0 so the fallback recomputes from
+                // a clean state instead.  When the GPU failed on a fresh session
+                // (pos == 0) this is a no-op and the CPU prefill is fully
+                // correct.
+                forceCpuForward_ = true;
+                if (kvCache_.pos > 0) {
+                    kvCache_.pos = 0;
+                }
             }
         }
 #endif
@@ -474,10 +484,8 @@ namespace tinycoder {
                 // cuts weight traffic ~2.65x vs Q8_K (measurement: attnO+ffnDown
                 // ~35% of per-token time).
                 {
-                    // IQ3_S / IQ2_S / IQ3_XXS attnO: llama streams the raw
-                    // quantized blocks with vec_dot_iq*_q8_K (exact integer
-                    // accumulation). Route through the llama-parity Q8K batch
-                    // path instead of the lossy pre-dequantized F16 copy.
+                    // Route through the reference-parity Q8K batch path instead
+                    // of the lossy pre-dequantized F16 copy.
                     if (GGMLDequantize::supportsQ8KDot(w.attnO.type)) {
                         ScopedProfile spQ8K("matMulVecBatchQ8K_attnO");
                         GGMLDequantize::matMulVecBatchQ8K(w.attnO.type, w.attnO.data.data(),
@@ -603,17 +611,13 @@ namespace tinycoder {
                         }
                     }
 
-                    // Down projection fused with residual.
-                    // Prefer the compact Q3_K batch GEMM (raw GGUF blocks, 0.43
-                    // B/elem) when available — ffnDown is stored as Q3_K in the
-                    // model file — then the Q8_K batch GEMM (1.14 B/elem). Both
-                    // reuse each weight row across all tokens and use the int8
+                    // Down projection fused with residual. Prefer the compact
+                    // Q3_K batch GEMM (raw GGUF blocks, 0.43 B/elem) when
+                    // available — ffnDown is stored as Q3_K in the model file —
+                    // then the Q8_K batch GEMM (1.14 B/elem). Both reuse each
+                    // weight row across all tokens and use the int8
                     // _mm256_maddubs_epi16 kernel, cutting weight-matrix memory
-                    // traffic vs the FP16 path.
-                    // Prefer the exact Q3_K source blocks (raw GGUF bytes, 0.43
-                    // B/elem) via the compact batch GEMM — this is the
-                    // quality-correct default (llama.cpp streams the same Q3_K
-                    // bytes; no lossy re-quant). Falls back to the Q8_K batch
+                    // traffic vs the FP16 path. Falls back to the Q8_K batch
                     // GEMM (1.14 B/elem) which is built losslessly from the
                     // same Q3_K source at load time.
                     if (w.ffnDown.type == GGML_TYPE_Q3_K &&
@@ -631,7 +635,7 @@ namespace tinycoder {
                                 w.ffnDown.rows, w.ffnDown.cols,
                                 scratch.ffnOut.data());
                     } else if (GGMLDequantize::supportsQ8KDot(w.ffnDown.type)) {
-                        // IQ3_XXS / IQ2_S / IQ3_S ffnDown: llama-parity Q8K
+                        // IQ3_XXS / IQ2_S / IQ3_S ffnDown: reference-parity Q8K
                         // integer dot over the raw quantized blocks (exact),
                         // instead of the lossy pre-dequantized F16 copy.
                         GGMLDequantize::matMulVecBatchQ8K(w.ffnDown.type, w.ffnDown.data.data(),
@@ -681,17 +685,14 @@ namespace tinycoder {
                         hiddenSize % 256 == 0 &&
                         intermediateSize % 256 == 0) {
                         // Fused gate+up+down kernel: eliminate intermediate
-                        // gatePtr/upPtr buffers and the separate ffnDown dispatch.
-                        // The kernel computes out = residual + down@(silu(gate@x)
-                        // *up@x) and folds the residual into its store epilogue,
-                        // so pass hidden as BOTH out and residual (in-place,
-                        // exactly like the attnO+residual fusion in
-                        // matMulVecBatchQ3K_SIMD) — hidden receives the FFN
-                        // output, removing the downBuf round-trip and the
-                        // separate addSIMD pass.
-                        // The Q3_K source blocks for ffnDown are streamed directly
-                        // (84 B/block gate+up, 110 B/block down), matching
-                        // llama.cpp's exact-weight semantics at full quality.
+                        // gatePtr/upPtr buffers and the separate ffnDown
+                        // dispatch. The kernel computes out = residual +
+                        // down@(silu(gate@x) *up@x) and folds the residual into
+                        // its store epilogue, so pass hidden as BOTH out and
+                        // residual (in-place, exactly like the attnO+residual
+                        // fusion in matMulVecBatchQ3K_SIMD) — hidden receives
+                        // the FFN output, removing the downBuf round-trip and
+                        // the separate addSIMD pass.
                         ScopedProfile sp("fused_gateUp_ffnDown");
                         runParallel([&](uint32_t s) {
                             const float *ffnRowPtr = ffnNormData + s * hiddenSize;
@@ -746,7 +747,7 @@ namespace tinycoder {
                                         // handled by the compact Q3_K batch kernel
                                     } else if (GGMLDequantize::supportsQ8KDot(w.ffnDown.type)) {
                                         // IQ3_XXS / IQ2_S / IQ3_S ffnDown:
-                                        // llama-parity Q8K integer dot.
+                                        // reference-parity Q8K integer dot.
                                         GGMLDequantize::matMulVecBatchQ8K(w.ffnDown.type, w.ffnDown.data.data(),
                                                                           ffnActPtr, 1, w.ffnDown.rows,
                                                                           w.ffnDown.cols, downBuf);
@@ -1045,16 +1046,13 @@ namespace tinycoder {
                 }
             } else if (!forceScalarPath() && lmHead_.type == GGML_TYPE_Q6_K &&
                        hiddenSize % 256 == 0) {
-                // Q6_K raw LM head kernel (0.82 B/elem vs 1.14 B/elem for the
-                // Q8_K copy below) — ~28% less per-token LM-head weight traffic,
-                // matching llama.cpp's working set. The hidden vector is
-                // quantized to Q8_K once per token inside the kernel (reused
-                // across all vocab rows); the -32 offset of the 6-bit weights
-                // folds through the Q8KBlock bsums (per-lane vector, Q3K pattern).
-                // The kernel returns false on builds without the vector kernel
-                // (e.g. no AVX2) and writes nothing; the return value MUST be
-                // honored — ignoring it leaves logitRow all zeros, which
-                // degenerates the whole forward pass.
+                // The hidden vector is quantized to Q8_K once per token inside
+                // the kernel (reused across all vocab rows); the -32 offset of
+                // the 6-bit weights folds through the Q8KBlock bsums (per-lane
+                // vector, Q3K pattern). The kernel returns false on builds
+                // without the vector kernel (e.g. no AVX2) and writes nothing;
+                // the return value MUST be honored — ignoring it leaves
+                // logitRow all zeros, which degenerates the whole forward pass.
                 bool batchOk = true;
                 for (uint32_t s = logitStart; s < logitStart + logitCount; ++s) {
                     const float *hPtr = hiddenData + s * hiddenSize;
