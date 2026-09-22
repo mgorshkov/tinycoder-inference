@@ -102,6 +102,18 @@ namespace tinycoder {
             }
             return matMulVecBatchQ8_0_SIMD(data, x, 1, rows, cols, out);
         }
+        // F32 (the qwen35moe ROUTER ffnGateInpMoe is an F32 [expertCount x
+        // hiddenSize] host matrix): the register-tiled AVX2 FMA kernel handles
+        // ANY positive cols (vecGroups = cols/8 with a scalar tail), so no
+        // 256-multiple alignment gate applies — only cols > 0.
+        if (type == GGML_TYPE_F32) {
+            if (cols == 0) {
+                return false;
+            }
+            return matMulVecBatchF32_SIMD(
+                    reinterpret_cast<const float *>(data), x, 1, rows, cols,
+                    out);
+        }
         if (cols == 0 || (cols & 255) != 0) {
             return false;
         }
@@ -162,8 +174,29 @@ namespace tinycoder {
         //
         // For F32 matrices, we still use the CUDA/CPU path.
 
-        // For F32 type, use the CUDA/CPU path (no dequantization needed)
+        // For F32 type (the qwen35moe ROUTER ffnGateInpMoe), the FAST path is the
+        // register-tiled AVX2 FMA batch kernel (matMulVecBatchF32_AVX2): it
+        // parallelizes the 256 output rows across the pool and accumulates each
+        // row into four __m256 FMA chains.  This replaced the scalar fp64 loop
+        // below (the dominant CPU cost of the hybrid GPU callback — ~16.6
+        // ms/token decode, ~17.4 ms/token prefill).  TINYCODER_FORCE_SCALAR=1
+        // (or a non-AVX2 host) keeps the exact fp64 reference below.
+        //
+        // Numerics: fp32 FMA vs fp64 accumulation produces tiny logit deltas.
+        // The router output feeds ONLY the top-k EXPERT SELECTION (softmax +
+        // partial_sort) and the GPU-vs-CPU parity tests use top-10 membership,
+        // not bit-equality.  Every router call (pure-CPU, hybrid callback, batch
+        // & single-token prefill) funnels through this same matMulVec, so
+        // batch-vs-sequential and CPU-vs-hybrid parity hold BY CONSTRUCTION.
         if (type == GGML_TYPE_F32) {
+            if (!forceScalarPath() &&
+                matMulVecBatchSIMD(type, data.data(), x, rows, cols, out)) {
+                g_batchKernelCalls.fetch_add(1, std::memory_order_relaxed);
+                if (type < 64)
+                    g_batchKernelTypes[type].fetch_add(1, std::memory_order_relaxed);
+                return;
+            }
+            g_scalarFallbackCalls.fetch_add(1, std::memory_order_relaxed);
             const float *W_f32 = reinterpret_cast<const float *>(data.data());
             // For F32, compute directly into out (avoiding the CUDA path's allocation)
             for (uint32_t j = 0; j < rows; ++j) {
@@ -322,8 +355,20 @@ namespace tinycoder {
         }
 
         if (type == GGML_TYPE_F32) {
+            // Same register-tiled AVX2 FMA batch kernel as matMulVec's F32
+            // path, applied to the contiguous row slice [rowStart,
+            // rowStart + numRows).  The kernel's out layout is
+            // out[s*rows + j] with seqLen==1, so it writes out[j] in place —
+            // exactly the matMulVecRows format.  Handles any positive cols
+            // (vecGroups = cols/8 + scalar tail), so unlike the K-quant batch
+            // kernels there is no cols % 8 == 0 gate.  The fp64 scalar loop
+            // below is the TINYCODER_FORCE_SCALAR / non-AVX2 reference.
             const float *W_f32 = reinterpret_cast<const float *>(data.data());
             const float *W_start = W_f32 + static_cast<size_t>(rowStart) * cols;
+            if (!forceScalarPath() &&
+                matMulVecBatchF32_SIMD(W_start, x, 1, numRows, cols, out)) {
+                return;
+            }
             for (uint32_t j = 0; j < numRows; ++j) {
                 double dot = 0.0;
                 for (uint32_t i = 0; i < cols; ++i) {

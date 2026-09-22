@@ -2954,6 +2954,105 @@ namespace tinycoder::simd {
         });
     }
 
+    // ---- AVX2 register-tiled batch GEMM for a single F32 matrix over a batch ----
+    //
+    // Router kernel. Computes out[s*rows + j] = sum_i X[s*cols + i] * W[j*cols + i]
+    // for all tokens s and output rows j, where W is a ROW-MAJOR fp32 matrix
+    // (the qwen35moe ffnGateInpMoe router is F32 [expertCount x hiddenSize]).
+    // Replaces the per-token scalar fp64-accumulation loop in
+    // QuantizedMatrix::matMulVec, which was the dominant CPU cost of the hybrid
+    // GPU callback (~16.6 ms/token decode, ~17.4 ms/token prefill on a 256x2048
+    // router x 40 layers).
+    //
+    // Design (mirrors the Q8_K/Q4_K batch kernels):
+    //   - Rows are processed in tiles of 8 (parallelForSlab over tiles), so the
+    //     x-vector is loaded once per (token, 8-lane group) and reused across
+    //     the 8 tile rows.
+    //   - Each (row, token) output accumulates into four __m256 FMA chains
+    //     (32 independent FMA lanes per chain step, classic latency-hiding),
+    //     horizontal-summed exactly once at the end.
+    //   - For prefill (seqLen > 1) the weight rows are streamed once and reused
+    //     across all seqLen tokens (weight-stationary, the prefill GEMM
+    //     optimization).
+    //
+    // Numerical stance: float FMA accumulation (vs the scalar fp64 loop). The
+    // router's output feeds only the top-k EXPERT SELECTION (probs = softmax,
+    // partial_sort) — tiny logit deltas from fp32-vs-fp64 rounding cannot flip a
+    // well-separated top-8, and the GPU-vs-CPU parity tests use top-10
+    // membership, not bit-equality. All router computations (pure-CPU path,
+    // hybrid CPU callback, decode and prefill) funnel through
+    // QuantizedMatrix::matMulVec, so batch-vs-sequential and CPU-vs-hybrid
+    // parity are preserved BY CONSTRUCTION (every path uses this same kernel).
+    void matMulVecBatchF32_AVX2(const float *W_f32, const float *X,
+                                uint32_t seqLen, uint32_t rows, uint32_t cols,
+                                float *out) {
+        static constexpr uint32_t BATCH_SIZE = 8;
+        if (seqLen == 0 || rows == 0 || cols == 0) {
+            return;
+        }
+        uint32_t numTiles = (rows + BATCH_SIZE - 1) / BATCH_SIZE;
+        ThreadPool::instance().parallelForSlab(0, numTiles, [&](uint32_t tile) {
+            uint32_t rowStart = tile * BATCH_SIZE;
+            uint32_t batchSize = std::min(BATCH_SIZE, rows - rowStart);
+
+            // Vector lanes: cols / 8 full __m256 groups; tail handled by the
+            // scalar epilogue.
+            const uint32_t vecGroups = cols >> 3;
+            const uint32_t tail = cols & 7u;
+
+            for (uint32_t r = 0; r < batchSize; ++r) {
+                const float *wrow = W_f32 +
+                                    static_cast<size_t>(rowStart + r) * cols;
+                for (uint32_t s = 0; s < seqLen; ++s) {
+                    const float *xrow = X + static_cast<size_t>(s) * cols;
+                    __m256 acc0 = _mm256_setzero_ps();
+                    __m256 acc1 = _mm256_setzero_ps();
+                    __m256 acc2 = _mm256_setzero_ps();
+                    __m256 acc3 = _mm256_setzero_ps();
+                    uint32_t i = 0;
+                    for (; i + 31 < vecGroups * 8; i += 32) {
+                        // 4 independent FMAs per step = 32 multiply-accumulates
+                        // in flight per accumulator chain pair.
+                        acc0 = _mm256_fmadd_ps(_mm256_loadu_ps(xrow + i),
+                                               _mm256_loadu_ps(wrow + i),
+                                               acc0);
+                        acc1 = _mm256_fmadd_ps(_mm256_loadu_ps(xrow + i + 8),
+                                               _mm256_loadu_ps(wrow + i + 8),
+                                               acc1);
+                        acc2 = _mm256_fmadd_ps(_mm256_loadu_ps(xrow + i + 16),
+                                               _mm256_loadu_ps(wrow + i + 16),
+                                               acc2);
+                        acc3 = _mm256_fmadd_ps(_mm256_loadu_ps(xrow + i + 24),
+                                               _mm256_loadu_ps(wrow + i + 24),
+                                               acc3);
+                    }
+                    for (; i + 7 < vecGroups * 8; i += 8) {
+                        acc0 = _mm256_fmadd_ps(_mm256_loadu_ps(xrow + i),
+                                               _mm256_loadu_ps(wrow + i),
+                                               acc0);
+                    }
+                    // Horizontal sum of the 4 chains.
+                    __m256 sv01 = _mm256_add_ps(acc0, acc1);
+                    __m256 sv23 = _mm256_add_ps(acc2, acc3);
+                    __m256 sv = _mm256_add_ps(sv01, sv23);
+                    __m128 hi = _mm256_extractf128_ps(sv, 1);
+                    __m128 lo = _mm256_castps256_ps128(sv);
+                    __m128 sum128 = _mm_hadd_ps(_mm_add_ps(lo, hi),
+                                                _mm_add_ps(lo, hi));
+                    sum128 = _mm_hadd_ps(sum128, sum128);
+                    float v = _mm_cvtss_f32(sum128);
+                    // Scalar tail (cols % 8): accumulated separately so the
+                    // vector part is never polluted by a partial-lane group.
+                    for (uint32_t k = 0; k < tail; ++k) {
+                        v += xrow[vecGroups * 8 + k] *
+                             wrow[vecGroups * 8 + k];
+                    }
+                    out[static_cast<size_t>(s) * rows + rowStart + r] = v;
+                }
+            }
+        });
+    }
+
     // ---- AVX2 register-tiled batch GEMM for a single Q8_K matrix over a batch ----
     //
     // Prefill kernel. Computes out[s*rows + j] = sum_i X[s*cols + i] * W[j*cols + i]

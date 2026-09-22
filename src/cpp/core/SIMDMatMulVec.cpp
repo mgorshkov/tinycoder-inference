@@ -1114,6 +1114,38 @@ namespace tinycoder {
         return false;
     }
 
+    // ---- matMulVecBatchF32_SIMD ----
+    // Register-tiled batch GEMM for a single F32 (fp32) weight matrix over a
+    // batch of tokens. Used for the qwen35moe ROUTER (ffnGateInpMoe is an F32
+    // [expertCount x hiddenSize] host matrix): the previous per-token scalar
+    // fp64-accumulation loop in QuantizedMatrix::matMulVec was the dominant CPU
+    // cost of the hybrid GPU callback. Dispatches to the vector (AVX2) kernel
+    // when available; returns false so the caller falls back to the scalar
+    // fp64 reference loop on hosts without a vector kernel.
+    bool matMulVecBatchF32_SIMD(const float *W_f32, const float *X,
+                                uint32_t seqLen, uint32_t rows, uint32_t cols,
+                                float *out) {
+        static std::atomic<int> s_level{-1};
+        int level = s_level.load(std::memory_order_acquire);
+        if (level < 0) {
+            level = static_cast<int>(np::internal::max_simd_level());
+            s_level.store(level, std::memory_order_release);
+        }
+#if defined(__AVX2__) && defined(__FMA__)
+        if (level >= static_cast<int>(np::internal::SimdLevel::AVX2)) {
+            simd::matMulVecBatchF32_AVX2(W_f32, X, seqLen, rows, cols, out);
+            return true;
+        }
+#endif
+        (void) W_f32;
+        (void) X;
+        (void) seqLen;
+        (void) rows;
+        (void) cols;
+        (void) out;
+        return false;
+    }
+
     // ---- matMulVecBatchQ4K_SIMD ----
     // Register-tiled batch GEMM for a single Q4_K matrix over a batch of tokens.
     // Dispatches to the vector (AVX2) kernel when available; returns false so the
