@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.18.0)
 
 set(PROJECT_NAME tinycoder_unit_tests)
 
-project(${PROJECT_NAME} VERSION 0.2.0 DESCRIPTION "TinyCoder Inference Unit Tests")
+project(${PROJECT_NAME} VERSION 0.3.0 DESCRIPTION "TinyCoder Inference Unit Tests")
 
 include(FetchContent)
 

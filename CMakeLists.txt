@@ -6,7 +6,7 @@ cmake_minimum_required(VERSION 3.18.0)
 # This repository contains ONLY the engine: src/cpp/core (C++/CUDA), include/
 # (public engine headers), unit_tests/, benchmarks/ and the build plumbing.
 # The N-API bridge (src/cpp/bridge) lives in the extension repository
-# (~/git/tinycoder) and consumes this project's tinycoder_core static library
+# (https://github.com/mgorshkov/tinycoder) and consumes this project's tinycoder_core static library
 # via FetchContent.
 #
 # Standalone build (static lib + tests + bench):
@@ -14,13 +14,19 @@ cmake_minimum_required(VERSION 3.18.0)
 #   cmake --build build --config Release
 #   ctest --test-dir build            # when BUILD_TESTS=ON
 # ---------------------------------------------------------------------------
-project(tinycoder_inference VERSION 0.2.0 DESCRIPTION "High-Performant local inference engine" LANGUAGES CXX)
+project(tinycoder_inference VERSION 0.3.0 DESCRIPTION "High-Performant local inference engine" LANGUAGES CXX)
 enable_testing()
 
 # ---- Options ----
 option(ENABLE_CUDA "Enable CUDA GPU acceleration" OFF)
-option(ENABLE_AVX2 "Enable AVX2 optimizations" ON)
-option(ENABLE_AVX512 "Enable AVX-512 optimizations" OFF)
+option(ENABLE_AVX2 "Enable AVX2 optimizations" OFF)
+option(ENABLE_AVX512 "Enable AVX-512 optimizations" ON)
+# AVX-512 sub-features (Ice Lake+ only; OPT-IN because the runtime dispatch
+# cannot protect code compiled with these flags — a CPU without them will
+# SIGILL). ENABLE_AVX512 alone enables only the base set (F/DQ/BW/VL) which
+# runs on all AVX-512 CPUs including Cascade Lake.
+option(ENABLE_AVX512_VBMI "Enable AVX-512 VBMI (byte permutes; Ice Lake+) optimizations" OFF)
+option(ENABLE_AVX512_VBMI2 "Enable AVX-512 VBMI2 (byte compress/expand; Ice Lake+) optimizations" OFF)
 option(ENABLE_AMX "Enable AMX (Advanced Matrix Extensions) optimizations" OFF)
 option(ENABLE_OPENMP "Enable OpenMP parallelization" ON)
 option(BUILD_SHARED_LIBS "Build shared library" OFF)
@@ -95,6 +101,8 @@ if(NOT TARGET np)
         -DENABLE_AVX=${ENABLE_AVX}
         -DENABLE_AVX2=${ENABLE_AVX2}
         -DENABLE_AVX512=${ENABLE_AVX512}
+        -DENABLE_AVX512_VBMI=${ENABLE_AVX512_VBMI}
+        -DENABLE_AVX512_VBMI2=${ENABLE_AVX512_VBMI2}
         -DENABLE_AMX=${ENABLE_AMX}
         -DBUILD_SHARED_LIBS=${BUILD_SHARED_LIBS}
         -DDEBUG_INFO=${DEBUG_INFO}
@@ -208,13 +216,23 @@ if(SAMPLING_AVX2_FLAGS)
     )
 endif()
 
-# AVX-512 is not supported on this CPU, so these flags are disabled by default.
-# Enable ENABLE_AVX512 to compile the AVX-512 kernels. -mavx512bw is required for
-# the byte/word intrinsics (_mm512_maddubs_epi16, _mm512_madd_epi16) used by the
-# Q8_K and pre-packed Q2_K kernels.
+# AVX-512 kernels TU. The base flags (-mavx512f -mavx512bw -mfma) cover all
+# intrinsics used here (the _mm512_maddubs_epi16/_mm512_madd_epi16 byte/word
+# kernels need -mavx512bw) and run on any AVX-512 CPU including Cascade Lake.
+# VBMI/VBMI2 are NOT added here automatically: enabling them would let the
+# compiler emit vpermi2b/vpermt2b that Cascade Lake cannot execute (SIGILL).
+# Projects that KNOW their target supports Ice Lake+ can opt in by enabling
+# ENABLE_AVX512_VBMI / ENABLE_AVX512_VBMI2, which also emits the -mavx512vbmi
+# / -mavx512vbmi2 flags for this TU.
 set(SIMD_MATMUL_AVX512_FLAGS "")
 if(ENABLE_AVX512)
     set(SIMD_MATMUL_AVX512_FLAGS "${SIMD_MATMUL_AVX512_FLAGS} -mavx512f -mavx512bw -mfma")
+endif()
+if(ENABLE_AVX512 AND ENABLE_AVX512_VBMI)
+    set(SIMD_MATMUL_AVX512_FLAGS "${SIMD_MATMUL_AVX512_FLAGS} -mavx512vbmi")
+endif()
+if(ENABLE_AVX512 AND ENABLE_AVX512_VBMI2)
+    set(SIMD_MATMUL_AVX512_FLAGS "${SIMD_MATMUL_AVX512_FLAGS} -mavx512vbmi2")
 endif()
 if(SIMD_MATMUL_AVX512_FLAGS)
     set_source_files_properties(
@@ -287,6 +305,8 @@ message(STATUS "")
 message(STATUS "TinyCoder Inference Engine Build Configuration:")
 message(STATUS "  AVX2:          ${ENABLE_AVX2}")
 message(STATUS "  AVX-512:       ${ENABLE_AVX512}")
+message(STATUS "  AVX-512 VBMI:  ${ENABLE_AVX512_VBMI}")
+message(STATUS "  AVX-512 VBMI2: ${ENABLE_AVX512_VBMI2}")
 message(STATUS "  AMX:           ${ENABLE_AMX}")
 message(STATUS "  OpenMP:        ${ENABLE_OPENMP}")
 message(STATUS "  CUDA:          ${ENABLE_CUDA}")

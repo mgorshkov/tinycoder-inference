@@ -248,6 +248,17 @@ namespace tinycoder::simd {
         return result;
     }
 
+    // _mm512_sign_epi8 does not exist (VPSSIGNB is AVX2-only). Emulate
+    // a * sgn(b) per byte with a compare + masked blend: -a when b < 0, a
+    // otherwise. Note: when b == 0 VPSSIGNB yields 0 but this yields a; that
+    // only matters for lanes where the paired |x| byte is also 0 (so the
+    // maddubs product is 0 either way), keeping results bit-identical.
+    static inline __m512i signEPI8_AVX512(__m512i a, __m512i b) {
+        const __m512i zero = _mm512_setzero_si512();
+        __mmask64 neg = _mm512_cmpgt_epi8_mask(zero, b); // mask where b < 0
+        return _mm512_mask_blend_epi8(neg, a, _mm512_sub_epi8(zero, a));
+    }
+
     // ---- AVX-512 Q8_K x Q8_K dot product ----
     // Computes dot(x, w) where both x and w are Q8_K blocks (256 int8 values +
     // a block scale). Uses _mm512_maddubs_epi16 (64 int8xint8->int16
@@ -267,8 +278,10 @@ namespace tinycoder::simd {
             // maddubs cannot saturate.
             __m512i xv = _mm512_loadu_si512((const __m512i *) &x->qs[i]);
             __m512i wv = _mm512_loadu_si512((const __m512i *) &w->qs[i]);
-            __m512i xabs = _mm512_sign_epi8(xv, xv);
-            __m512i wsig = _mm512_sign_epi8(wv, xv);
+            // xabs = |xv| (VPABSB, AVX-512BW); the sign trick uses
+            // _mm512_sign_epi8 semantics, which only exist as VPSSIGNB in AVX2.
+            __m512i xabs = _mm512_abs_epi8(xv);
+            __m512i wsig = signEPI8_AVX512(wv, xv);
             __m512i p = _mm512_maddubs_epi16(xabs, wsig);
             sumi = _mm512_add_epi32(sumi, _mm512_madd_epi16(p, _mm512_set1_epi16(1)));
         }

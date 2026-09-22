@@ -992,6 +992,31 @@ namespace tinycoder {
             // token. All other logit rows are set to the pruned sentinel; the
             // subsequent softmax maps them to zero probability, and the candidate
             // dots are bit-identical to the unpruned reference path.
+            // Generic scalar fallback shared by the Q6_K-batch fallthrough and the
+            // final else: dequantize each vocab row block and dot with FMA. This
+            // path always produces correct logits regardless of host SIMD support.
+            auto computeLogitsScalar = [&](uint32_t startRow, uint32_t count) {
+                ThreadPool::instance().parallelFor(0, count * vocabSize, [&](uint32_t flatIdx) {
+                    uint32_t s = startRow + flatIdx / vocabSize;
+                    uint32_t i = flatIdx % vocabSize;
+                    const float *hPtr = hiddenData + s * hiddenSize;
+                    float *logitRow = logitsData + s * vocabSize;
+                    float dot = 0.0f;
+                    uint32_t blockSize = ggmlBlockSize(lmHead_.type);
+                    uint32_t typeSize = ggmlTypeSize(lmHead_.type);
+                    uint32_t numBlocks = (hiddenSize + blockSize - 1) / blockSize;
+                    for (uint32_t b = 0; b < numBlocks; ++b) {
+                        uint64_t blockOffset = static_cast<uint64_t>(i) * numBlocks + b;
+                        const uint8_t *blockData = lmHead_.data.data() + blockOffset * typeSize;
+                        float blockOut[256];
+                        GGMLDequantize::dequantizeBlock(lmHead_.type, blockData, blockOut, blockSize);
+                        uint32_t start = b * blockSize;
+                        uint32_t n = std::min(blockSize, hiddenSize - start);
+                        dot += dotProductFMA(hPtr + start, blockOut, n);
+                    }
+                    logitRow[i] = dot;
+                });
+            };
             bool usePruning = pendingPruneActive_ && !lmHeadPruneUseless_ &&
                               seqLen == 1 && logitCount == 1 && logitStart == 0 &&
                               !lmHeadBounds_.empty() &&
@@ -1026,11 +1051,25 @@ namespace tinycoder {
                 // quantized to Q8_K once per token inside the kernel (reused
                 // across all vocab rows); the -32 offset of the 6-bit weights
                 // folds through the Q8KBlock bsums (per-lane vector, Q3K pattern).
+                // The kernel returns false on builds without the vector kernel
+                // (e.g. no AVX2) and writes nothing; the return value MUST be
+                // honored — ignoring it leaves logitRow all zeros, which
+                // degenerates the whole forward pass.
+                bool batchOk = true;
                 for (uint32_t s = logitStart; s < logitStart + logitCount; ++s) {
                     const float *hPtr = hiddenData + s * hiddenSize;
                     float *logitRow = logitsData + s * vocabSize;
-                    matMulVecBatchQ6K_SIMD(lmHead_.data.data(), hPtr, 1,
-                                           vocabSize, hiddenSize, logitRow);
+                    if (!matMulVecBatchQ6K_SIMD(lmHead_.data.data(), hPtr, 1,
+                                                vocabSize, hiddenSize, logitRow)) {
+                        batchOk = false;
+                        break;
+                    }
+                }
+                if (!batchOk) {
+                    // Vector kernel unavailable: rows are still zero, so recompute
+                    // them on the generic scalar path instead of silently
+                    // producing degenerate (all-zero) logits.
+                    computeLogitsScalar(logitStart, logitCount);
                 }
             } else if (!forceScalarPath() && !lmHeadQ8K_.empty()) {
                 // Plan §3: pre-quantized Q8_K copy of the separate LM head. Quantize
@@ -1062,27 +1101,9 @@ namespace tinycoder {
                     });
                 }
             } else {
-                // Consolidated single parallelFor over the requested (token, vocab) pairs
-                ThreadPool::instance().parallelFor(0, logitCount * vocabSize, [&](uint32_t flatIdx) {
-                    uint32_t s = logitStart + flatIdx / vocabSize;
-                    uint32_t i = flatIdx % vocabSize;
-                    const float *hPtr = hiddenData + s * hiddenSize;
-                    float *logitRow = logitsData + s * vocabSize;
-                    float dot = 0.0f;
-                    uint32_t blockSize = ggmlBlockSize(lmHead_.type);
-                    uint32_t typeSize = ggmlTypeSize(lmHead_.type);
-                    uint32_t numBlocks = (hiddenSize + blockSize - 1) / blockSize;
-                    for (uint32_t b = 0; b < numBlocks; ++b) {
-                        uint64_t blockOffset = static_cast<uint64_t>(i) * numBlocks + b;
-                        const uint8_t *blockData = lmHead_.data.data() + blockOffset * typeSize;
-                        float blockOut[256];
-                        GGMLDequantize::dequantizeBlock(lmHead_.type, blockData, blockOut, blockSize);
-                        uint32_t start = b * blockSize;
-                        uint32_t n = std::min(blockSize, hiddenSize - start);
-                        dot += dotProductFMA(hPtr + start, blockOut, n);
-                    }
-                    logitRow[i] = dot;
-                });
+                // Consolidated scalar path (also reached via the Q6_K-batch
+                // fallthrough when the vector kernel is unavailable).
+                computeLogitsScalar(logitStart, logitCount);
             }
         }
 
