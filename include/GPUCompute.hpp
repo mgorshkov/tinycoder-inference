@@ -49,6 +49,14 @@ namespace tinycoder::gpu {
         uint32_t type = 0;        // GGML_TYPE_* enum
         uint32_t blocksPerRow = 0;// number of 256-elem blocks per row
         uint32_t rowBytes = 0;    // q row stride in bytes
+        // Persistent fp16 twin (prefill fast path): NULL unless the uploader
+        // decided a persistent fp16 copy of THIS matrix fits VRAM (small
+        // dense models only — 1.5B q2_k is ~1.5x the quantized bytes, 7B+
+        // models leave this NULL because the full twin set would OOM the
+        // 11 GB card).  When set, dequantMatrixF16() returns it directly and
+        // the per-layer streaming dequant kernel is skipped entirely.
+        void *f16Twin = nullptr;
+        uint64_t f16TwinBytes = 0;
         bool empty_ = false;
         bool hasQ() const { return q != nullptr; }
     };
@@ -572,14 +580,15 @@ namespace tinycoder::gpu {
         static constexpr uint32_t kExpertCacheWays = 2;    // ways per set
         static constexpr uint32_t kExpertCacheSlots =
                 kExpertCacheSets * kExpertCacheWays;// 64 per layer
-        // Runtime set count (env TINYCODER_MOE_WAYS = SETS, default 16; slots =
+        // Runtime set count (env TINYCODER_MOE_WAYS = SETS, default 32; slots =
         // sets*2).  An A/B tool: more sets shrink conflicts (more VRAM), fewer
-        // sets shrink VRAM (more conflicts).  16 sets = 32 slots = ~4.1 GB for
-        // 40 layers (default footprint); 24 sets = 48 slots ≈ 6.1 GB; 32 sets
-        // = 64 slots ≈ 8.2 GB (fits the 11 GB card after the hybrid retry
-        // FREED the per-expert weight upload, so the expert cache can now
-        // borrow that VRAM).
-        static constexpr uint32_t kExpertCacheSetsDefault = 16;
+        // sets shrink VRAM (more conflicts).  32 sets = 64 slots ≈ 8.2 GB for
+        // 40 layers — the tuned default (2026-09-26): measured +15-16% over 16
+        // sets on the 11 GB card because the hybrid retry FREED the per-expert
+        // weight upload, so the expert cache borrows that VRAM.  16 sets = 32
+        // slots ≈ 4.1 GB was the pre-tune default; 24 sets = 48 slots ≈ 6.1 GB
+        // is a middle ground for smaller cards.
+        static constexpr uint32_t kExpertCacheSetsDefault = 32;
         uint32_t expertCacheSets_ = kExpertCacheSetsDefault;
         ExpertSlot expertCache_[kExpertCacheLayers];
         int32_t expertCacheTag_[kExpertCacheLayers][kExpertCacheSets]
@@ -688,8 +697,15 @@ namespace tinycoder::gpu {
 
         bool allocated_ = false;
         DeviceLayer *layers_ = nullptr;// device-backed descriptors
-        float *kvK_ = nullptr;         // [nGpuLayers][maxSeqLen*kHeads*headDim]
-        float *kvV_ = nullptr;
+        void *kvK_ = nullptr;          // [nGpuLayers][maxSeqLen*kHeads*headDim]
+        void *kvV_ = nullptr;          // element type = fp32, or fp16 when kvHalf_
+        // ---- fp16 KV cache (TINYCODER_KV16, dense arch, default ON 2026-10-01) ----
+        // The O(context) decode attention + RoPE/KV-store DRAM traffic dominates
+        // long-context decode (20.27 ms of the 24.99 ms layer loop at pp1024).
+        // Storing K/V as fp16 halves that traffic.  Only the dense qwen2 path
+        // (architecture == 0) uses it; qwen35 keeps fp32 (its GDN/full-attention
+        // kernels index kvK_/kvV_ as float*).
+        bool kvHalf_ = false;
         // Qwen35 recurrent-state buffers: per GPU layer, conv state
         // [(convKernel-1) * convChannels] and gdn state [nVHeads*headV*headV]
         // (fp32; persistent across tokens, reset on clearKVCache).
@@ -711,6 +727,17 @@ namespace tinycoder::gpu {
         void *wF16_ = nullptr;
         uint64_t wF16Bytes_ = 0;
         const void *wF16SrcQ_ = nullptr;// matrix source whose dequant is in wF16_
+        // Persistent per-matrix FP16 prefill twins (2026-09-29): when the VRAM
+        // budget at upload allows (see upload()'s twinBytesRemaining_), each
+        // uploaded matrix gets a one-time kDequantF16 twin (same kernel, same
+        // bytes, bit-identical GEMM input).  dequantMatrixF16() then returns
+        // the twin directly and the per-layer streaming dequant (+ its ~4x
+        // DRAM traffic) is skipped during prefill.  Default ON for models that
+        // fit; TINYCODER_PREFILL_TWINS=0 disables (streaming path).
+        bool twinEnabled_ = false;
+        uint64_t twinBytesRemaining_ = 0;
+        uint64_t twinBytesAlloc_ = 0;
+        uint32_t twinMatrices_ = 0;
         // Reusable Q8_K activation scratch for the decode GEMV of the IQ2_S /
         // IQ3_XXS / IQ3_S matrices AND the Q8_0 x Q8_32 integer GEMV
         // (kQuantizeQ8_0x32/kQGemvQ8_0xQ8K — bit-exact with the CPU's
@@ -810,6 +837,87 @@ namespace tinycoder::gpu {
         MoeCpuFn moeCpuFn_;
         size_t kvPos_ = 0;
         bool scratchAlloc_ = false;
+
+        // ---- CUDA-graph decode acceleration (TINYCODER_GPU_GRAPH=1) ----
+        // The decode path (seqLen==1) launches ~15 tiny kernels per layer x
+        // 28 layers + LM head + H2D/D2H ~ every token.  llama.cpp captures a
+        // CUDA graph for its decode and replays it (one cudaGraphLaunch + one
+        // sync) instead of re-issuing ~500 launches/token.  Captured graphs
+        // freeze kernel arguments, so all position-dependent values (RoPE
+        // cos/sin index, KV cache write offset, attention causal end) must be
+        // read from DEVICE memory at kernel time:
+        //   * s.tokens        -- updated via cudaMemcpyAsync before replay
+        //   * graphPos_       -- a device uint32 holding pos, updated via
+        //                        cudaMemcpyAsync before replay; kernels read
+        //                        it through the graph-frozen pointer.
+        // The kernels kRoPEQ / kStoreKVRope / kWarpAttention already accept
+        // `pos` as a plain value; the graph variants below take a const
+        // uint32_t* instead.  q8k_ / scratch are pre-allocated and stable, so
+        // no cudaMalloc can occur during replay (which would invalidate a
+        // captured graph).
+        uint32_t *graphPos_ = nullptr;// device uint32 (updated per replay)
+        uint32_t graphPosHost_ = 0;   // stable host staging for the async H2D
+        void *graphExec_ = nullptr;   // cudaGraphExec_t (opaque; CUDA-free header)
+        void *graph_ = nullptr;       // cudaGraph_t (opaque; CUDA-free header)
+        bool graphBuilt_ = false;     // graphExec_ is valid for this model+geom
+        // Capture the decode (seqLen==1) forward into a CUDA graph.
+        // Falls back to the regular path on any capture error; the graph is
+        // rebuilt automatically if the geometry (rows/blocks) changes (model
+        // reload).  TINYCODER_GPU_GRAPH=0 disables (default: ON when the
+        // model is a dense qwen2/gemma-style arch -- graph capture assumes
+        // the deterministic decode dependency chain; qwen35/qwen35moe paths
+        // are NOT captured).
+        // Set while the decode forward is being RECORDED into graphExec_ (the
+        // eager body runs once to record; during recording the body skips the
+        // host cudaStreamSynchronize error-check points and uses the
+        // kRoPEQPos/kStoreKVRopePos/kWarpAttentionPos variants).
+        bool graphCaptureActive_ = false;
+        // Set if a capture attempt failed: subsequent decode forwards go eager.
+        bool graphCaptureFailed_ = false;
+        // Pre-allocate the Graph-time decode buffers (q8k_ etc.) before the
+        // first capture so no cudaMalloc happens during recording.
+        bool ensureGraphScratch();
+        // Instantiates graphExec_ from the current graph_ and cleans graph_.
+        bool instantiateGraph();
+        // Capture the decode (seqLen==1) forward into a CUDA graph.
+        // Falls back to the regular path on any capture error; the graph is
+        // rebuilt automatically if the geometry (rows/blocks) changes (model
+        // reload).  TINYCODER_GPU_GRAPH=0 disables (default: ON when the
+        // model is a dense qwen2/gemma-style arch -- graph capture assumes
+        // the deterministic decode dependency chain; qwen35/qwen35moe paths
+        // are NOT captured).  pos is the token's position; it is written to
+        // graphPos_ (blocking H2D) BEFORE cudaStreamBeginCapture so the
+        // recorded kernels see the right value at first launch.
+        bool captureDecodeGraph(uint32_t pos);
+        // Replay the captured decode graph (which contains kernels only --
+        // no memcpys / position values): the caller has already H2D'd the
+        // tokens into s.tokens; this updates the graphPos_ device scalar,
+        // cudaGraphLaunch, syncs, then D2H's the logits from scratch_.logits
+        // into the caller's buffer.
+        bool replayDecodeGraph(uint32_t pos, float *logitsOut,
+                               std::string &errMsg);
+
+        // ---- Split-KV decode attention (TINYCODER_ATTN_SPLIT) ----
+        // The eager decode attention launches ONE warp per (token, q-head):
+        // at batch==1 that is nHeads (=12) warps for the whole 68-SM GPU, each
+        // scanning the full cachePos range, so decode attention is latency- not
+        // bandwidth-bound and costs a hard O(context) wall (measured 0.76 ms @
+        // pp16 -> 20.27 ms @ pp1024 over 28 layers = 81% of the layer loop at
+        // 1K context, while the GEMVs stay flat at ~3.6 ms).  The split path
+        // tiles the KV range into attnChunk_-sized windows and launches
+        // nHeads*attnChunks_ warps, folding each window into a flash-attention
+        // (m,l,acc) partial that a combine kernel merges.  Same online softmax
+        // math, different reduction grouping; top-k logit identity preserved.
+        // Device-resident, pointer-stable across CUDA-graph capture.
+        //   partAcc: [seqLen][nHeads][attnChunks_][hd]      (hd = NV*32)
+        //   partM/L: [seqLen][nHeads][attnChunks_]
+        // TINYCODER_ATTN_SPLIT=0 disables; TINYCODER_ATTN_SPLIT_CHUNK overrides
+        // the default 64-row window.
+        float *attnPartialAcc_ = nullptr;
+        float *attnPartialM_ = nullptr;
+        float *attnPartialL_ = nullptr;
+        uint32_t attnChunk_ = 64;// KV rows per split window (chunk size)
+        uint32_t attnChunks_ = 0;// ceil(maxSeqLen / attnChunk_)
 
         bool ensureScratch(uint32_t seqLen, std::string &errMsg);
         void destroyScratch();
