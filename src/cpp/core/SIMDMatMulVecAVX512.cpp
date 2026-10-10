@@ -255,7 +255,7 @@ namespace tinycoder::simd {
     // maddubs product is 0 either way), keeping results bit-identical.
     static inline __m512i signEPI8_AVX512(__m512i a, __m512i b) {
         const __m512i zero = _mm512_setzero_si512();
-        __mmask64 neg = _mm512_cmpgt_epi8_mask(zero, b); // mask where b < 0
+        __mmask64 neg = _mm512_cmpgt_epi8_mask(zero, b);// mask where b < 0
         return _mm512_mask_blend_epi8(neg, a, _mm512_sub_epi8(zero, a));
     }
 

@@ -49,6 +49,8 @@ SOFTWARE.
 #include <cstdint>
 #include <cstdio>
 #include <mutex>
+#include <stdexcept>
+#include <string>
 #include <vector>
 
 namespace tinycoder {

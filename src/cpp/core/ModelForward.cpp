@@ -146,9 +146,24 @@ namespace tinycoder {
                 }
                 // Fall through to the CPU path below.  The GPU engine's KV cache is
                 // NOT consumed on the fallback (kvPos_ reverts to its pre-pass
-                // value) and the session latch is cleared, so the CPU-side KV
-                // cache (kvCache_) remains authoritative for the remaining steps.
+                // value) and the session latch is cleared.
                 gpuSessionActive_ = false;
+                // The GPU path is now known-bad for this session: latch the CPU
+                // path so subsequent forwards don't retry it (each retry would
+                // fail again and re-enter this branch).  Additionally, if the
+                // GPU owned EARLIER tokens of this session (full offload writes
+                // K/V only into GPU memory; kvCache_.pos is just bookkeeping),
+                // the CPU-side KV cache holds NO data for them -- continuing
+                // would attend over empty/zeroed K/V and emit garbage logits
+                // (observed as "CertainlyCertainlyHereSure..."-style noise).
+                // Re-seat the CPU position to 0 so the fallback recomputes from
+                // a clean state instead.  When the GPU failed on a fresh session
+                // (pos == 0) this is a no-op and the CPU prefill is fully
+                // correct.
+                forceCpuForward_ = true;
+                if (kvCache_.pos > 0) {
+                    kvCache_.pos = 0;
+                }
             }
         }
 #endif

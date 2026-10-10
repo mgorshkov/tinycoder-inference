@@ -398,6 +398,35 @@ namespace tinycoder {
                                 uint32_t seqLen, uint32_t rows, uint32_t cols,
                                 float *out);
 
+    /// @brief Register-tiled batch GEMM for a single F32 (fp32) weight matrix
+    /// over a batch of tokens, used for the qwen35moe ROUTER (ffnGateInpMoe is
+    /// an F32 [expertCount x hiddenSize] host matrix).
+    ///
+    /// Computes out[s*rows + j] = sum_i X[s*cols + i] * W_f32[j*cols + i] for
+    /// all tokens s and output rows j, where W_f32 is a row-major fp32 matrix.
+    /// On a host with a vector (AVX2) kernel each tile of 8 rows accumulates
+    /// into four independent __m256 FMA chains (32 lanes in flight), streams
+    /// the weight rows once and reuses them across all seqLen tokens
+    /// (weight-stationary prefill); the x-vector is loaded once per
+    /// (token, 8-lane group) and reused across the 8 tile rows. The previous
+    /// path was a per-token scalar fp64-accumulation loop — the dominant CPU
+    /// cost of the hybrid GPU callback (~16.6 ms/token decode, ~17.4 ms/token
+    /// prefill on the 256x2048 router x 40 layers). Router output feeds only
+    /// the top-k expert selection, so the fp32-vs-fp64 rounding delta is
+    /// benign. Returns true if a vector kernel was used, false if the caller
+    /// must fall back to the scalar fp64 reference loop.
+    ///
+    /// @param W_f32  fp32 weights, row-major [rows * cols]
+    /// @param X      Input activations [seqLen, cols] (row-major)
+    /// @param seqLen Number of tokens in the batch
+    /// @param rows   Number of output rows (expertCount)
+    /// @param cols   Number of input columns (hiddenSize)
+    /// @param out    Output [seqLen, rows] (row-major)
+    /// @return true if the vector batch kernel was dispatched
+    bool matMulVecBatchF32_SIMD(const float *W_f32, const float *X,
+                                uint32_t seqLen, uint32_t rows, uint32_t cols,
+                                float *out);
+
     /// @brief Register-tiled batch GEMM for a single Q4_K weight matrix over a
     /// batch of tokens (prefill), used for the attnV projection.
     ///
