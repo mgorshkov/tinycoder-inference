@@ -198,16 +198,20 @@ namespace tinycoder {
         // Q+G fused projection: w.attnQ = [nHeads*2*headDim, hiddenSize].
         // Row layout per head h: [Q(h) (headDim) | gate(h) (headDim)].
         const uint32_t qgDims = nHeads * 2 * headDim;
+        // Prism: attn_q is a folded weight, so its activation is transformed into
+        // the folded basis first (identical for attn_k/attn_v at this width).
         for (uint32_t s = 0; s < seqLen; ++s) {
             const float *hRow = attnNorm + static_cast<size_t>(s) * hiddenSize;
-            w.attnQ.matMulVec(hRow, qGate + static_cast<size_t>(s) * qgDims);
+            const float *hFolded = applyPrismTransform(hRow, hiddenSize, false);
+            w.attnQ.matMulVec(hFolded, qGate + static_cast<size_t>(s) * qgDims);
         }
 
         // K/V projections.
         for (uint32_t s = 0; s < seqLen; ++s) {
             const float *hRow = attnNorm + static_cast<size_t>(s) * hiddenSize;
-            w.attnK.matMulVec(hRow, k + static_cast<size_t>(s) * nKVHeads * headDim);
-            w.attnV.matMulVec(hRow, v + static_cast<size_t>(s) * nKVHeads * headDim);
+            const float *hFolded = applyPrismTransform(hRow, hiddenSize, false);
+            w.attnK.matMulVec(hFolded, k + static_cast<size_t>(s) * nKVHeads * headDim);
+            w.attnV.matMulVec(hFolded, v + static_cast<size_t>(s) * nKVHeads * headDim);
         }
 
         // Per-head Q norm (shared weight, [headDim]) + per-head K norm.
@@ -326,9 +330,13 @@ namespace tinycoder {
         }
 
         // Output projection: attnProj = attn_output @ attnOut.
+        // Prism: attn_output is folded, so transform the attention output (width
+        // nHeads*headDim) into the folded basis before the matmul.
         for (uint32_t s = 0; s < seqLen; ++s) {
             const float *oRow = attnOut + static_cast<size_t>(s) * nHeads * headDim;
-            w.attnO.matMulVec(oRow, attnProj + static_cast<size_t>(s) * hiddenSize);
+            const float *oFolded =
+                    applyPrismTransform(oRow, nHeads * headDim, false);
+            w.attnO.matMulVec(oFolded, attnProj + static_cast<size_t>(s) * hiddenSize);
         }
 
         // Residual: hidden += attnProj.
@@ -437,10 +445,15 @@ namespace tinycoder {
 
         for (uint32_t s = 0; s < seqLen; ++s) {
             const float *hRow = attnNorm + static_cast<size_t>(s) * hiddenSize;
+            // Prism: attn_qkv / attn_gate read the hidden dimension and ARE
+            // folded, so a single transform serves them. ssm_alpha / ssm_beta are
+            // NOT folded (they are absent from prism.hadamard.weight_names), so
+            // they must read the raw hidden state.
+            const float *hFolded = applyPrismTransform(hRow, hiddenSize, false);
 
             // ---- Projections ----
-            w.attnQKV.matMulVec(hRow, qkv.data());
-            w.attnGate.matMulVec(hRow, z.data());
+            w.attnQKV.matMulVec(hFolded, qkv.data());
+            w.attnGate.matMulVec(hFolded, z.data());
             w.ssmBetaQ.matMulVec(hRow, beta.data());
             w.ssmAlphaQ.matMulVec(hRow, gateV.data());
             for (uint32_t v = 0; v < nVHeads; ++v) {
@@ -592,7 +605,11 @@ namespace tinycoder {
             }
 
             // ---- Output projection: ssm_out [valueDim -> hiddenSize] ----
-            w.ssmOut.matMulVec(normOut.data(), attnProj + static_cast<size_t>(s) * hiddenSize);
+            // Prism: ssm_out was folded with the GDN value-head permutation, so
+            // the activation is permuted + sign-flipped + Hadamard-rotated first.
+            const float *ssmFolded =
+                    applyPrismTransform(normOut.data(), dInner, true);
+            w.ssmOut.matMulVec(ssmFolded, attnProj + static_cast<size_t>(s) * hiddenSize);
 
             // TINYCODER_DUMP_NORM=1: dump CPU L0 token-0 normOut (post
             // gated-RMSNorm × silu(z)) and attnProj (post ssmOut) to bisect
@@ -727,14 +744,19 @@ namespace tinycoder {
             // ---- Dense SwiGLU FFN (qwen35) ----
             for (uint32_t s = 0; s < seqLen; ++s) {
                 const float *x = ffnNorm + static_cast<size_t>(s) * hiddenSize;
+                // Prism: ffn_gate/ffn_up read the hidden dimension.
+                const float *xFolded = applyPrismTransform(x, hiddenSize, false);
                 float *g = gate + static_cast<size_t>(s) * intermediateSize;
                 float *u = up + static_cast<size_t>(s) * intermediateSize;
-                w.ffnGate.matMulVecFusedGateUp(w.ffnUp, x, g, u);
+                w.ffnGate.matMulVecFusedGateUp(w.ffnUp, xFolded, g, u);
                 for (uint32_t i = 0; i < intermediateSize; ++i) {
                     // silu(gate) * up
                     g[i] = g[i] / (1.0f + std::exp(-g[i])) * u[i];
                 }
-                w.ffnDown.matMulVec(g, ffnOut + static_cast<size_t>(s) * hiddenSize);
+                // Prism: ffn_down reads the (activated) intermediate dimension.
+                const float *gFolded =
+                        applyPrismTransform(g, intermediateSize, false);
+                w.ffnDown.matMulVec(gFolded, ffnOut + static_cast<size_t>(s) * hiddenSize);
             }
         }
         // Residual: hidden += ffnOut (residual is the pre-post-norm tensor, which

@@ -61,10 +61,10 @@ namespace tinycoder {
     /// m16n8k16 (Ampere+), so one pack feeds both.
     struct Int8Pack {
         // ---- IQ3_XXS source geometry (GGML) ----
-        static constexpr uint32_t BLOCK_SIZE = 256;     // weights per block
-        static constexpr uint32_t GROUP_SIZE = 32;      // weights per scale group
+        static constexpr uint32_t BLOCK_SIZE = 256;                          // weights per block
+        static constexpr uint32_t GROUP_SIZE = 32;                           // weights per scale group
         static constexpr uint32_t GROUPS_PER_BLOCK = BLOCK_SIZE / GROUP_SIZE;// 8
-        static constexpr uint32_t SRC_BLOCK_BYTES = 98; // d(2) + qs[96]
+        static constexpr uint32_t SRC_BLOCK_BYTES = 98;                      // d(2) + qs[96]
 
         // ---- mma.s8.m8n8k16 geometry ----
         // Turing (sm_75) has no mma.m16n8k16 for int8 (that needs sm_80+); the
@@ -85,8 +85,8 @@ namespace tinycoder {
         /// @brief One packed IQ3_XXS block: 256 signed int8 weights + 8 group
         /// scales.  This is the canonical int8 form both MMQ paths consume.
         struct PackedBlock {
-            int8_t qs[BLOCK_SIZE];          // signed grid values, weight order
-            float scales[GROUPS_PER_BLOCK]; // per-32-group weight scale db
+            int8_t qs[BLOCK_SIZE];         // signed grid values, weight order
+            float scales[GROUPS_PER_BLOCK];// per-32-group weight scale db
         };
         static_assert(sizeof(PackedBlock) ==
                               BLOCK_SIZE + GROUPS_PER_BLOCK * sizeof(float),

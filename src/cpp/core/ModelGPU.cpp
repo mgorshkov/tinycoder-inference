@@ -79,9 +79,20 @@ namespace tinycoder {
                     return 136;// 256 weights in 136 bytes
                 case GGML_TYPE_Q5_K:
                     return 176;// 256 weights in 176 bytes
+                case GGML_TYPE_PQ2_0:
+                    return 34;// 128 weights: d(fp16,2) + qs[32] (Prism ternary)
                 default:
                     return 0;
             }
+        }
+
+        // TINYCODER_GPU_PRISM=0: launch the Prism-folded PQ2_0 weight GEMVs on
+        // the RAW activation (no forward Hadamard transform / inverse embedding
+        // restore).  Diagnostic A/B for the Bonsai path only; produces wrong but
+        // deterministic numbers, so it is never on by default.
+        bool prismGpuDisabled() {
+            const char *e = std::getenv("TINYCODER_GPU_PRISM");
+            return e != nullptr && e[0] == '0';
         }
 
         // Blocks per row for a quant type and row width (mirrors the layout the
@@ -114,6 +125,7 @@ namespace tinycoder {
                 case GGML_TYPE_IQ2_XXS:
                 case GGML_TYPE_IQ4_XS:
                 case GGML_TYPE_IQ4_NL:
+                case GGML_TYPE_PQ2_0:
                     return true;
                 default:
                     return false;
@@ -124,7 +136,7 @@ namespace tinycoder {
             return type == GGML_TYPE_Q2_K || type == GGML_TYPE_Q5_0 ||
                    type == GGML_TYPE_Q8_0 || type == GGML_TYPE_IQ3_S ||
                    type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K ||
-                   type == GGML_TYPE_IQ4_NL;
+                   type == GGML_TYPE_IQ4_NL || type == GGML_TYPE_PQ2_0;
         }
 
         DeviceMatrix toDeviceMatrix(const QuantizedMatrix &m) {
@@ -489,9 +501,36 @@ namespace tinycoder {
             }
             geom.lmHeadTied = m.lmHeadTied_ ? 1u : 0u;
 
-            if (!gpu_.upload(deviceLayers, geom, emb.data.data(), emb.type,
-                             embRowBytes, lmHeadQ, lmHeadType, lmHeadRowBytes,
-                             err)) {
+            // ---- Prism Hadamard fold (Ternary-Bonsai-2-27B PQ2_0) ----
+            // The Bonsai weights are stored folded (W @ (H S P)) and the token
+            // embedding is stored latent (rotated).  Hand the sign vectors +
+            // geometry to the GPU engine so it applies the forward activation
+            // transform before every folded projection (and the inverse
+            // transform to the latent embedding rows).  Held for the model's
+            // lifetime; upload() copies them to the device.
+            gpu::PrismGPUConfig prism;
+            prism.enabled = m.prismFold_ && !prismGpuDisabled();
+            if (prism.enabled) {
+                prism.blockSize = m.prismBlockSize_ ? m.prismBlockSize_ : 1024u;
+                prism.gdnVGrouped = m.prismGdnVGrouped_;
+                // signFor() is a private Model accessor (the adapter is a friend
+                // class); the widths are the Bonsai hidden/ssm-inner/FFN widths.
+                prism.signs5120 = m.signFor(5120);
+                prism.n5120 = prism.signs5120 ? 5120u : 0u;
+                prism.signs6144 = m.signFor(6144);
+                prism.n6144 = prism.signs6144 ? 6144u : 0u;
+                prism.signs17408 = m.signFor(17408);
+                prism.n17408 = prism.signs17408 ? 17408u : 0u;
+                std::fprintf(stderr,
+                             "[gpu] Prism fold: block=%u gdnVGrouped=%d "
+                             "signs[%u/%u/%u]\n",
+                             prism.blockSize, prism.gdnVGrouped ? 1 : 0,
+                             prism.n5120, prism.n6144, prism.n17408);
+            }
+
+            if (!gpu_.uploadWithPrism(deviceLayers, geom, emb.data.data(),
+                                      emb.type, embRowBytes, lmHeadQ, lmHeadType,
+                                      lmHeadRowBytes, prism, err)) {
                 // Failed to fit. IQ1_M fits the full-GPU upload on the first
                 // try and never reaches this path.
                 if (cfg.architecture == ARCH_QWEN35MOE && !moeCpuEnabled_) {
@@ -547,14 +586,14 @@ namespace tinycoder {
                                          layer, ffnNorm[0], ffnNorm[1], ffnNorm[2],
                                          ffnNorm[3], ffnNorm[4]);
                         }
-                        // The GPU driver (GPUCompute.cu qwen35moe hybrid block)
+                        // The GPU driver (GPUComputeForward.cu qwen35moe hybrid block)
                         // SELECTS the fallback independently: it runs the routed
                         // experts from the device cache ONLY when
                         // `expertCacheBuilt_ && !forceMoeFallback`.  Keep this
                         // callback's contract EXACTLY in sync: when
                         // TINYCODER_MOE_FALLBACK=1 forces the CPU path, the
                         // driver will H2D moeFfnOutHost_ (the fallback branch in
-                        // GPUCompute.cu) and therefore needs the FULL routed
+                        // GPUComputeForward.cu) and therefore needs the FULL routed
                         // experts written here.  In the normal (non-fallback)
                         // mode, the driver consumes the router-only tables.
                         const bool forceMoeFallback =
@@ -757,7 +796,7 @@ namespace tinycoder {
                     });
                     moeCpuEnabled_ = true;
                     // upload() releases every partially-allocated device buffer
-                    // on failure (GPUCompute.cu failCleanup), so this retry
+                    // on failure (GPUComputeUpload.cu failCleanup), so this retry
                     // starts from a clean device.
                     if (gpu_.upload(deviceLayers, geom, emb.data.data(), emb.type,
                                     embRowBytes, lmHeadQ, lmHeadType,
@@ -814,7 +853,7 @@ namespace tinycoder {
                     }
                 }
                 // Latch the failure.  upload() now releases its partially
-                // allocated device buffers (GPUCompute.cu failCleanup), and this
+                // allocated device buffers (GPUComputeUpload.cu failCleanup), and this
                 // latch stops any later fresh session (kvCache_.pos == 0) from
                 // re-attempting the doomed upload.  Without both, every
                 // re-attempt re-allocates ~10 GB of VRAM and, before the leak

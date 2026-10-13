@@ -347,7 +347,7 @@ namespace tinycoder {
         // ffnGateInpMoe @ norm + double softmax + stable-by-index top-k +
         // renormalize with the norm_w clamp), writing the per-(token, rank)
         // tables WITHOUT running the expert FFNs — those run on the GPU via
-        // the per-layer expert cache (GPUCompute.cu ensureExpertCached).
+        // the per-layer expert cache (GPUComputeMoE.cu ensureExpertCached).
         uint32_t expertCount = config_.expertCount;
         uint32_t expertUsedCount = config_.expertUsedCount;
         const uint32_t eu = expertUsedCount;

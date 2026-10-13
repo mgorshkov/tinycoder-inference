@@ -241,6 +241,49 @@ namespace tinycoder {
     bool Model::loadWeights(GGUFLoader &loader) {
         auto t0 = std::chrono::high_resolution_clock::now();
 
+        // ---- Prism Hadamard fold setup (Ternary-Bonsai-2-27B PQ2_0) ----
+        // When prism.hadamard.* metadata is present the listed weights were
+        // stored folded (W_folded = W @ (H S P)); the matching activations are
+        // transformed at runtime (Model::applyPrismTransform). Sign vectors are
+        // keyed by input width and sliced out of the concatenated sign_values by
+        // sign_widths.
+        {
+            const auto &pm = loader.prism();
+            if (pm.present) {
+                prismFold_ = true;
+                prismBlockSize_ = pm.blockSize;
+                prismGdnVGrouped_ = pm.gdnVGrouped;
+                config_.prismFold = true;
+                config_.prismBlockSize = pm.blockSize;
+                config_.prismGdnVGrouped = pm.gdnVGrouped;
+                prismWeightNames_ = pm.foldedWeights;
+                size_t off = 0;
+                for (uint32_t w: pm.signWidths) {
+                    std::vector<float> v(w, 1.0f);
+                    for (uint32_t i = 0; i < w && off + i < pm.signValues.size(); ++i) {
+                        v[i] = static_cast<float>(pm.signValues[off + i]);
+                    }
+                    prismSigns_[w] = std::move(v);
+                    off += w;
+                }
+                std::cout << "[TinyCoder] Prism Hadamard fold: block=" << pm.blockSize
+                          << " folded weights=" << pm.foldedWeights.size()
+                          << " latent tables=" << pm.inverseWeights.size()
+                          << " sign widths=";
+                for (size_t si = 0; si < pm.signWidths.size(); ++si) {
+                    std::cout << (si ? "," : "") << pm.signWidths[si];
+                }
+                std::cout << " gdnVGrouped=" << (pm.gdnVGrouped ? 1 : 0) << std::endl;
+            }
+        }
+        // True when `name` is a folded weight whose activation must be
+        // transformed before the matmul.
+        auto isFoldedWeight = [&](const std::string &name) {
+            return prismFold_ &&
+                   std::find(prismWeightNames_.begin(), prismWeightNames_.end(),
+                             name) != prismWeightNames_.end();
+        };
+
         // Helper to convert a packed FP16 weight matrix to a row-major Q8_K block
         // array (rows x blocksPerRow Q8KBlock), for the prefill Q8_K batch GEMM.
         auto buildQ8K = [](const uint16_t *W_f16, uint32_t rows, uint32_t cols) {
@@ -352,6 +395,11 @@ namespace tinycoder {
             qm.rows = rows;
             qm.cols = cols;
             qm.type = info->type;
+            // Mark folded (Prism-rotated) weights so the forward pass routes
+            // their activation through applyPrismTransform.
+            if (isFoldedWeight(name)) {
+                qm.foldedWeight = true;
+            }
             // Zero-copy: adopt the tensor bytes DIRECTLY from the loader's
             // file-backed mmap (kept alive by Model::weightLoader_) instead of
             // heap-copying them. The previous qm.data.assign() copied every
@@ -378,6 +426,33 @@ namespace tinycoder {
             std::vector<float> vec(n);
             std::memcpy(vec.data(), data, n * sizeof(float));
             return np::Array<float>(vec, np::Shape{n});
+        };
+
+        // Load a quantized weight, converting a BF16 (type 30) tensor to F32.
+        // The Prism Bonsai export stores ssm_alpha / ssm_beta as BF16; the engine
+        // has no BF16 kernel, so convert the 2-byte bf16 values to F32 at load
+        // (F32 takes the fast AVX2 matmul path; these matrices are tiny). Other
+        // types pass through unchanged.
+        auto loadQuantizedBF16ToF32 = [&](const std::string &name) -> QuantizedMatrix {
+            QuantizedMatrix qm = loadQuantized(name);
+            if (qm.empty() || qm.type != GGML_TYPE_BF16) {
+                return qm;
+            }
+            const uint64_t n = static_cast<uint64_t>(qm.rows) * qm.cols;
+            const uint16_t *src = reinterpret_cast<const uint16_t *>(qm.data.data());
+            std::vector<float> f32(n);
+            for (uint64_t i = 0; i < n; ++i) {
+                f32[i] = GGMLDequantize::bf16ToFloat(src[i]);
+            }
+            QuantizedMatrix out;
+            out.rows = qm.rows;
+            out.cols = qm.cols;
+            out.type = GGML_TYPE_F32;
+            out.data.assign(reinterpret_cast<const uint8_t *>(f32.data()),
+                            reinterpret_cast<const uint8_t *>(f32.data()) + n * sizeof(float));
+            std::cout << "[TinyCoder] " << name << ": converted BF16 -> F32 ("
+                      << qm.rows << "x" << qm.cols << ")" << std::endl;
+            return out;
         };
 
         // Load token embeddings (keep quantized)
@@ -413,15 +488,29 @@ namespace tinycoder {
             uint64_t numBlocks = (numElements + blockSize - 1) / blockSize;
             uint64_t compressedBytes = numBlocks * typeSize;
 
+            // Prism stores the token table "latent" (rows rotated by H S); the
+            // looked-up rows are restored to the primal basis in getRow().
+            bool latent = false;
+            if (prismFold_) {
+                const auto &inv = loader.prism().inverseWeights;
+                latent = std::find(inv.begin(), inv.end(), std::string("token_embd.weight")) != inv.end();
+            }
             quantizedEmbeddings_.data.assign(data, data + compressedBytes);
             quantizedEmbeddings_.vocabSize = rows;
             quantizedEmbeddings_.hiddenSize = cols;
             quantizedEmbeddings_.type = info->type;
-
+            if (latent) {
+                quantizedEmbeddings_.isLatentPrism = true;
+                quantizedEmbeddings_.hadamardBlockSize = prismBlockSize_;
+                const float *s = signFor(cols);
+                if (s != nullptr) {
+                    quantizedEmbeddings_.signs.assign(s, s + cols);
+                }
+            }
             std::cout << "[TinyCoder] Token embeddings: " << rows << " x " << cols
                       << " (type " << info->type << ", "
-                      << (compressedBytes / (1024 * 1024)) << " MB quantized)"
-                      << std::endl;
+                      << (compressedBytes / (1024 * 1024)) << " MB quantized"
+                      << (latent ? ", Prism latent)" : ")") << std::endl;
         }
 
         // Check if LM head is tied (output.weight exists and has same pointer as
@@ -734,8 +823,8 @@ namespace tinycoder {
                     layers_[i].attnGate = loadQuantized(prefix + "attn_gate.weight");
                     layers_[i].ssmConv1d = loadQuantized(prefix + "ssm_conv1d.weight");// F32 [4, 10240]
                     layers_[i].ssmABroadcast = loadF32_1D(prefix + "ssm_a");
-                    layers_[i].ssmAlphaQ = loadQuantized(prefix + "ssm_alpha.weight");
-                    layers_[i].ssmBetaQ = loadQuantized(prefix + "ssm_beta.weight");
+                    layers_[i].ssmAlphaQ = loadQuantizedBF16ToF32(prefix + "ssm_alpha.weight");
+                    layers_[i].ssmBetaQ = loadQuantizedBF16ToF32(prefix + "ssm_beta.weight");
                     layers_[i].ssmDtBiasFull = loadF32_1D(prefix + "ssm_dt.bias");
                     layers_[i].ssmNorm = loadF32_1D(prefix + "ssm_norm.weight");
                     layers_[i].ssmOut = loadQuantized(prefix + "ssm_out.weight");
@@ -910,7 +999,11 @@ namespace tinycoder {
         // block stores 256 int8 values + a block scale, and the dot product uses
         // _mm256_maddubs_epi16 int8 kernels. Since the source embeddings are Q2_K
         // (~2-bit), Q8_K is lossless.
-        {
+        // PQ2_0 (Prism type 142) has 128-wide blocks and no Q8_K dot kernel;
+        // skip the Q8_K build so the LM head uses the generic per-block path
+        // (and for a separate head the Q8_K block-build below is skipped too).
+        if (quantizedEmbeddings_.type != GGML_TYPE_PQ2_0 &&
+            quantizedEmbeddings_.type != GGML_TYPE_BF16) {
             uint32_t blocksPerRow = (hiddenSize + 255) / 256;
             std::vector<Q8KBlock> q8k(static_cast<size_t>(vocabSize) * blocksPerRow);
             // Quantize each row independently (Q8_K blocks are per-row).

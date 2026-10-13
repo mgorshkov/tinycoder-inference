@@ -29,6 +29,7 @@
 #include <memory>
 #include <random>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -38,6 +39,7 @@
 #include "GGMLDequantize.hpp"
 #include "GGUFLoader.hpp"
 #include "ModelConfig.hpp"
+#include "PrismHadamard.hpp"
 #include "Tokenizer.hpp"
 
 namespace tinycoder {
@@ -51,6 +53,13 @@ namespace tinycoder {
         uint32_t rows = 0;          // Number of rows (output dim)
         uint32_t cols = 0;          // Number of columns (input dim)
         uint32_t type = 0;          // GGML_TYPE_* enum
+
+        // Prism Hadamard fold: true when this weight was stored folded (its
+        // input dimension carries the H S transform). The activation fed to
+        // matMulVec/matMulVecFusedGateUp must then be transformed by
+        // Model::applyPrismTransform before the call. The weight itself stays in
+        // its native PQ2_0 format (never expanded to F16).
+        bool foldedWeight = false;
 
         // Pre-packed Q2_K data (expanded 2-bit values to bytes 0-3).
         // Only populated for ffnGate and ffnUp when type == GGML_TYPE_Q2_K.
@@ -133,6 +142,14 @@ namespace tinycoder {
             uint32_t hiddenSize;
             uint32_t type;// GGML_TYPE_* enum
 
+            // ---- Prism latent embedding (Ternary-Bonsai-2-27B PQ2_0) ----
+            // When true, `data` holds a PQ2_0 table whose rows are stored
+            // "latent" (folded): getRow/dotRow restore the primal basis with the
+            // inverse transform (H then signs). Populated at load.
+            bool isLatentPrism = false;
+            uint32_t hadamardBlockSize = 0;
+            std::vector<float> signs;// hiddenSize ±1 sign vector (per feature)
+
             bool empty() const { return data.empty(); }
 
             /// @brief Dequantize a single token embedding row.
@@ -142,6 +159,11 @@ namespace tinycoder {
             /// (dequantized on-the-fly).
             float dotRow(const float *vec, uint32_t tokenId) const;
         };
+
+        /// @brief Embedding table storage. Identical to QuantizedEmbedding; the
+        /// synonym exists so the Prism-latent embedding table can be held in a
+        /// separate member without duplicating the struct.
+        using Embedding = QuantizedEmbedding;
 
         /// @brief Pre-dequantized embedding matrix for fast LM head computation.
         /// Stores the full float32 embedding matrix (vocabSize × hiddenSize) which
@@ -618,6 +640,36 @@ namespace tinycoder {
         QuantizedMatrix lmHead_;
         bool lmHeadTied_ = true;
 
+        // ---- Prism Hadamard-fold state (Ternary-Bonsai-2-27B PQ2_0) ----
+        // When config_.prismFold is set the model's linear weights were stored
+        // folded: W_folded = W @ (H S P). At inference the small activation fed
+        // to each folded projection is transformed by applyPrismTransform
+        // (P then S then H) so the untouched PQ2_0 weights still reproduce the
+        // primal output y = W_folded @ (H S P x) = W x. The token-embedding
+        // table is stored latent (rotated); its looked-up rows are restored with
+        // the inverse transform (H then S) in QuantizedEmbedding::getRow. Sign
+        // vectors are keyed by input width (5120/6144/17408); signFor() returns
+        // nullptr for a width folded in identity sign mode.
+        bool prismFold_ = false;
+        uint32_t prismBlockSize_ = 0;
+        bool prismGdnVGrouped_ = false;
+        // Sign vectors keyed by input width. signFor() returns nullptr for
+        // a width with no sign vector (folded in identity sign mode).
+        std::unordered_map<uint32_t, std::vector<float>> prismSigns_;
+        // Names of the folded weights (prism.hadamard.weight_names); used to set
+        // QuantizedMatrix::foldedWeight at load.
+        std::vector<std::string> prismWeightNames_;
+
+        /// @brief Sign vector for an input width, or nullptr (identity mode).
+        /// The Prism metadata provides exact per-width sign vectors for every
+        /// folded width (5120 hidden, 6144 ssm inner, 17408 FFN intermediate).
+        const float *signFor(uint32_t width) const {
+            auto it = prismSigns_.find(width);
+            return it == prismSigns_.end() || it->second.empty()
+                           ? nullptr
+                           : it->second.data();
+        }
+
         // Plan §3: pre-quantized Q8_K copy of the separate (non-tied) LM head.
         // The LM head mat-vec is the largest single memory read per token
         // (vocabSize × hiddenSize); Q8_K stores 256 int8 values + a block scale
@@ -705,6 +757,15 @@ namespace tinycoder {
             //   gated-delta state — per value-head a square matrix of size
             //   headV = ssmInnerSize / ssmTimeStepRank (128x128 for Qwen3.8-27B).
             std::vector<std::vector<float>> q35GdnState;
+
+            // Per-layer K/V cache widths. Zero for non-attention layers (the
+            // qwen35 recurrent layers never touch the KV cache). The generic
+            // qwen35 path allocates numKVHeads*headDim per row for every layer,
+            // but a Prism (full-attention-every-layer) model lets recurrent
+            // layers use zero width, shrinking the cache to the 64 attention
+            // layers only. kvStrideK/L is the layer's slot stride in elements.
+            std::vector<uint64_t> kvStrideK;
+            std::vector<uint64_t> kvStrideV;
         };
         KVCache kvCache_;
 
@@ -830,6 +891,11 @@ namespace tinycoder {
             // gated rmsnorm output: [seqLen, dInner]
             std::vector<float> q35NormOut;
             std::vector<float> q35FinalOut;
+
+            // ---- Prism Hadamard-fold temporaries ----
+            // Transformed (folded-space) activation copy with the maximum input
+            // width of any folded weight, reused per projection.
+            std::vector<float> prismAct;
         };
 
         /// @brief Get the per-thread scratch pool for the calling thread.
@@ -961,6 +1027,16 @@ namespace tinycoder {
                                     float *hidden, float *attnNorm,
                                     float *attnProj, uint32_t seqLen,
                                     uint32_t hiddenSize);
+
+        /// @brief Transform a primal activation `x` (width `cols`) into the
+        /// folded basis in the thread-local scratch buffer `dst`: dst = H S x
+        /// (preceded by the GDN value-head permutation P when `gdnPerm`, for
+        /// ssm_out). Used as the input to a folded weight so that dot(dst,
+        /// W_folded_row) reproduces the primal projection output. No-op (copy
+        /// through) when `cols` has no sign vector or the model isn't folded.
+        /// Returns `dst` (which holds `cols` floats).
+        const float *applyPrismTransform(const float *x, uint32_t cols,
+                                         bool gdnPerm) const;
 
         /// @brief Apply Q/K norms (per-head RMSNorm before RoPE).
         /// Used by Gemma4 and Qwen35MoE architectures.

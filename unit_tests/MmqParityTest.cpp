@@ -69,7 +69,7 @@ using namespace tinycoder;
 
 namespace {
 
-    // The device Q8_K block stride (kQ8K_STRIDE in GPUCompute.cu);
+    // The device Q8_K block stride (kQ8K_STRIDE in GPUComputeInternal.hpp);
     // independently asserted by the byte-exact quantizer parity tests.
     constexpr uint32_t kMmqQ8KStride = 304;
 
@@ -111,14 +111,14 @@ namespace {
         (void) cols;
         for (uint32_t s = 0; s < seq; ++s) {
             const uint8_t *xqTok = xq + static_cast<size_t>(s) * blocksPerRow *
-                                               kMmqQ8KStride;
+                                                kMmqQ8KStride;
             for (uint32_t n = 0; n < rows; ++n) {
                 float total = 0.0f;
                 for (uint32_t g = 0; g < blocksPerRow; ++g) {
                     const Int8Pack::PackedBlock &pb =
                             packed[static_cast<size_t>(n) * blocksPerRow + g];
                     const uint8_t *q8 = xqTok + static_cast<size_t>(g) *
-                                                          kMmqQ8KStride;
+                                                        kMmqQ8KStride;
                     const int8_t *yq = reinterpret_cast<const int8_t *>(q8);
                     const float ad =
                             *reinterpret_cast<const float *>(q8 + 288);
@@ -202,7 +202,7 @@ namespace {
         Int8Pack::packMma(src, rows, cols, pm.b.data(), pm.scales.data());
     }
 
-} // namespace
+}// namespace
 
 class MmqParityTest : public ::testing::Test {};
 
@@ -399,4 +399,4 @@ TEST_F(MmqParityTest, RealModelKernelMatchesReference) {
     EXPECT_TRUE(ran);
 }
 
-#endif // USE_CUDA
+#endif// USE_CUDA

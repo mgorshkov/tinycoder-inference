@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.18.0)
 
 set(PROJECT_NAME tinycoder_unit_tests)
 
-project(${PROJECT_NAME} VERSION 0.4.0 DESCRIPTION "TinyCoder Inference Unit Tests")
+project(${PROJECT_NAME} VERSION 0.5.0 DESCRIPTION "TinyCoder Inference Unit Tests")
 
 include(FetchContent)
 
@@ -39,6 +39,20 @@ target_link_libraries(tinycoder_test
     gtest
     tinycoder_core
 )
+
+# ---- Toolchain workaround (CUDA + GCC) ----
+# nvcc's device-link step injects `-L/usr/lib/gcc/x86_64-linux-gnu/<N>` ahead of
+# the host C++ runtime, so the driver's implicit `-lstdc++` resolves to the
+# gcc-<N> libstdc++ (a build that predates CXXABI_1.3.15).  googletest's
+# `main` references `__cxa_call_terminate`, which only the newer SYSTEM
+# libstdc++ defines, so the test fails to link with:
+#   undefined reference to `__cxa_call_terminate'
+# Appending the system libstdc++ by full path (after the other libs) restores
+# the symbol without changing the CPU-only build.  Guarded by an EXISTS check
+# so a non-standard layout is simply left to the default toolchain.
+if(ENABLE_CUDA AND NOT APPLE AND EXISTS "/usr/lib/x86_64-linux-gnu/libstdc++.so.6")
+    target_link_libraries(tinycoder_test PRIVATE /usr/lib/x86_64-linux-gnu/libstdc++.so.6)
+endif()
 
 # ---- Standalone logits probe (diagnostic; not a gtest) ----
 # Links the same way as tinycoder_test so CUDA separable compilation,

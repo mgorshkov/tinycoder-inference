@@ -73,6 +73,8 @@ namespace tinycoder {
                 return 2;
             case GGML_TYPE_I32:
                 return 4;
+            case GGML_TYPE_BF16:
+                return 2;// 2 bytes/element (no quantized block)
             // Quantized types: bytes per block
             // Reference: quants.h (block_q4_0, block_q4_1, etc.)
             case GGML_TYPE_Q4_0:
@@ -115,6 +117,8 @@ namespace tinycoder {
                 return 82;// 256 weights in 82 bytes (block_iq2_s)
             case GGML_TYPE_IQ4_XS:
                 return 136;// 256 weights: d(fp16,2) + scales_h(2) + scales_l(4) + qs(128) = 136 bytes (block_iq4_xs)
+            case GGML_TYPE_PQ2_0:
+                return 34;// 128 weights: d(fp16,2) + qs(32) = 34 bytes (block_pq2_0)
             default:
                 return 0;
         }
@@ -146,6 +150,8 @@ namespace tinycoder {
                 return 32;// 32 weights per block (block_iq4_nl)
             case GGML_TYPE_IQ3_XXS:
                 return 256;
+            case GGML_TYPE_PQ2_0:
+                return 128;// 128 weights per block (block_pq2_0, Prism-private)
             default:
                 return 1;
         }
@@ -369,6 +375,53 @@ namespace tinycoder {
                     file_.read(reinterpret_cast<char *>(&arrayType), sizeof(uint32_t));
                     uint64_t arrayLen;
                     file_.read(reinterpret_cast<char *>(&arrayLen), sizeof(uint64_t));
+
+                    // Prism Hadamard-fold arrays are captured whole in prism_
+                    // (they are large: sign_values has 28672 entries, weight_names
+                    // 401). The scalar metadata_ map cannot hold them.
+                    if (key.rfind("prism.hadamard.", 0) == 0) {
+                        if (arrayType == GGUF_TYPE_INT32) {
+                            std::vector<int32_t> vals(arrayLen);
+                            if (arrayLen > 0) {
+                                file_.read(reinterpret_cast<char *>(vals.data()),
+                                           static_cast<std::streamsize>(arrayLen) *
+                                                   sizeof(int32_t));
+                            }
+                            if (key == "prism.hadamard.sign_widths") {
+                                prism_.signWidths.assign(vals.begin(), vals.end());
+                            } else if (key == "prism.hadamard.sign_values") {
+                                prism_.signValues.resize(vals.size());
+                                for (size_t si = 0; si < vals.size(); ++si) {
+                                    prism_.signValues[si] =
+                                            static_cast<int8_t>(vals[si]);
+                                }
+                            }
+                        } else if (arrayType == GGUF_TYPE_STRING) {
+                            std::vector<std::string> vals(arrayLen);
+                            for (uint64_t j = 0; j < arrayLen; ++j) {
+                                uint64_t elemLen;
+                                file_.read(reinterpret_cast<char *>(&elemLen),
+                                           sizeof(uint64_t));
+                                vals[j].resize(elemLen);
+                                file_.read(vals[j].data(),
+                                           static_cast<std::streamsize>(elemLen));
+                            }
+                            if (key == "prism.hadamard.weight_names") {
+                                prism_.foldedWeights = std::move(vals);
+                            } else if (key == "prism.hadamard.inverse_weight_names") {
+                                prism_.inverseWeights = std::move(vals);
+                            }
+                        } else {
+                            uint32_t elemSize = ggufValueTypeSize(arrayType);
+                            if (elemSize > 0) {
+                                file_.seekg(static_cast<std::streamoff>(elemSize) *
+                                                    static_cast<std::streamoff>(arrayLen),
+                                            std::ios::cur);
+                            }
+                        }
+                        break;
+                    }
+
                     // Store first element for numeric arrays (used by parseArchKey)
                     // Some metadata (e.g. head_count_kv) is stored as per-layer arrays
                     if (arrayLen > 0) {
@@ -546,6 +599,17 @@ namespace tinycoder {
                 config_.vocabSize = std::stoul(metadata_[key]);
             } else if (key == "tokenizer.chat_template") {
                 config_.chatTemplate = metadata_[key];
+            } else if (key == "prism.hadamard.version") {
+                prism_.version = std::stoul(metadata_[key]);
+                prism_.present = true;
+            } else if (key == "prism.hadamard.block_size") {
+                prism_.blockSize = std::stoul(metadata_[key]);
+            } else if (key == "prism.hadamard.gdn_v_grouped") {
+                // Stored by the BOOL scalar path as the string "true"/"false"
+                // (see the GGUF_TYPE_BOOL case above), NOT a numeric literal —
+                // std::stoul("true") would throw std::invalid_argument.
+                const std::string &gv = metadata_[key];
+                prism_.gdnVGrouped = (gv == "true" || gv == "1");
             }
 
             // Architecture-specific keys - detect prefix from key

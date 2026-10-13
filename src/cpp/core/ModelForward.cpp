@@ -211,6 +211,25 @@ namespace tinycoder {
             });
         }
 
+        // TINYCODER_DUMP_NORM=1: dump the CPU's raw token-embedding row 0 so it
+        // can be compared against the GPU's [gpu emb] (Prism latent inverse
+        // lookup parity probe).
+        {
+            const char *dnE = std::getenv("TINYCODER_DUMP_NORM");
+            if (dnE != nullptr && dnE[0] != '\0' && dnE[0] != '0' && seqLen >= 1) {
+                double sq = 0.0;
+                for (uint32_t i = 0; i < hiddenSize; ++i) {
+                    sq += static_cast<double>(hiddenData[i]) * hiddenData[i];
+                }
+                std::fprintf(stderr,
+                             "[cpu emb] hidden[0..7]={%.6f %.6f %.6f %.6f %.6f "
+                             "%.6f %.6f %.6f} ||h||=%.3f\n",
+                             hiddenData[0], hiddenData[1], hiddenData[2],
+                             hiddenData[3], hiddenData[4], hiddenData[5],
+                             hiddenData[6], hiddenData[7], std::sqrt(sq));
+            }
+        }
+
         // Pre-allocate per-layer buffers (reused across layers)
         // attnNorm: [seqLen, hiddenSize]
         scratch.attnNorm.resize(static_cast<size_t>(seqLen) * hiddenSize);
@@ -1022,7 +1041,36 @@ namespace tinycoder {
                               seqLen == 1 && logitCount == 1 && logitStart == 0 &&
                               !lmHeadBounds_.empty() &&
                               lmHeadBoundsBlocksPerRow_ == (hiddenSize + 255) / 256;
-            if (usePruning) {
+            if (lmHead_.foldedWeight) {
+                // Prism folded LM head: output.weight was stored folded. Transform
+                // the (primal) hidden into the folded basis ONCE per token, then
+                // dot against the untouched PQ2_0 rows (dot(hs, W_folded_row) =
+                // W x). The transformed hidden lives in the calling thread's
+                // scratch and is read by the workers (same idiom as q8Hidden).
+                uint32_t bs = ggmlBlockSize(lmHead_.type);
+                uint32_t ts = ggmlTypeSize(lmHead_.type);
+                uint32_t nb = (hiddenSize + bs - 1) / bs;
+                for (uint32_t s = logitStart; s < logitStart + logitCount; ++s) {
+                    const float *hRow = hiddenData + s * hiddenSize;
+                    const float *hs = applyPrismTransform(hRow, hiddenSize, false);
+                    float *logitRow = logitsData + s * vocabSize;
+                    ThreadPool::instance().parallelFor(0, vocabSize, [&](uint32_t i) {
+                        const uint8_t *row = lmHead_.data.data() +
+                                             static_cast<uint64_t>(i) * nb * ts;
+                        double dot = 0.0;
+                        for (uint32_t b = 0; b < nb; ++b) {
+                            float blockOut[256];
+                            GGMLDequantize::dequantizeBlock(lmHead_.type,
+                                                            row + static_cast<uint64_t>(b) * ts,
+                                                            blockOut, bs);
+                            uint32_t start = b * bs;
+                            uint32_t n = std::min(bs, hiddenSize - start);
+                            dot += static_cast<double>(dotProductFMA(hs + start, blockOut, n));
+                        }
+                        logitRow[i] = static_cast<float>(dot);
+                    });
+                }
+            } else if (usePruning) {
                 uint32_t cand = computeLogitsTopK(
                         lmHead_.data.data(), lmHead_.type, lmHeadBounds_,
                         lmHeadBoundsBlocksPerRow_, lmHeadBoundsSubgroupsPerBlock_,

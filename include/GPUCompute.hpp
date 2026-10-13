@@ -139,6 +139,31 @@ namespace tinycoder::gpu {
         uint32_t expertUsedCount = 0;// routed top-k (8)
         uint32_t expertFF = 0;       // per-expert feed-forward width (512)
         uint32_t expertSharedFF = 0; // shared-expert FF width (512)
+
+        // ---- Prism Hadamard fold (Ternary-Bonsai-2-27B PQ2_0) ----
+        // 1 = the linear weights are stored folded (W @ H S P); the driver
+        // applies the forward activation transform (kPrismFold) before every
+        // folded projection and the inverse transform to the latent token
+        // embedding rows.  0 = plain model.
+        uint32_t prismFold = 0;
+        uint32_t prismBlock = 1024;// Hadamard block size (prism.hadamard.block_size)
+    };
+
+    /// @brief Host-side Prism sign vectors + geometry passed to upload().
+    /// The PQ2_0 fold applies a per-input-width sign vector (5120 / 6144 /
+    /// 17408 for Ternary-Bonsai-2-27B); each is the sign_widths slice of the
+    /// model's prism.hadamard.sign_values.  Widths with no sign vector are left
+    /// null (identity signs).
+    struct PrismGPUConfig {
+        bool enabled = false;
+        uint32_t blockSize = 1024;
+        bool gdnVGrouped = false;
+        const float *signs5120 = nullptr;
+        uint32_t n5120 = 0;
+        const float *signs6144 = nullptr;
+        uint32_t n6144 = 0;
+        const float *signs17408 = nullptr;
+        uint32_t n17408 = 0;
     };
 
     /// @brief GPU model runtime: owns device memory, hosts the persistent KV cache
@@ -162,6 +187,17 @@ namespace tinycoder::gpu {
                     const void *embedQ, uint32_t embedType, uint32_t embedRowBytes,
                     const void *lmHeadQ, uint32_t lmHeadType, uint32_t lmHeadRowBytes,
                     std::string &errMsg);
+        /// @brief Same as upload(), plus the Prism Hadamard-fold sign vectors.
+        /// When cfg.enabled, the driver applies the forward activation transform
+        /// before every folded PQ2_0 projection and the inverse transform to the
+        /// latent token-embedding rows.  The sign pointers are HOST pointers to
+        /// model-lifetime storage; upload() copies them to the device.
+        bool uploadWithPrism(const std::vector<DeviceLayer> &layers,
+                             const ModelGeometry &geom, const void *embedQ,
+                             uint32_t embedType, uint32_t embedRowBytes,
+                             const void *lmHeadQ, uint32_t lmHeadType,
+                             uint32_t lmHeadRowBytes, const PrismGPUConfig &prism,
+                             std::string &errMsg);
 
         /// @brief Copy the current GPU-side hidden state (after the offloaded layer
         /// prefix) back to the host.  Used by the partial-offload path: the caller
@@ -437,7 +473,7 @@ namespace tinycoder::gpu {
         // Grow-on-demand device scratch, sized for the current seqLen.
         // NOTE: fp16 scratch buffers are stored as uint16_t* (bit-compatible with
         // CUDA __half) so this header stays valid in host-only translation units;
-        // GPUCompute.cu casts them to __half*/__half2* at the use sites.
+        // the GPUCompute*.cu TUs cast them to __half*/__half2* at the use sites.
         struct DeviceScratch {
             int32_t *tokens = nullptr;
             float *hidden = nullptr;      // [seqLen][hidden]
@@ -465,7 +501,7 @@ namespace tinycoder::gpu {
             float *q35QGate = nullptr;
             // Q8_K-quantized activation scratch for the decode (seqLen==1) GEMV
             // of the IQ2_S/IQ3_XXS/IQ3_S matrices. Layout per block (stride
-            // kQ8K_STRIDE in GPUCompute.cu): int8 qs[256] + int16 bsums[16] +
+            // kQ8K_STRIDE in GPUComputeInternal.hpp): int8 qs[256] + int16 bsums[16] +
             // float d.
             uint8_t *q8k = nullptr;// [blocksPerRow * kQ8K_STRIDE] Q8_K activation
             // [seqLen][hidden] RMSNorm output.  The norm results must NOT be
@@ -791,6 +827,26 @@ namespace tinycoder::gpu {
         uint32_t embedRowBytes_ = 0;
         uint32_t lmHeadType_ = 0;
         uint32_t lmHeadRowBytes_ = 0;
+        // ---- Prism Hadamard fold device state (Ternary-Bonsai PQ2_0) ----
+        // prismFold_ is set from ModelGeometry.prismFold; when set, gemvFolded()
+        // transforms the activation before every folded PQ2_0 projection and
+        // the embedding kernel restores the latent token-embedding rows.
+        uint32_t prismBlock_ = 1024;
+        bool prismGdnVGrouped_ = false;
+        uint32_t prismHeadV_ = 0;   // dInner / nVHeads
+        uint32_t prismNk_ = 0;      // nKHeads
+        uint32_t prismRep_ = 0;     // nVHeads / nKHeads
+        float *signs5120_ = nullptr;// device per-feature signs
+        float *signs6144_ = nullptr;
+        float *signs17408_ = nullptr;
+        uint32_t nSigns5120_ = 0;
+        uint32_t nSigns6144_ = 0;
+        uint32_t nSigns17408_ = 0;
+        // Device scratch for the folded activation H S P x (preallocated in
+        // uploadWithPrism to the widest folded projection so no cudaMalloc
+        // happens during forward / CUDA-graph capture).
+        float *prismFoldBuf_ = nullptr;
+        uint64_t prismFoldBufBytes_ = 0;
         // Host mirror of the MoE router's top-k expert selection (qwen35moe).
         // The per-expert GEMVs need the SELECTED expert ids per token; the GPU
         // router kernel writes moeIdx on the device, so the driver copies the
@@ -962,6 +1018,22 @@ namespace tinycoder::gpu {
         /// @param outBuf Receives the (cached) fp16 scratch pointer.
         bool dequantMatrixF16(const DeviceMatrix &m, void **outBuf,
                               std::string &errMsg);
+
+        /// @brief Apply the Prism forward activation transform x' = H S P x into
+        /// the per-thread device scratch (_prismFoldBuf).  No-op (returns x) when
+        /// the model is not folded or the width carries no sign vector and no
+        /// GDN permutation.  @param cols activation width (= weight cols).
+        /// @param gdnPerm true for the ssm_out projection (applies the GDN
+        ///        value-head permutation first).
+        const float *prismFoldForward(const float *x, uint32_t cols, bool gdnPerm);
+
+        /// @brief device sign vector matching a width (5120/6144/17408) or null.
+        const float *prismSignsFor(uint32_t cols) const {
+            if (cols == 5120 && signs5120_ != nullptr) return signs5120_;
+            if (cols == 6144 && signs6144_ != nullptr) return signs6144_;
+            if (cols == 17408 && signs17408_ != nullptr) return signs17408_;
+            return nullptr;
+        }
     };
 
     /// @brief Global GPU enable flag (default ON in CUDA builds; $TINYCODER_GPU=0

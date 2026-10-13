@@ -14,7 +14,7 @@ cmake_minimum_required(VERSION 3.18.0)
 #   cmake --build build --config Release
 #   ctest --test-dir build            # when BUILD_TESTS=ON
 # ---------------------------------------------------------------------------
-project(tinycoder_inference VERSION 0.4.0 DESCRIPTION "High-Performant local inference engine" LANGUAGES CXX)
+project(tinycoder_inference VERSION 0.5.0 DESCRIPTION "High-Performant local inference engine" LANGUAGES CXX)
 enable_testing()
 
 # ---- Options ----
@@ -129,6 +129,10 @@ set(TINYCODER_HEADERS
     include/GGMLDequantize.hpp
     include/GGUFLoader.hpp
     include/GPUCompute.hpp
+    # GPUComputeInternal.hpp is a PRIVATE implementation detail of the CUDA
+    # engine (kernels/helpers shared by the split GPUCompute*.cu translation
+    # units).  It is intentionally NOT listed here so it is not installed as a
+    # public header.
     include/Int8Pack.hpp
     include/IQ3XXS.hpp
     include/LMHead.hpp
