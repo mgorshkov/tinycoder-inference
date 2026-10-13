@@ -116,6 +116,17 @@ namespace tinycoder {
         uint32_t attentionValueLength = 0;               // 0 = derived from headDim
         uint32_t ropeDimensionSections[4] = {0, 0, 0, 0};// MRoPE sections (t,h,w,e)
 
+        // ---- Prism Hadamard-fold (Ternary-Bonsai-2-27B PQ2_0) ----
+        // When prismFold is set, the model's linear weights were stored folded
+        // with a per-input-dimension normalized Walsh-Hadamard rotation (plus an
+        // optional sign flip), and the activation fed to every folded matmul
+        // must be transformed the same way; the token embedding table is stored
+        // latent and restored with the inverse transform. See
+        // include/PrismHadamard.hpp and GGUFLoader::PrismMetadata.
+        bool prismFold = false;       // prism.hadamard.version present
+        uint32_t prismBlockSize = 0;  // Hadamard block size (1024)
+        bool prismGdnVGrouped = false;// ssm_out needs the tiled→grouped perm
+
         // Runtime
         uint32_t nThreads = 4;// OpenMP threads
 

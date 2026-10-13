@@ -320,6 +320,13 @@ TEST_P(SampleQuestionTest, AnswersQuestion) {
     // not position-locked) carry over; the token floors are trivially met.
     const bool isQwen3527B = (cfg.architecture == ARCH_QWEN35 &&
                               cfg.hiddenSize == 5120 && cfg.numLayers == 65);
+    // Ternary-Bonsai-2-27B is a qwen35 (dense hybrid) Prism checkpoint with a
+    // 64-layer trunk (hidden 5120, 24 q-heads x 256) and a folded PQ2_0 export.
+    // It answers the same content-based keyword questions as the other >7B
+    // models, so accept it here (the token floor is trivially met and the
+    // C++/Python language guards still apply).
+    const bool isBonsai = (cfg.architecture == ARCH_QWEN35 &&
+                           cfg.hiddenSize == 5120 && cfg.numLayers == 64);
     // Qwen3.6-35B-A3B (qwen35moe arch, MoE gated-delta-net hybrid, hidden 2048)
     // is a sparse MoE of comparable intelligence; the same keyword assertions
     // carry over (content-based, not position-locked).  Both the
@@ -329,7 +336,7 @@ TEST_P(SampleQuestionTest, AnswersQuestion) {
                               cfg.hiddenSize == 2048 &&
                               (cfg.numLayers == 40 || cfg.numLayers == 41));
     if (!isGptQwen025B && !isQwen25Coder7B && !isQwen25Coder15B &&
-        !isQwen3527B && !isQwen35MoE) {
+        !isQwen3527B && !isBonsai && !isQwen35MoE) {
         GTEST_SKIP() << "generation keyword assertions validated against the "
                         "IQ3_XXS Qwen2-0.5B and Qwen2.5-Coder-7B reference "
                         "models plus the Qwen3.6-27B (qwen35) model; loaded "
@@ -343,7 +350,8 @@ TEST_P(SampleQuestionTest, AnswersQuestion) {
     // reference models.
     const uint32_t maxGenTokens =
             isQwen25Coder7B ? 96u
-                            : ((isQwen3527B || isQwen35MoE) ? 160u : 64u);
+                            : ((isQwen3527B || isBonsai || isQwen35MoE) ? 160u
+                                                                        : 64u);
 
     // Use formatChat() to build the prompt in an architecture-aware way
     std::string prompt = SharedTestEnv::model->formatChat(

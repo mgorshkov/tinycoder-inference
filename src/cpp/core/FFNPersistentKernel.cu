@@ -60,7 +60,7 @@ namespace cg = cooperative_groups;
 namespace tinycoder::gpu {
     namespace {
 
-        // GGML QK_K block byte sizes (kQ2K_BYTES matches GPUCompute.cu).
+        // GGML QK_K block byte sizes (kQ2K_BYTES matches GPUComputeInternal.hpp).
         constexpr uint32_t kQ2K_BYTES = 84;
         constexpr uint32_t kQ3K_BYTES = 110;
 
@@ -149,7 +149,7 @@ namespace tinycoder::gpu {
         }
 
         // Stride padded to 40 B so the int8 lanes and the 4-way u32 loads stay
-        // aligned (matches kQ8_1_STRIDE in GPUCompute.cu).
+        // aligned (matches kQ8_1_STRIDE in GPUComputeInternal.hpp).
         constexpr uint32_t kQ8_1_STRIDE = 40;
 
         // 4-rows-per-warp Q2_K x Q8_1 dp4a partial dot.  Same 8-lane geometry as
@@ -161,7 +161,7 @@ namespace tinycoder::gpu {
         // n, 32-group j): b*8 + n*4 + j (8 groups of 32 per Q2_K block).
         // dq/dmin/sc come from the Q2_K weight block exactly as in the float
         // path; the sc byte's low nibble is the d scale and high nibble the
-        // min.  Bit-identical to kQGemvQ2KxQ81_4xW (GPUCompute.cu).
+        // min.  Bit-identical to kQGemvQ2KxQ81_4xW (GPUComputeInternal.hpp).
         __device__ __forceinline__ float kFfnQ2KRowDot4W_Q81(
                 const uint8_t *__restrict__ rp, const uint8_t *__restrict__ sy,
                 uint32_t I, uint32_t isub, uint32_t blocksPerRow) {

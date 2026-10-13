@@ -10,7 +10,7 @@ namespace tinycoder::gpu {
     // IQ2_XS grid table: 512 entries, each storing 8 dequantized byte values
     // packed into a uint64_t (low byte = grid[0], high byte = grid[7]).
     // Byte-identical copy of ggml's iq2xs_grid in ggml-common.h.
-    __device__ uint64_t c_iq2xs_grid[512] = {
+    static __device__ uint64_t c_iq2xs_grid[512] = {
             0x0808080808080808,
             0x080808080808082b,
             0x0808080808081919,
@@ -525,7 +525,7 @@ namespace tinycoder::gpu {
             0x2b2b2b2b2b2b2b2b,
     };
 
-    __device__ uint32_t c_iq3s_grid[512] = {
+    static __device__ uint32_t c_iq3s_grid[512] = {
             0x01010101,
             0x01010103,
             0x01010105,
@@ -1040,7 +1040,7 @@ namespace tinycoder::gpu {
             0x0f0f0101,
     };
 
-    __device__ uint8_t c_ksigns_iq2xs[128] = {
+    static __device__ uint8_t c_ksigns_iq2xs[128] = {
             0,
             129,
             130,
@@ -1171,12 +1171,12 @@ namespace tinycoder::gpu {
             255,
     };
 
-    __device__ uint8_t c_kmask_iq2xs[8] = {1, 2, 4, 8, 16, 32, 64, 128};
+    static __device__ uint8_t c_kmask_iq2xs[8] = {1, 2, 4, 8, 16, 32, 64, 128};
 
     // IQ2_XXS grid table: 256 entries, each storing 8 dequantized byte values
     // packed into a uint64_t (low byte = grid[0], high byte = grid[7]).
     // Byte-identical copy of ggml's iq2xxs_grid (from GGMLDequantize::iq2xxs_grid).
-    __device__ uint64_t c_iq2xxs_grid[256] = {
+    static __device__ uint64_t c_iq2xxs_grid[256] = {
             0x0808080808080808,
             0x080808080808082b,
             0x0808080808081919,
@@ -1435,12 +1435,12 @@ namespace tinycoder::gpu {
             0x2b2b2b1908081908,
     };
 
-    __device__ int8_t c_kvalues_iq4nl[16] = {-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113};
+    static __device__ int8_t c_kvalues_iq4nl[16] = {-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113};
 
     // IQ2_S grid table: 1024 entries, each storing 8 dequantized byte values
     // packed into a uint64_t (low byte = grid[0], high byte = grid[7]).
     // Byte-identical copy of ggml's iq2s_grid (from GGMLDequantize::IQ2S_GRID).
-    __device__ uint64_t c_iq2s_grid[1024] = {
+    static __device__ uint64_t c_iq2s_grid[1024] = {
             0x0808080808080808,
             0x080808080808082b,
             0x0808080808081919,
@@ -2471,7 +2471,7 @@ namespace tinycoder::gpu {
     // IQ3_XXS grid table: 256 entries, each storing 4 dequantized byte values
     // packed into a uint32_t (low byte = grid[0], high byte = grid[3]).
     // Byte-identical copy of ggml's iq3xxs_grid (from GGMLDequantize::IQ3XXS_GRID).
-    __device__ uint32_t c_iq3xxs_grid[256] = {
+    static __device__ uint32_t c_iq3xxs_grid[256] = {
             0x04040404,
             0x04040414,
             0x04040424,

@@ -45,6 +45,48 @@ namespace tinycoder {
         rmsNormSIMD(x, out, weight, n);
     }
 
+    // -----------------------------------------------------------------------
+    // Prism Hadamard-fold activation transform.
+    //
+    // A folded weight was stored as W_folded = W @ (H S P), so feeding it the
+    // transformed activation H S P x reproduces the primal projection output:
+    //   y = W_folded @ (H S P x) = W @ x.
+    // The transform runs on the small activation vector (never the weight), so
+    // the PQ2_0 weights stay compressed in RAM/VRAM. The result is written to
+    // this thread's scratch pool, which is safe because call sites are
+    // single-threaded per invocation (and each thread owns its pool).
+    // -----------------------------------------------------------------------
+    const float *Model::applyPrismTransform(const float *x, uint32_t cols,
+                                            bool gdnPerm) const {
+        // Not a folded model, or the width carries no transform: identity.
+        if (!prismFold_ || prismBlockSize_ == 0) {
+            return x;
+        }
+        const float *signs = signFor(cols);
+        if (!gdnPerm && signs == nullptr) {
+            return x;
+        }
+
+        // GDN value-head geometry (ssm_out only): the fold groups the value
+        // feature axis, so the activation is permuted to that order first.
+        uint32_t headV = 0, nk = 0, rep = 0;
+        if (gdnPerm && prismGdnVGrouped_) {
+            const uint32_t nVHeads = config_.ssmTimeStepRank;
+            nk = config_.ssmGroupCount;
+            if (nk > 0 && nVHeads % nk == 0 && cols % nVHeads == 0) {
+                headV = cols / nVHeads;
+                rep = nVHeads / nk;
+            }
+        }
+
+        ScratchPool &sp = scratchPool();
+        sp.prismAct.resize(cols);
+        float *dst = sp.prismAct.data();
+        std::memcpy(dst, x, cols * sizeof(float));
+        prism::applyFoldForward(dst, cols, prismBlockSize_, signs, headV, nk, rep);
+        return dst;
+    }
+
     void Model::ensureRoPETables(uint32_t neededPos) {
         uint32_t headDim = config_.headDim;
         float theta = config_.ropeTheta;

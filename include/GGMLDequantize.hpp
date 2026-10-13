@@ -1343,12 +1343,79 @@ namespace tinycoder {
         /// @param out       Output buffer (must hold at least blockSize floats).
         /// @param blockSize Number of elements in the block (e.g., 256 for K-quant,
         /// 32 for Q5_1).
+        // -----------------------------------------------------------------------
+        // bfloat16 (type 30): 1 sign + 8 exp + 7 mantissa. Convert to fp32 by
+        // zero-extending the low 16 bits. Only used by the Ternary-Bonsai
+        // ssm_alpha/ssm_beta tensors, converted to F32 at load time.
+        // -----------------------------------------------------------------------
+        static float bf16ToFloat(uint16_t h) {
+            uint32_t f = static_cast<uint32_t>(h) << 16;
+            float v;
+            std::memcpy(&v, &f, sizeof(float));
+            return v;
+        }
+
+        // -----------------------------------------------------------------------
+        // PQ2_0 (Prism-private type 142): identical 2-bit codec to Q2_0 but with
+        // a single fp16 scale per 128 weights. Block = fp16 d (2 B) + qs[32]
+        // (32 B, 4 two-bit values per byte) = 34 bytes.
+        // Dequant: value = (q - 1) * d, q in {0,1,2,3} (00=-1, 01=0, 10=+1, 11=+2).
+        // -----------------------------------------------------------------------
+        static void dequantizePQ2_0Block(const uint8_t *blockData, float *out) {
+            const float d =
+                    halfToFloat(*reinterpret_cast<const uint16_t *>(blockData));
+            const uint8_t *qs = blockData + 2;
+            for (uint32_t j = 0; j < 128; ++j) {
+                const uint8_t q = (qs[j >> 2] >> ((j & 3) * 2)) & 0x03;
+                out[j] = static_cast<float>(static_cast<int>(q) - 1) * d;
+            }
+        }
+
+        static std::vector<float> dequantizePQ2_0(const uint8_t *data,
+                                                  uint64_t numElements) {
+            constexpr uint32_t QK = 128;
+            constexpr uint32_t BLOCK_BYTES = 34;
+            std::vector<float> result(numElements);
+            const uint64_t numBlocks = (numElements + QK - 1) / QK;
+            for (uint64_t b = 0; b < numBlocks; ++b) {
+                const uint64_t start = b * QK;
+                const uint32_t n =
+                        static_cast<uint32_t>(std::min<uint64_t>(QK, numElements - start));
+                float blockOut[QK];
+                dequantizePQ2_0Block(data + b * BLOCK_BYTES, blockOut);
+                for (uint32_t i = 0; i < n; ++i) {
+                    result[start + i] = blockOut[i];
+                }
+            }
+            return result;
+        }
+
+        static float dotProductPQ2_0(const uint8_t *blockData, const float *x) {
+            const float d =
+                    halfToFloat(*reinterpret_cast<const uint16_t *>(blockData));
+            const uint8_t *qs = blockData + 2;
+            float acc = 0.0f;
+            for (uint32_t j = 0; j < 128; ++j) {
+                const uint8_t q = (qs[j >> 2] >> ((j & 3) * 2)) & 0x03;
+                acc += static_cast<float>(static_cast<int>(q) - 1) * x[j];
+            }
+            return acc * d;
+        }
+
         static void dequantizeBlock(uint32_t ggmlType, const uint8_t *blockData,
                                     float *out, uint32_t blockSize) {
             switch (ggmlType) {
                 case GGML_TYPE_F32:
                     std::memcpy(out, blockData, blockSize * sizeof(float));
                     break;
+                case GGML_TYPE_F16: {
+                    const uint16_t *h =
+                            reinterpret_cast<const uint16_t *>(blockData);
+                    for (uint32_t i = 0; i < blockSize; ++i) {
+                        out[i] = halfToFloat(h[i]);
+                    }
+                    break;
+                }
                 case GGML_TYPE_Q5_0:
                     dequantizeQ5_0Block(blockData, out);
                     break;
@@ -1399,6 +1466,13 @@ namespace tinycoder {
                     break;
                 case GGML_TYPE_IQ4_XS:
                     dequantizeIQ4_XSBlock(blockData, out);
+                    break;
+                case GGML_TYPE_PQ2_0:
+                    dequantizePQ2_0Block(blockData, out);
+                    break;
+                case GGML_TYPE_BF16:
+                    out[0] = bf16ToFloat(
+                            *reinterpret_cast<const uint16_t *>(blockData));
                     break;
                 default: {
                     auto deq = dequantize(ggmlType, blockData, blockSize);
@@ -2188,6 +2262,8 @@ namespace tinycoder {
                     return dotProductIQ2_XXS(blockData, x);
                 case GGML_TYPE_IQ3_S:
                     return dotProductIQ3_S(blockData, x);
+                case GGML_TYPE_PQ2_0:
+                    return dotProductPQ2_0(blockData, x);
                 default: {
                     // Fallback: dequantize then dot product
                     float blockOut[256];
@@ -2233,6 +2309,8 @@ namespace tinycoder {
                     return dotProductIQ2_XXS;
                 case GGML_TYPE_IQ3_S:
                     return dotProductIQ3_S;
+                case GGML_TYPE_PQ2_0:
+                    return dotProductPQ2_0;
                 default:
                     return nullptr;
             }
@@ -2393,6 +2471,14 @@ namespace tinycoder {
                     std::memcpy(result.data(), data, numElements * sizeof(float));
                     return result;
                 }
+                case GGML_TYPE_F16: {
+                    std::vector<float> result(numElements);
+                    const uint16_t *h = reinterpret_cast<const uint16_t *>(data);
+                    for (uint64_t i = 0; i < numElements; ++i) {
+                        result[i] = halfToFloat(h[i]);
+                    }
+                    return result;
+                }
                 case GGML_TYPE_Q5_0:
                     return dequantizeQ5_0(data, numElements);
                 case GGML_TYPE_Q5_1:
@@ -2427,6 +2513,8 @@ namespace tinycoder {
                     return dequantizeIQ4_NL(data, numElements);
                 case GGML_TYPE_IQ4_XS:
                     return dequantizeIQ4_XS(data, numElements);
+                case GGML_TYPE_PQ2_0:
+                    return dequantizePQ2_0(data, numElements);
                 default:
                     return {};// Unsupported
             }

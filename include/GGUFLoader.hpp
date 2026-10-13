@@ -60,10 +60,36 @@ enum GGMLType : uint32_t {
     GGML_TYPE_I8 = 24,
     GGML_TYPE_I16 = 25,
     GGML_TYPE_I32 = 26,
-    GGML_TYPE_COUNT = 27,
+    // bfloat16 (2 bytes/element). Used by the Ternary-Bonsai-2-27B export for
+    // the ssm_alpha / ssm_beta projection matrices (converted to F32 at load).
+    GGML_TYPE_BF16 = 30,
+    // Prism-private 2-bit type (Ternary-Bonsai PQ2_0 export): identical 2-bit
+    // codec to Q2_0 but with one fp16 scale per 128 weights (34-byte block).
+    GGML_TYPE_PQ2_0 = 142,
+    GGML_TYPE_COUNT = 143,
 };
 
 namespace tinycoder {
+
+    /// @brief Prism "Hadamard fold" metadata (prism.hadamard.* keys) for the
+    /// Ternary-Bonsai-2-27B export. When present, the listed linear weights are
+    /// stored pre-folded with a per-input-dimension rotation, so the activation
+    /// fed to each such matmul must undergo the same transform (sign flip +
+    /// blockwise normalized Hadamard rotation). The token embedding is stored
+    /// "latent" and its looked-up rows must be restored with the inverse
+    /// transform. See include/PrismHadamard.hpp.
+    struct PrismMetadata {
+        bool present = false;
+        uint32_t version = 0;
+        uint32_t blockSize = 0;                 // Hadamard block size (1024)
+        bool gdnVGrouped = false;               // ssm_out value-head tiled→grouped perm
+        std::vector<std::string> foldedWeights; // weights needing forward fold
+        std::vector<std::string> inverseWeights;// latent tables needing inverse
+        // Per-input-dimension sign vectors (width → ±1 values), concatenated in
+        // prism.hadamard.sign_values and sliced by prism.hadamard.sign_widths.
+        std::vector<uint32_t> signWidths;
+        std::vector<int8_t> signValues;// concatenated per-width ±1 values
+    };
 
     /// @brief Get the byte size of one block for a GGML quantization type.
     /// For non-quantized types (F32, etc.), returns 1.
@@ -97,6 +123,10 @@ namespace tinycoder {
 
         /// @brief Get the model configuration parsed from GGUF metadata.
         const ModelConfig &config() const { return config_; }
+
+        /// @brief Prism Hadamard-fold metadata (empty/`present == false` for
+        /// every non-Prism model).
+        const PrismMetadata &prism() const { return prism_; }
 
         /// @brief Get raw tensor data by name.
         /// @param name Tensor name (e.g., "blk.0.attn_q.weight")
@@ -157,6 +187,11 @@ namespace tinycoder {
 
         // Metadata storage
         std::unordered_map<std::string, std::string> metadata_;
+
+        // Prism Hadamard-fold metadata (parsed from the prism.hadamard.* keys
+        // during readMetadata; captured here because sign_values / weight_names
+        // are large arrays that the scalar metadata_ map does not retain).
+        PrismMetadata prism_;
 
         // Tensor storage
         std::vector<GGUFTensorInfo> tensorInfos_;

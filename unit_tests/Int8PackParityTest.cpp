@@ -115,16 +115,16 @@ namespace {
         for (size_t li = 0; li < layers.size(); ++li) {
             const auto &L = layers[li];
             const QuantizedMatrix *ms[] = {
-                    &L.attnQ,       &L.attnK,       &L.attnV,       &L.attnO,
-                    &L.ffnGate,     &L.ffnUp,       &L.ffnDown,     &L.attnQKV,
-                    &L.attnGate,    &L.ssmAlphaQ,   &L.ssmBetaQ,    &L.ssmOut,
-                    &L.ffnGateExps, &L.ffnUpExps,   &L.ffnDownExpsMoe,
+                    &L.attnQ, &L.attnK, &L.attnV, &L.attnO,
+                    &L.ffnGate, &L.ffnUp, &L.ffnDown, &L.attnQKV,
+                    &L.attnGate, &L.ssmAlphaQ, &L.ssmBetaQ, &L.ssmOut,
+                    &L.ffnGateExps, &L.ffnUpExps, &L.ffnDownExpsMoe,
                     &L.ffnGateShexp, &L.ffnUpShexp, &L.ffnDownShexp};
             const char *ns[] = {
-                    "attnQ",       "attnK",       "attnV",       "attnO",
-                    "ffnGate",     "ffnUp",       "ffnDown",     "attnQKV",
-                    "attnGate",    "ssmAlphaQ",   "ssmBetaQ",    "ssmOut",
-                    "ffnGateExps", "ffnUpExps",   "ffnDownExpsMoe",
+                    "attnQ", "attnK", "attnV", "attnO",
+                    "ffnGate", "ffnUp", "ffnDown", "attnQKV",
+                    "attnGate", "ssmAlphaQ", "ssmBetaQ", "ssmOut",
+                    "ffnGateExps", "ffnUpExps", "ffnDownExpsMoe",
                     "ffnGateShexp", "ffnUpShexp", "ffnDownShexp"};
             for (size_t i = 0; i < sizeof(ms) / sizeof(ms[0]); ++i) {
                 if (!ms[i]->empty() && ms[i]->type == GGML_TYPE_IQ3_XXS) {

@@ -25,6 +25,7 @@ SOFTWARE.
 #include "GGMLDequantize.hpp"
 #include "GGUFLoader.hpp"
 #include "Model.hpp"
+#include "PrismHadamard.hpp"
 #include "SIMDMatMulVec.hpp"
 #include <algorithm>
 #include <cstdint>
@@ -70,11 +71,24 @@ namespace tinycoder {
                 result[i] = blockOut[i - start];
             }
         }
+        // Prism latent embedding: the stored row is folded (rotated); restore the
+        // primal basis with the inverse transform (rotate H, then sign S).
+        if (isLatentPrism) {
+            prism::applyInverseLookup(result.data(), hiddenSize, hadamardBlockSize,
+                                      signs.empty() ? nullptr : signs.data());
+        }
         return result;
     }
 
     float Model::QuantizedEmbedding::dotRow(const float *vec,
                                             uint32_t tokenId) const {
+        // Prism latent embedding: the stored row is folded, so restore it to the
+        // primal basis first (the fast block-accumulation path below would
+        // otherwise dot against the rotated basis).
+        if (isLatentPrism) {
+            std::vector<float> row = getRow(tokenId);
+            return dotProductFMA(vec, row.data(), hiddenSize);
+        }
         // Compute dot product of vec with a single quantized embedding row.
         // Dequantize one block at a time and accumulate the dot product directly,
         // avoiding the intermediate float vector allocation.
