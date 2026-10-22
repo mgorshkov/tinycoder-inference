@@ -153,10 +153,29 @@ namespace tinycoder {
         return rendered;
     }
 
+    void Model::armAbortPredicate(AbortPredicate pred) {
+        abortPredicate_ = std::move(pred);
+        aborted_ = false;
+    }
+
+    bool Model::abortRequested() const {
+        if (aborted_) {
+            return true;
+        }
+        if (abortPredicate_ && abortPredicate_()) {
+            aborted_ = true;
+            return true;
+        }
+        return false;
+    }
+
     std::vector<int32_t>
     Model::generate(const std::string &prompt, const InferenceParams &params,
                     std::function<bool(int32_t, const std::string &)> callback) {
         if (!loaded_) {
+            return {};
+        }
+        if (abortRequested()) {
             return {};
         }
 
@@ -180,6 +199,12 @@ namespace tinycoder {
         // embedding matrix per token).
         auto tPrefill0 = std::chrono::high_resolution_clock::now();
         auto logits = forward(tokens, false);
+        // A cooperative abort during prefill returns an uninitialized (but
+        // correctly sized) logits array and leaves kvCache_.pos untouched;
+        // bail out before sampling.
+        if (abortRequested()) {
+            return {};
+        }
         auto tPrefill1 = std::chrono::high_resolution_clock::now();
         auto prefillMs =
                 std::chrono::duration_cast<std::chrono::milliseconds>(tPrefill1 - tPrefill0).count();
@@ -248,6 +273,11 @@ namespace tinycoder {
         // path and only when topK is finite (>= 1).
         std::vector<int32_t> forceInclude;
         for (int32_t i = 1; i < params.maxTokens; ++i) {
+            // Cooperative abort between decoded tokens (cheap; complements the
+            // per-layer check inside forward()).
+            if (abortRequested()) {
+                break;
+            }
             // Forward pass for single token (P0 top-K pruning of the LM head).
             forceInclude.clear();
             if (params.repeatPenalty != 1.0f && !penaltyHistory.empty()) {
