@@ -24,6 +24,7 @@ SOFTWARE.
 
 #include "MemHints.hpp"
 #include "Model.hpp"
+#include "ThreadPool.hpp"
 
 #include "GGMLDequantize.hpp"
 #include "ModelInternal.hpp"
@@ -222,6 +223,25 @@ namespace tinycoder {
         if (!initKVCache()) {
             setError("Failed to initialize KV cache (out of memory?)");
             return false;
+        }
+
+        // Initialize the shared CPU thread pool from the configured thread
+        // count so the per-layer / per-block parallelFor dispatches actually run
+        // on multiple workers. Without this the pool is never created and every
+        // parallel region silently runs serially on the calling thread (the
+        // observed 0% multi-core utilisation). ThreadPool::initialize is
+        // idempotent (the first call wins), so an explicit tc_engine_set_threads
+        // wins when it ran first.
+        {
+            auto &pool = ThreadPool::instance();
+            if (!pool.isInitialized()) {
+                size_t n = config_.nThreads > 0
+                                   ? static_cast<size_t>(config_.nThreads)
+                                   : ThreadPool::recommendedThreadCount();
+                pool.initialize(n);
+                std::cout << "[TinyCoder] CPU thread pool initialized with " << n
+                          << " threads" << std::endl;
+            }
         }
 
         loaded_ = true;

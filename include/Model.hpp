@@ -328,6 +328,12 @@ namespace tinycoder {
         /// @param stage Description of the current loading stage
         using ProgressCallback = std::function<void(float progress, const std::string &stage)>;
 
+        /// @brief Cooperative abort predicate. Returns true to request a stop.
+        /// Polled inside forward()'s per-layer loop and generate()'s per-token
+        /// loop, so a long generation can be interrupted without waiting for a
+        /// token callback.
+        using AbortPredicate = std::function<bool()>;
+
         Model();
         ~Model();
 
@@ -388,6 +394,13 @@ namespace tinycoder {
         std::vector<int32_t>
         generate(const std::string &prompt, const InferenceParams &params,
                  std::function<bool(int32_t, const std::string &)> callback);
+
+        /// @brief Arm (or clear, with nullptr) the cooperative abort predicate
+        /// consulted between per-layer / per-token units of work.
+        void armAbortPredicate(AbortPredicate pred);
+
+        /// @brief True when the armed abort predicate reported cancellation.
+        bool abortRequested() const;
 
         /// @brief Get the KV cache size (number of cached tokens).
         size_t kvCacheSize() const { return kvCache_.pos; }
@@ -716,6 +729,13 @@ namespace tinycoder {
         int32_t pendingPruneTopK_ = 0;
         const std::vector<int32_t> *pendingForceInclude_ = nullptr;
         bool pendingPruneActive_ = false;
+
+        // Cooperative cancellation: armed per tc_engine_generate call and
+        // consulted inside forward()'s per-layer loop and generate()'s
+        // per-token loop. aborted_ latches the first true result so the
+        // predicate is not re-invoked (and stays true after generation ends).
+        AbortPredicate abortPredicate_;
+        mutable bool aborted_ = false;
 
         // Once P0 pruning is observed to be ineffective for this model/LM-head
         // (candidate set stays ~ the full vocab because the per-subgroup interval

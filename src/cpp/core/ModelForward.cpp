@@ -263,6 +263,12 @@ namespace tinycoder {
         // (their conv/GDN/KV state lives on the device); resume on the CPU from
         // gpuContinueLayer.  Pure-CPU runs start at layer 0.
         for (uint32_t layer = gpuContinueLayer; layer < nLayers; ++layer) {
+            // Cooperative cancellation: bail out between layers. The token
+            // callback alone cannot interrupt a single long prefill/decode
+            // forward pass, so the abort predicate must be polled here too.
+            if (abortRequested()) {
+                return np::Array<float>{};
+            }
             auto &w = layers_[layer];
 
             // qwen35 (dense) and qwen35moe share the SAME hybrid structure:
