@@ -750,6 +750,33 @@ namespace tinycoder::gpu {
         // (architecture == 0) uses it; qwen35 keeps fp32 (its GDN/full-attention
         // kernels index kvK_/kvV_ as float*).
         bool kvHalf_ = false;
+        // ---- KV-cache layer slotting ----
+        // Dense architectures allocate ONE KV slot per offloaded layer
+        // (kvLayerStride_ = maxSeqLen*kvHeads*headDim*elem, kvSlots_ = nGpu).
+        // qwen35/qwen35moe allocate slots ONLY for the FULL-ATTENTION layers:
+        // the recurrent gated-delta-net layers (the large majority — 48 of 64
+        // on Bonsai-2-27B) never store K/V, so slotting them wasted ~3/4 of the
+        // KV VRAM.  Layer L's slot index is floor(L / fullAttentionInterval)
+        // (the full-attention layers occur at L ≡ interval-1 (mod interval)),
+        // assigned in layer order; kvSlots_ is that count.  All KV indexing
+        // goes through kvLayerOffset() so the allocation and every use site
+        // stay in lockstep.
+        uint64_t kvLayerStride_ = 0;// bytes per KV slot (K or V), 0 = not allocated
+        uint32_t kvSlots_ = 0;      // number of KV slots actually allocated
+        uint64_t kvLayerOffset(uint32_t L) const {
+            uint32_t slot = L;
+            if ((geom_.architecture == 1u || geom_.architecture == 2u) &&
+                geom_.fullAttentionInterval > 0u) {
+                slot = L / geom_.fullAttentionInterval;
+            }
+            return static_cast<uint64_t>(slot) * kvLayerStride_;
+        }
+        // When true the [seqCap][vocab] logits scratch could not fit and was
+        // allocated for ONE token instead; the LM head then writes only the
+        // last token's logits into s.logits (computeAllLogits is never
+        // requested by the generation path, so this only affects the rare
+        // full-set request, which falls back to a per-token loop there).
+        bool logitsCapOneRow_ = false;
         // Qwen35 recurrent-state buffers: per GPU layer, conv state
         // [(convKernel-1) * convChannels] and gdn state [nVHeads*headV*headV]
         // (fp32; persistent across tokens, reset on clearKVCache).

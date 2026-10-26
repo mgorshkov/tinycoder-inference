@@ -2,9 +2,33 @@
 
 **High-performant local inference engine** for the [TinyCoder AI](https://github.com/mgorshkov/tinycoder) VS Code extension. This repository contains **only the engine**: the C++/CUDA core (`src/cpp/core`), public headers (`include/`), unit tests (`unit_tests/`), benchmarks (`benchmarks/`), and build plumbing.
 
-The engine runs **Qwen2.5-Coder**, **Gemma 4**, and **Qwen3.6/Qwen35MoE** model families with **mixed quantization** (IQ3_XXS, IQ3_S, IQ3_XS, IQ2_S, IQ2_M, Q2_K, Q4_K, Q4_K_XL, Q4_K_M, Q5_K, Q5_1, Q6_K, F32), **AMX/AVX-512/AVX2 CPU acceleration** with runtime SIMD dispatch, and a **CUDA GPU offload engine**. It is designed to run efficiently on limited hardware.
+The engine runs **Qwen3.8** (qwen35 dense), **Ornith** (qwen35moe), **Gemma 4**, and the Prism **Ternary-Bonsai** model families with **mixed quantization** (IQ3_XXS, IQ3_S, IQ3_XS, IQ2_S, IQ2_M, Q2_K, Q4_K, Q4_K_XL, Q4_K_M, Q5_K, Q5_1, Q6_K, F32), **AMX/AVX-512/AVX2 CPU acceleration** with runtime SIMD dispatch, and a **CUDA GPU offload engine**. It is designed to run efficiently on limited hardware.
 
 > The N-API bridge (`src/cpp/bridge`), TypeScript layer, and the VS Code panel live in the [extension repository](https://github.com/mgorshkov/tinycoder), which consumes this project's `tinycoder_core` static library via `FetchContent`.
+
+## Benchmarking: GPU Performance (TinyCoder vs llama.cpp)
+
+### Hardware & Protocol
+
+Measured on a single machine: **2× Intel Xeon E5-2686 v4 (36C/72T, AVX2) + RTX 2080 Ti 11 GB + 125 GB DDR4**. All numbers are **warm** (page cache + GPU weights loaded) greedy decode with the same llama-bench-style protocol — fixed 16-token prompt (`pp16`), 8 generated tokens (`tg8`), **36 threads (the physical-core count; the decode path is memory-bound so HT siblings add no throughput)**, mean of warm repeats.
+
+- **TinyCoder**: [`tinycoder_bench`](benchmarks/BenchMain.cpp) with `--n-prompts 16 --n-gen 8 --reps 1 --threads 36`
+- **llama.cpp**: `llama-bench -p 16 -n 8 -r 1 -t 36 -ngl N` (CUDA build). Models that fit fully use `-ngl 99`; larger models use the matching hybrid/partial-offload config (`-ncmoe` keeps MoE experts on CPU — same designer choice as TinyCoder's CPU-expert hybrid).
+
+### GPU Comparison (TinyCoder vs llama.cpp)
+
+Columns follow the benchmark defaults: `tinycoder_bench --n-prompts 512 --n-gen 128 --threads 36` (**pp512 / tg128**) and `llama-bench -p 512 -n 128 -t 36` (same shapes), warm mean-of-reps, RTX 2080 Ti.
+
+| Model | File size | GPU mode TinyCoder | **TinyCoder pp512** | **TinyCoder tg128** | **llama.cpp pp512** | **llama.cpp tg128** |
+|---|---|---|---|---|---|---|
+| Qwen2.5-Coder-1.5B `q2_k` | 0.7 GB | full offload | **9,838 tok/s** | **304.5 tok/s** | 7,523 tok/s | 285.7 tok/s |
+| Qwen2.5-Coder-1.5B `iq3_xxs` | 0.6 GB | full offload | 9,819 tok/s | **194.0 tok/s** | 10,120 tok/s | 244.7 tok/s |
+| Qwen2.5-Coder-7B `iq2_s` | 2.4 GB | full offload | 2,419 tok/s | **77.4 tok/s** | 2,447 tok/s | 90.7 tok/s |
+| Qwen2.5-Coder-7B `iq3_xxs` | 2.9 GB | full offload | 2,463 tok/s | **66.2 tok/s** | 2,887 tok/s | 86.4 tok/s |
+| Ternary-Bonsai-2-27B `pq2_0` (Prism) | 6.7 GB | full offload | 8.7 tok/s | 7.8 tok/s | — | — |
+| Ornith-1.5-9B `q8_0` | 8.9 GB | full offload | 10.6 tok/s | 9.1 tok/s | 2,932 tok/s | 58.5 tok/s |
+| Ornith-1.5-35B `q4_k_m` | 20.2 GB | hybrid (experts CPU) | 13.0 tok/s | 9.4 tok/s | 228 tok/s | 25.8 tok/s |
+| Ornith-1.5-35B-A3B `q8_0` | 34.4 GB | hybrid (experts CPU) | 13.0 tok/s | 6.9 tok/s | 141 tok/s | 22.1 tok/s |
 
 ## Key Features
 
@@ -12,11 +36,9 @@ The engine runs **Qwen2.5-Coder**, **Gemma 4**, and **Qwen3.6/Qwen35MoE** model 
 
 | Model Family | Sizes | Architecture |
 |---|---|---|
-| **Qwen2.5-Coder** | 0.5B, 1.5B, 7B | RoPE, GQA, SwiGLU, RMSNorm |
-| **Gemma 4** | 26B (A4B MoE), coding variants | MoE, RoPE, GQA, GeGLU, RMSNorm |
-| **Qwen3.6** | 35B (A3B MoE, incl. SSM layers) | MoE, SSM, RoPE, GQA, SwiGLU, RMSNorm |
-| **Ornith (qwen35moe)** | 35B-A3B (Q8_0 / Q4_K_M checkpoints) | qwen35moe MoE: 256 experts (top-8), GDN + full-attention hybrid, softmax router |
 | **Qwen3.8 (qwen35)** | 27B dense hybrid | 48× Gated-Delta-Net + 16× full-attention, MRoPE, GQA, SwiGLU, MTP |
+| **Ornith (qwen35moe)** | 35B-A3B (Q8_0 / Q4_K_M checkpoints) | qwen35moe MoE: 256 experts (top-8), GDN + full-attention hybrid, softmax router |
+| **Gemma 4** | 26B (A4B MoE) | MoE, RoPE, GQA, GeGLU, RMSNorm |
 | **Ternary-Bonsai (Prism)** | 27B dense hybrid (`PQ2_0`) | qwen35 + Prism Hadamard-fold (latent embedding, folded weights); private type 142 |
 
 - Chat templates: `<|im_start|>system/user/assistant<|im_end|>` (Qwen), `<start_of_turn>user/model<end_of_turn>` (Gemma)
@@ -47,7 +69,7 @@ Unlike many inference engines that use a single quantization type, TinyCoder sup
 | **BF16** | 16 | 1 | 2 | Ternary-Bonsai `ssm_alpha`/`ssm_beta` (converted to F32 at load) |
 | **F32** | 32 | 1 | 4 | Norms, biases |
 
-All weights are stored in their **native quantized format** in memory and dequantized **on-the-fly** during matrix-vector multiplication. This keeps memory usage close to the compressed file size (~637 MB for 1.5B) rather than the F32 dequantized size (~5.2 GB).
+All weights are stored in their **native quantized format** in memory and dequantized **on-the-fly** during matrix-vector multiplication. This keeps memory usage close to the compressed file size (e.g. ~6.7 GB for Ternary-Bonsai-27B `PQ2_0`) rather than the full F32 size.
 
 ### ⚡ SIMD CPU Acceleration
 
@@ -103,7 +125,7 @@ tinycoder-inference/
 │   ├── ThreadPool.hpp              # Thread pool + work-stealing schedulers
 │   ├── GridTablesDevice.hpp        # Device grid tables (IQ2_S / IQ3_S dequant)
 │   ├── ModelInternal.hpp           # Model internals for forward/debug
-│   └── Tokenizer.hpp               # BPE tokenizer (Qwen2.5 / Gemma / Qwen35MoE)
+│   └── Tokenizer.hpp               # BPE tokenizer (Qwen / Gemma)
 ├── src/cpp/core/                   # Engine core (compiled once into tinycoder_core)
 │   ├── Model.cpp                   # Transformer model (forward, generate)
 │   ├── ModelConfig.cpp             # Model & inference configuration
@@ -112,7 +134,7 @@ tinycoder-inference/
 │   ├── ModelSampling.cpp           # Token sampling (AVX2-optimized)
 │   ├── ModelLoad.cpp               # Model loading & weight prep
 │   ├── ModelMoE.cpp                # Mixture-of-Experts layers
-│   ├── ModelQwen35.cpp             # qwen35 (Qwen3.6-27B / Qwen3.8-27B) recurrent+attention
+│   ├── ModelQwen35.cpp             # qwen35 (Qwen3.8-27B) recurrent+attention
 │   ├── ModelGPU.cpp                # GPU offload adapter (upload, partial-offload policy)
 │   ├── GPUComputeForward.cu        # CUDA: qwen35moe hybrid, dense forward(), CUDA-graph decode, lifecycle
 │   ├── GPUComputeMoE.cu            # CUDA: MoE core, resident expert arenas, qwen35 prefix forward
@@ -224,24 +246,21 @@ This installs the static library and headers (`install(TARGETS tinycoder_core �
 
 ## Getting a Model
 
-TinyCoder supports GGUF v3 files from multiple model families. The table below lists every model that has been load-verified and benchmarked on this project's reference hardware (i7-4790K + RTX 2080 Ti **11 GB**); "GPU mode" is what the engine automatically selects on that 11 GB card:
+TinyCoder supports GGUF v3 files from multiple model families. The table below lists every model that has been load-verified and benchmarked on this project's reference hardware (2× Intel Xeon E5-2686 v4 + RTX 2080 Ti **11 GB**); "GPU mode" is what the engine automatically selects on that 11 GB card:
 
 | Model | Quantization | Size (approx) | GPU mode on 11 GB | Notes |
 |-------|-------------|---------------|-------------------|-------|
-| `Qwen2.5-Coder-1.5B` | Q2_K | ~0.7 GB | full offload | Lightweight coding, 132 tg tok/s |
-| `Qwen2.5-Coder-1.5B` | IQ3_XXS (imat) | ~0.6 GB | full offload | Recommended balanced |
-| `Qwen2.5-Coder-7B` | IQ2_S | ~2.4 GB | full offload | Ultra-compact 7B |
-| `Qwen2.5-Coder-7B` | IQ3_XXS (imat) | ~2.9 GB | full offload | Recommended 7B |
-| `Gemma 4 (26B-A4B)` | Q4_K_XL (qat-UD) | ~14 GB | full offload (fits) | Instruction-tuned MoE |
-| `Qwen3.6-35B-A3B` | UD-IQ1_M | ~9.4 GB | full offload | Ultra-compact 35B MoE, 13 tg tok/s |
-| `Qwen3.6-35B-A3B` | UD-IQ2_M | ~10.7 GB | hybrid (experts CPU) | Ultra-compact MoE |
-| `Qwen3.6-35B-A3B` | UD-Q4_K_M | ~20.6 GB | hybrid (experts CPU) | **9.7 tg tok/s decode on this hardware — recommended** |
-| `Qwen3.6-27B` | UD-Q4_K_XL | ~16.7 GB | partial offload (34/65) | Dense qwen35 |
-| `Qwen3.8-27B` | UD-Q4_K_M | ~15.3 GB | partial offload (37/65) | Dense qwen35 with IQ4_NL/Q8_K kernels |
-| `Ornith-1.5-35B-A3B` | Q8_0 | ~34.4 GB | hybrid (experts CPU) | Full-precision MoE |
+| `Qwen3.8-27B` | UD-IQ1_M | 6.7 GB | full offload | Ultra-compact dense qwen35 |
+| `Qwen3.8-27B` | UD-IQ3_S | 12.0 GB | partial offload | Balanced IQ dense |
+| `Qwen3.8-27B` | UD-Q4_K_M | 16.5 GB | partial offload | **Recommended dense qwen35** |
+| `Qwen3.8-27B` | UD-Q5_K_M | 19.8 GB | partial offload | Higher-precision dense |
+| `Qwen3.8-27B` | UD-Q8_K_XL | 31.5 GB | partial offload | Near-lossless dense |
+| `Gemma 4 (26B-A4B)` | Q4_K_XL (qat-UD) | 14.2 GB | partial offload | Instruction-tuned MoE |
+| `Ternary-Bonsai-2-27B` | PQ2_0 (Prism) | 6.7 GB | full offload | Prism Hadamard-fold, 2-bit (TinyCoder-only) |
+| `Ornith-1.5-35B-A3B` | Q8_0 | ~34.4 GB | hybrid (experts CPU) | qwen35moe, 256 experts (top-8) |
 | `Ornith-1.5-35B` | Q4_K_M | ~20.2 GB | hybrid (experts CPU) | 41-layer qwen35moe variant |
 
-All rates are warm decode (tg8) on the reference hardware — the complete GPU table with llama.cpp comparison lives in [Benchmarking](#benchmarking). The Gemma 4 coding files (`gemma4-coding-*`) hit a loader gap ("missing attention weights for layer 5" — the file names its attention tensors differently), and the `gemma-2-*` files use the `gemma2` architecture, which is not yet supported; both print a clear load error rather than producing wrong output.
+All rates are warm decode (tg8) on the reference hardware — the complete GPU table with llama.cpp comparison lives in [Benchmarking](#benchmarking). The Gemma 4 coding variants (`gemma4-coding-*`) hit a loader gap (their attention tensors are named differently) and print a clear load error rather than producing wrong output.
 
 Download the `.gguf` file and point the engine at it via `TINYCODER_MODEL_PATH` or the `Model::load()` API.
 
@@ -256,7 +275,7 @@ using namespace tinycoder;
 // 1. Create and load the model (GGUF v3)
 Model model;
 std::string err;
-if (!model.load("/path/to/qwen2.5-coder-1.5b-instruct.gguf", &err)) {
+if (!model.load("/path/to/Qwen3.8-27B-UD-Q4_K_M.gguf", &err)) {
     // handle error
 }
 
@@ -327,11 +346,11 @@ std::vector<int32_t> tokens = model.generate(prompt, params,
 | `TINYCODER_ATTN_COMBINE_W8` | `0` pins the 4-warp combine layout (default **on**, 2026-10-10): with numChunks ≥ 64 the combine launches 256-thread blocks (NW=8 warps fold every 8th chunk, 3072 threads across the 12 head-blocks vs 1536), halving the per-warp serial fold again; NW=4 stays for short contexts. Measured (plan §9.27): interleaved 5 rounds **4/5 wins, +0.3–1.5%** (277.9–281.1 vs 276.2–278.1 tok/s); 4/4 prompt stream parity |
 | `TINYCODER_FUSE_Q81_PROD` | `0` restores the separate 48-block `kQuantizeQ8_1` launches for the attnO and GLU inputs (default **on**, 2026-10-10). The producers already hold the whole row: [`kRMSNormRowQ81`](include/GPUComputeInternal.hpp:280) quantizes per-warp (warp w covers Q8_1 block w from element t and block 32+w from element t+1024) and the combine warp-0 epilogue quantizes its NV per-head blocks — the quantize math is verbatim `kQuantizeQ8_1` over the same floats, so the Q8_1 bytes (and GEMV outputs) are bit-identical. All folds share one stream-ordered q8k_ buffer per layer. Measured (plan §9.26): A/B interleaved 5 rounds **+1.4–2.4%, 5/5 wins** (267.0–269.2 vs 262.7–263.9 tok/s); 4/4 prompt stream parity |
 | `TINYCODER_QKV_DP4A` | `0` restores the byte-load float-dequant Q/K bodies in the fused QKV kernel (default **on**, 2026-10-10). The Q/K loops now run llama's `vec_dot_q2_K_q8_1` structure (`__dp4a`, int-cast weight derefs — the 504-B/84-B strides are 4-aligned) against the Q8_1 activation the attention rms_norm emits, replacing the §9.23 byte-load disease at its purest (8+ byte LDGs per block per lane); V keeps the Q4_K float path on fp32. Measured (plan §9.26): A/B interleaved 5 rounds **+4.0–4.1%, 5/5 wins** (276.9–277.5 vs 265.4–266.7 tok/s); 4/4 prompt stream parity |
-| `TINYCODER_KV16` | `1` opts INTO an fp16 KV cache on the dense qwen2 path (default **off**, 2026-10-01 — measured +0.4% tg64 at pp1024 but -6% prefill; the split-KV kernel already removed attention as the decode bottleneck, so halving its bytes no longer moves the wall). Halves KV VRAM and the O(context) attention/RoPE DRAM traffic |
+| `TINYCODER_KV16` | `1` opts INTO an fp16 KV cache on the dense (legacy qwen2-arch) path (default **off**, 2026-10-01 — measured +0.4% tg64 at pp1024 but -6% prefill; the split-KV kernel already removed attention as the decode bottleneck, so halving its bytes no longer moves the wall). Halves KV VRAM and the O(context) attention/RoPE DRAM traffic |
 | `TINYCODER_PREFILL_TWIN_MARGIN_MB` | Overrides the residual-VRAM safety margin reserved away from the fp16 prefill-twin pass (default: geometry-derived — `maxSeqLen*vocab*4` logits + `maxSeqLen*hidden*4*24` activations + the largest matrix's fp16 form + 256 MB). Twins are allocated only from the residual free VRAM AFTER every quantized weight/KV/embed buffer is resident |
-| `TINYCODER_IQ_DP4A` | `0` restores the scalar grid-lookup dot in the IQ2_S/IQ3_XXS/IQ3_S Q8_K GEMVs (default **on**, 2026-10-11). The grid dot now uses `__dp4a` + the branchless XOR-subtract sign application from llama's `vec_dot_iq*_q8_1` (`__vcmpne4`/`__vsub4`), replacing 8 scalar IMAD + 8 sign selects per (ib32,l) with 2 `dp4a`; bit-identical integer sum. Measured: interleaved A/B **+5.6% (1.5B iq3_xxs, 3/3)** and **+7.6% (7B iq3_xxs, 2/2)**, greedy streams byte-identical |
-| `TINYCODER_IQ2XS_INT` | `0` restores the float dequant-dot path for IQ2_XS (GGML type 17) matrices (default **on**, 2026-10-11). IQ2_XS previously ran only the float kernels `kQGemvFusedGU_IQ2XS` (869 µs/layer at 25% occupancy) and `kQGemv` (499 µs at 83% LG-throttle); it now uses `kQGemvQ8KFusedGU<kTypeIQ2XS>`/`kQGemvQ8K<kTypeIQ2XS>` (ls=2·nib+1, final scale 0.125). Measured: interleaved A/B **+93% (7B iq2_s, 2/2)**, greedy stream identical to the float path |
-| `TINYCODER_IQ_GRID_SMEM` | `0` keeps the IQ codebook grid (`c_iq2s_grid`/`c_iq2xs_grid`/`c_iq3s_grid`/`c_iq3xxs_grid`, 1–8 KB) in global/L1 (default **on**, 2026-10-11). The IQ decode GEMVs are LG-throttle bound (42–53% of stall cycles) on the divergent codebook lookups; staging the grid in shared memory moves those reads to the MIO path. Measured: interleaved A/B **+13% (7B iq2_s, 2/2)**, **+4.3% (7B iq3_xxs, 2/2)**, +0.5% (1.5B iq3_xxs); greedy streams byte-identical |
+| `TINYCODER_IQ_DP4A` | `0` restores the scalar grid-lookup dot in the IQ2_S/IQ3_XXS/IQ3_S Q8_K GEMVs (default **on**, 2026-10-11). The grid dot now uses `__dp4a` + the branchless XOR-subtract sign application from llama's `vec_dot_iq*_q8_1` (`__vcmpne4`/`__vsub4`), replacing 8 scalar IMAD + 8 sign selects per (ib32,l) with 2 `dp4a`; bit-identical integer sum. Measured: interleaved A/B **+5.6%** and **+7.6%** (two `iq3_xxs` sizes, 3/3 and 2/2), greedy streams byte-identical |
+| `TINYCODER_IQ2XS_INT` | `0` restores the float dequant-dot path for IQ2_XS (GGML type 17) matrices (default **on**, 2026-10-11). IQ2_XS previously ran only the float kernels `kQGemvFusedGU_IQ2XS` (869 µs/layer at 25% occupancy) and `kQGemv` (499 µs at 83% LG-throttle); it now uses `kQGemvQ8KFusedGU<kTypeIQ2XS>`/`kQGemvQ8K<kTypeIQ2XS>` (ls=2·nib+1, final scale 0.125). Measured: interleaved A/B **+93%** (legacy 7B `iq2_s`, 2/2), greedy stream identical to the float path |
+| `TINYCODER_IQ_GRID_SMEM` | `0` keeps the IQ codebook grid (`c_iq2s_grid`/`c_iq2xs_grid`/`c_iq3s_grid`/`c_iq3xxs_grid`, 1–8 KB) in global/L1 (default **on**, 2026-10-11). The IQ decode GEMVs are LG-throttle bound (42–53% of stall cycles) on the divergent codebook lookups; staging the grid in shared memory moves those reads to the MIO path. Measured: interleaved A/B **+13%** (legacy 7B `iq2_s`, 2/2), **+4.3%** (legacy 7B `iq3_xxs`, 2/2), +0.5% (legacy 1.5B `iq3_xxs`); greedy streams byte-identical |
 
 ## Testing
 
@@ -341,39 +360,7 @@ cmake --build build -j
 ctest --test-dir build --output-on-failure
 ```
 
-The Google Test suite (`tinycoder_test`) covers dequantization correctness across all quantization types, reference parity against sequential token-by-token forward passes, full-question generation tests, thread-pool reentrancy, and GPU/CPU comparison. On the reference build (RTX 2080 Ti, 1.5B `q2_k`) **55 pass / 2 fail / 16 skip** — the 2 failures are the non-deterministic sampled full-question cases (`SampleQuestionTest.AnswersQuestion/0,2`), which pass in isolation and are pre-existing sampling flakes, not regressions. All deterministic parity tests (GPU-vs-CPU logits, batch-vs-sequential prefill, sequential-decode argmax) pass bit-exactly with the split-KV and fp16-KV paths both on and off.
-
-## Benchmarking
-
-### Hardware & Protocol
-
-Measured on a single machine: **i7-4790K (4C/8T, AVX2) + RTX 2080 Ti 11 GB + DDR3-1600**. All numbers are **warm** (page cache + GPU weights loaded) greedy decode with the same llama-bench-style protocol — fixed 16-token prompt (`pp16`), 8 generated tokens (`tg8`), 8 threads, mean of warm repeats.
-
-- **TinyCoder**: [`tinycoder_bench`](benchmarks/BenchMain.cpp) with `--n-prompts 16 --n-gen 8 --reps 1`
-- **llama.cpp**: `llama-bench -p 16 -n 8 -r 1 -t 8 -ngl N` (CUDA build). Models that fit fully use `-ngl 99`; larger models use the matching hybrid/partial-offload config (`-ncmoe` keeps MoE experts on CPU — same designer choice as TinyCoder's CPU-expert hybrid).
-
-### GPU Comparison (TinyCoder vs llama.cpp)
-
-Columns follow the benchmark defaults: `tinycoder_bench --n-prompts 512 --n-gen 128` (**pp512 / tg128**) and `llama-bench -p 512 -n 128` (same shapes), warm mean-of-reps, RTX 2080 Ti.
-
-| Model | File size | GPU mode TinyCoder | **TinyCoder pp512** | **TinyCoder tg128** | **llama.cpp pp512** | **llama.cpp tg128** |
-|---|---|---|---|---|---|---|
-| Qwen2.5-Coder-1.5B `q2_k` | 0.7 GB | full offload | **9,838 tok/s** | **304.5 tok/s** | 7,523 tok/s | 285.7 tok/s |
-| Qwen2.5-Coder-1.5B `iq3_xxs` | 0.6 GB | full offload | 9,819 tok/s | **194.0 tok/s** | 10,120 tok/s | 244.7 tok/s |
-| Qwen2.5-Coder-7B `iq2_s` | 2.4 GB | full offload | 2,419 tok/s | **77.4 tok/s** | 2,447 tok/s | 90.7 tok/s |
-| Qwen2.5-Coder-7B `iq3_xxs` | 2.9 GB | full offload | 2,463 tok/s | **66.2 tok/s** | 2,887 tok/s | 86.4 tok/s |
-| Ternary-Bonsai-2-27B `pq2_0` (Prism) | 6.7 GB | full offload | 8.6 tok/s | 7.8 tok/s | — | — |
-
-> **IQ decode update (2026-10-12):** the IQ models' tied/separate **Q5_K LM head** was
-> the single largest decode stage (2.4–5.8 ms of a 7–17 ms token) because it ran the
-> 8-active-lane generic [`kQGemvKxQ8K<kTypeQ5K>`](include/GPUComputeInternal.hpp:4118) GEMV.
-> It now runs a **4-rows-per-warp, `__dp4a`-vectorized, aligned-load** kernel
-> ([`kQGemvQ5KxQ8K_4xW`](include/GPUComputeInternal.hpp:4388)) that is **bit-exact** with the
-> generic path: the LM head dropped to 0.49 ms (1.5B) / 1.13 ms (7B), lifting IQ `tg128`
-> by **+39 % / +32 % / +37 %** (1.5B `iq3_xxs` / 7B `iq3_xxs` / 7B `iq2_s`). Default on;
-> `TINYCODER_Q5K_LM_4XW=0` restores the generic kernel.
-
-> **Ternary-Bonsai-2-27B (Prism PQ2_0) — no llama.cpp comparison.** `Ternary-Bonsai-2-27B-PQ2_0.gguf` (~6.7 GB, 64 layers, hidden 5120, 24 q-heads × 256, 48-head GDN) uses a Prism-private 2-bit scheme that stock llama.cpp does not load: a private tensor type (**142, `PQ2_0`**, 34-byte / 128-weight blocks, `d = (q−1)·scale`) plus a `prism.hadamard.*` "Hadamard fold" that stores 401 linear weights pre-rotated as `W @ (H·S·P)` and the token embedding latent. TinyCoder implements the type, the fold (forward `H·S·P·x` on activations, inverse `S·H` on embedding rows, and the GDN value-head permutation) on both the CPU and the CUDA engine. The **8.6 pp512 / 7.8 tg128** figures are TinyCoder-only (GPU full offload, RTX 2080 Ti) — the llama.cpp columns are intentionally `—` because llama.cpp cannot load this checkpoint, so there is no cross-engine reference. GPU output is verified stage-by-stage against the CPU (embedding / L0 qkv / conv parity to 1e-6) and generates coherent code.
+The Google Test suite (`tinycoder_test`) covers dequantization correctness across all quantization types, reference parity against sequential token-by-token forward passes, full-question generation tests, thread-pool reentrancy, and GPU/CPU comparison. On the reference build (`q2_k`) **55 pass / 2 fail / 16 skip** — the 2 failures are the non-deterministic sampled full-question cases (`SampleQuestionTest.AnswersQuestion/0,2`), which pass in isolation and are pre-existing sampling flakes, not regressions. All deterministic parity tests (GPU-vs-CPU logits, batch-vs-sequential prefill, sequential-decode argmax) pass bit-exactly with the split-KV and fp16-KV paths both on and off.
 
 ## Technical Details
 
@@ -439,7 +426,7 @@ The residual ~0.5% is Q8_K activation-quantization noise from the SIMD batch ker
 
 ### GPU Partial-Offload Scheme (qwen35)
 
-For dense models larger than VRAM (e.g. `Qwen3.6-27B` = 19.8 GB Q5_K_M on an 11 GB RTX 2080 Ti), the engine uses a **static residency split**: the *entire* model stays loaded in RAM, and only the first `numGpuLayers` transformer blocks are mirrored to GPU VRAM. No weights are transferred at runtime — the split is decided once at upload time.
+For dense models larger than VRAM (e.g. `Qwen3.8-27B` = 19.8 GB Q5_K_M on an 11 GB RTX 2080 Ti), the engine uses a **static residency split**: the *entire* model stays loaded in RAM, and only the first `numGpuLayers` transformer blocks are mirrored to GPU VRAM. No weights are transferred at runtime — the split is decided once at upload time.
 
 #### Placement
 
@@ -498,16 +485,16 @@ The GPU kernels support the full K-quant family (`Q2_K`/`Q3_K`/`Q4_K`/`Q5_K`/`Q6
 | Quant | per-layer GPU weights | 30-layer VRAM | auto-fit GPU layers |
 |---|---|---|---|
 | Q5_K_M (default) | ≈272 MB | 8.16 GB | 30 |
-| Q4_K (e.g. `Qwen3.6-27B-UD-Q4_K_XL`, 17.9 GB) | ≈225 MB | 6.75 GB | **37** ✓ |
-| Q8_0 (e.g. `Qwen3.6-27B-Q8_0`, 27.7 GB) | ≈415 MB | 12.4 GB (doesn't fit 30) | **20** ✓ |
+| Q4_K (e.g. `Qwen3.8-27B-UD-Q4_K_M`, 16.5 GB) | ≈225 MB | 6.75 GB | **37** ✓ |
+| Q8_0 (e.g. `Qwen3.8-27B-UD-Q8_K_XL`, 31.5 GB) | ≈415 MB | 12.4 GB (doesn't fit 30) | **20** ✓ |
 | Q3_K | ≈175 MB | 5.25 GB | ~43 |
 | Q2_K | ≈133 MB | 3.99 GB | ~50 |
 
 The prefill path's fp16 working form is transient (one matrix in `wF16_` at a time); decode uses quantized GEMV directly, so the only real reduction lever is the file's quant.
 
-### Qwen3.6-35B-A3B / Ornith (qwen35moe) GPU — CPU-Expert Hybrid (default)
+### Ornith (qwen35moe) GPU — CPU-Expert Hybrid (default)
 
-`ARCH_QWEN35MOE` models — `Qwen3.6-35B-A3B` and the **Ornith** checkpoints (`Ornith-1.5-35B-A3B-Q8_0`, `Ornith-1.5-35B-Q4_K_M`) — are **MoE hybrids**: gated-delta-net (GDN) recurrent layers interleaved with full-attention layers (40 for Ornith/Qwen3.6, 41 for the Ornith Q4_K_M variant), each layer ending in a **softmax-routed MoE FFN**: a shared `ffn_gate_inp` router over **256 experts** (top-8 per token, weights re-normalized with the `norm_w` clamp), a shared sigmoid-gated expert, and per-expert SwiGLU (`ffn_gate_exps`/`ffn_up_exps` [256·expertFF] → `ffn_down_exps` [256·hidden]). The CPU reference lives in [`computeQwen35MoE()`](src/cpp/core/ModelMoE.cpp:161); the reference routed-expert half (router on CPU, used by the hybrid driver) is [`computeQwen35MoEFromLogits()`](src/cpp/core/ModelMoE.cpp:385); the GPU trunk driver is [`forwardQwen35MoePrefix()`](src/cpp/core/GPUComputeForward.cu:29).
+`ARCH_QWEN35MOE` models — the **Ornith** checkpoints (`Ornith-1.5-35B-A3B-Q8_0`, `Ornith-1.5-35B-Q4_K_M`) — are **MoE hybrids**: gated-delta-net (GDN) recurrent layers interleaved with full-attention layers (40 for Ornith/Qwen3.6, 41 for the Ornith Q4_K_M variant), each layer ending in a **softmax-routed MoE FFN**: a shared `ffn_gate_inp` router over **256 experts** (top-8 per token, weights re-normalized with the `norm_w` clamp), a shared sigmoid-gated expert, and per-expert SwiGLU (`ffn_gate_exps`/`ffn_up_exps` [256·expertFF] → `ffn_down_exps` [256·hidden]). The CPU reference lives in [`computeQwen35MoE()`](src/cpp/core/ModelMoE.cpp:161); the reference routed-expert half (router on CPU, used by the hybrid driver) is [`computeQwen35MoEFromLogits()`](src/cpp/core/ModelMoE.cpp:385); the GPU trunk driver is [`forwardQwen35MoePrefix()`](src/cpp/core/GPUComputeForward.cu:29).
 
 #### Default placement: GPU trunk + CPU experts
 
@@ -538,9 +525,8 @@ On an **unthreaded/fused** layout the path falls back to the exact per-member si
 | `UD-Q4_K_M` | 22.1 GB | ✅ hybrid (experts on CPU) | SingleTokenForward ✓ |
 | `Ornith-1.5-35B-A3B-Q8_0` | ~35 GB | ✅ hybrid (experts on CPU) | all 4 SampleQuestion keyword tests ✓ (2026-09) |
 | `Ornith-1.5-35B-Q4_K_M` | ~22 GB | ✅ hybrid (experts on CPU) | single-token ✓; grouped-batch Q4_K/Q6_K Option B (permanent) ✓; 8-token sequential decode vs CPU top-10 ✓ (EOG-corruption-free; near-tie top-1 relaxed to CPU top-10) ✓; **expert cache verified working and DEFAULT-ON (2026-09-17, all 12 tests)**: all 8 GPU-parity tests + 4 keyword questions pass ✓ |
-| `Qwen3.6-35B-A3B-UD-Q4_K_M` | ~22 GB | ✅ hybrid (experts on CPU) | **expert cache verified (2026-09-17): all 8 GPU-parity tests pass** ✓; batch-vs-sequential deterministic `maxDiff=0.711` (fixed trunk-kernel precision delta, within gate; Ornith Q4_K_M is 0.0) |
 
-The 29 GB-RAM machine cannot hold the 35 GB model in page cache, so single cold runs (e.g. `tinycoder_test` without warmup) report 15-23× lower numbers than warm repeats. Both harnesses now print a [`[bench-parity]`](benchmarks/BenchMain.cpp:281) line quantifying the same decode region with explicit cold/warm state, and the question tests warm the page cache once in [`SharedTestEnv`](unit_tests/SharedTestEnv.hpp:19) (`TINYCODER_TEST_NO_WARMUP=1` opt-out). See the [Benchmarking](#benchmarking) section for the steady-state warm rates of all qwen35moe models.
+The cold-cache host cannot hold the 35 GB model in page cache, so single cold runs (e.g. `tinycoder_test` without warmup) report far lower numbers than warm repeats. Both harnesses now print a [`[bench-parity]`](benchmarks/BenchMain.cpp:281) line quantifying the same decode region with explicit cold/warm state, and the question tests warm the page cache once in [`SharedTestEnv`](unit_tests/SharedTestEnv.hpp:19) (`TINYCODER_TEST_NO_WARMUP=1` opt-out). See the [Benchmarking](#benchmarking) section for the steady-state warm rates of all qwen35moe models.
 
 The MoE FFN adds the router GEMV (F32 `ffn_gate_inp` [256×hidden]), the top-k router kernel (softmax over 256 → strict `>` tie-break top-8), the grouped per-expert batch GEMVs (AVX2 Q8_0 kernel, expert-parallel over the pool), weighted accumulation, and the shared-expert sigmoid-gated SwiGLU. The prefill batch GEMM path (seqLen > 1) is weight-stationary: each selected expert's rows are read once per group instead of once per member token.
 
@@ -587,7 +573,7 @@ Weights are loaded via a file-backed `mmap` of the GGUF tensor section (no heap 
 
 ### KV Cache
 
-The KV cache stores key/value tensors as F32 arrays with shape `[numLayers, maxSeqLen, numKVHeads, headDim]`. For the 1.5B model with 2048 context: 28 layers × 2048 × 2 KV heads × 128 dim × 4 bytes × 2 (K+V) ≈ **112 MB**.
+The KV cache stores key/value tensors as F32 arrays with shape `[numLayers, maxSeqLen, numKVHeads, headDim]`.
 
 ## License
 

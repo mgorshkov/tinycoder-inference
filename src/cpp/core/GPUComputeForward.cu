@@ -456,10 +456,13 @@ namespace tinycoder::gpu {
                 kQ35MRoPE<<<dim3(seqLen, nKV), 32, 0, g_stream>>>(
                         s.k, seqLen, nKV, hd, nDims, pos, mropeCos_, mropeSin_);
                 // Store K/V into the layer's KV cache.
-                float *kvK = reinterpret_cast<float *>(kvK_) +
-                             static_cast<size_t>(L) * geom_.maxSeqLen * kvLen;
-                float *kvV = reinterpret_cast<float *>(kvV_) +
-                             static_cast<size_t>(L) * geom_.maxSeqLen * kvLen;
+                // Full-attention layer; the KV cache is slotted by
+                // floor(L/interval) (recurrent layers get no slot) — see
+                // kvLayerOffset().  qwen35 stores fp32 KV (kvHalf_ is dense-only).
+                float *kvK = reinterpret_cast<float *>(
+                                     static_cast<uint8_t *>(kvK_) + kvLayerOffset(L));
+                float *kvV = reinterpret_cast<float *>(
+                                     static_cast<uint8_t *>(kvV_) + kvLayerOffset(L));
                 kQ35StoreKV<<<seqLen, 256, 0, g_stream>>>(s.k, s.v, kvK, kvV,
                                                           seqLen, nKV, hd, pos);
                 // Flash attention (warp per (token, q-head), HD=256).
@@ -1784,7 +1787,8 @@ namespace tinycoder::gpu {
         uint32_t lmRowBytes =
                 lmHeadQ_ != nullptr ? lmHeadRowBytes_ : embedRowBytes_;
         uint32_t lmBlocks = hostBlocksPerRow(lmType, H);
-        if (computeAllLogits) {
+        // logitsCapOneRow_: ONE-row logits scratch -> last token only.
+        if (computeAllLogits && !logitsCapOneRow_) {
             for (uint32_t si = 0; si < seqLen; ++si) {
                 launchQGemv(lmType, lmQ, s.hidden + si * H,
                             s.logits + si * geom_.vocabSize, geom_.vocabSize, H,
@@ -2056,15 +2060,14 @@ namespace tinycoder::gpu {
         for (uint32_t L = 0; L < nGpu; ++L) {
             if (L == 0) TIMING_TAG("layer loop start");
             const DeviceLayer &w = layers_[L];
-            // Byte-offset the cache base by the element size selected at upload
-            // (fp16 when kvHalf_); the store/attention kernels are templated on
-            // the cache element type and reinterpret this pointer.
-            const uint64_t kvStride = static_cast<uint64_t>(geom_.maxSeqLen) * kvLen *
-                                      (kvHalf_ ? sizeof(__half) : sizeof(float));
-            void *kvK = static_cast<uint8_t *>(kvK_) +
-                        static_cast<size_t>(L) * kvStride;
-            void *kvV = static_cast<uint8_t *>(kvV_) +
-                        static_cast<size_t>(L) * kvStride;
+            // Byte-offset the cache base: kvLayerStride_ bakes in the element
+            // size selected at upload (fp16 when kvHalf_); the store/attention
+            // kernels are templated on the cache element type and reinterpret
+            // this pointer.  kvLayerOffset() maps L to its slot (identity for
+            // the dense arch, floor(L/interval) for qwen35/MoE, whose recurrent
+            // layers store no K/V).
+            void *kvK = static_cast<uint8_t *>(kvK_) + kvLayerOffset(L);
+            void *kvV = static_cast<uint8_t *>(kvV_) + kvLayerOffset(L);
             // Set by the fused-QKV branch (bias adds live in the GEMV
             // epilogues there); the seqLen==1 vs prefill split below reads it.
             bool biasesFolded = false;
@@ -2825,7 +2828,8 @@ namespace tinycoder::gpu {
         // its own D2H from scratch_.logits into the caller's buffer, so the
         // captured LM head must write its logits to the DEVICE scratch_.logits
         // and skip the host D2H during capture (replay copies them out).
-        if (computeAllLogits) {
+        // logitsCapOneRow_: ONE-row logits scratch -> last token only.
+        if (computeAllLogits && !logitsCapOneRow_) {
             for (uint32_t si = 0; si < seqLen; ++si) {
                 launchQGemv(lmType, lmQ, s.hidden + si * H,
                             s.logits + si * geom_.vocabSize, geom_.vocabSize, H,
@@ -2842,9 +2846,23 @@ namespace tinycoder::gpu {
             cudaEventRecord(evLmMid, g_stream);
         }
         if (!graphCaptureActive_) {
+            // Only a ONE-row s.logits scratch (logitsCapOneRow_) or a decode
+            // (seqLen==1) writes a single row, so D2H just that row.  The CALLER
+            // buffer shape follows the computeAllLogits request: 1 row when
+            // !computeAllLogits (always dst row 0) and seqLen rows otherwise (the
+            // one-row fallback then lands at the last row, leaving the rest of
+            // the caller's array untouched — matching the CPU path, which also
+            // populates only the last row when computeAllLogits==false).
+            const bool writeAll = computeAllLogits && !logitsCapOneRow_;
+            const uint32_t rows = writeAll ? seqLen : 1u;
+            const uint32_t dstRow =
+                    (computeAllLogits && logitsCapOneRow_ && seqLen > 0u)
+                            ? seqLen - 1u
+                            : 0u;
             const uint64_t nL =
-                    static_cast<uint64_t>(computeAllLogits ? seqLen : 1u) *
-                    geom_.vocabSize;
+                    static_cast<uint64_t>(rows) * geom_.vocabSize;
+            float *dst = logitsOut +
+                         static_cast<uint64_t>(dstRow) * geom_.vocabSize;
             const char *pdE = std::getenv("TINYCODER_PINNED_D2H");
             const bool usePinned = (pdE == nullptr || pdE[0] != '0');
             if (usePinned && (lmPinned_ == nullptr ||
@@ -2855,12 +2873,11 @@ namespace tinycoder::gpu {
                 cudaError_t pe = cudaHostAlloc(
                         &lmPinned_,
                         static_cast<uint64_t>(geom_.vocabSize) * sizeof(float) *
-                                (computeAllLogits ? seqLen : 1u),
+                                rows,
                         cudaHostAllocDefault);
                 if (pe == cudaSuccess) {
                     lmPinnedFloats_ =
-                            static_cast<uint64_t>(geom_.vocabSize) *
-                            (computeAllLogits ? seqLen : 1u);
+                            static_cast<uint64_t>(geom_.vocabSize) * rows;
                 } else {
                     lmPinned_ = nullptr;
                     lmPinnedFloats_ = 0;
@@ -2874,9 +2891,9 @@ namespace tinycoder::gpu {
                 cudaMemcpyAsync(lmPinned_, s.logits, nL * sizeof(float),
                                 cudaMemcpyDeviceToHost, g_stream);
                 cudaStreamSynchronize(g_stream);
-                std::memcpy(logitsOut, lmPinned_, nL * sizeof(float));
+                std::memcpy(dst, lmPinned_, nL * sizeof(float));
             } else {
-                cudaMemcpyAsync(logitsOut, s.logits, nL * sizeof(float),
+                cudaMemcpyAsync(dst, s.logits, nL * sizeof(float),
                                 cudaMemcpyDeviceToHost, g_stream);
             }
         }
@@ -3212,11 +3229,12 @@ namespace tinycoder::gpu {
     void GPUModel::clearKVCache() {
         if (!allocated_) return;
         uint32_t nGpu = geom_.numGpuLayers;
-        uint64_t kvBytes = static_cast<uint64_t>(geom_.maxSeqLen) *
-                           geom_.numKVHeads * geom_.headDim *
-                           (kvHalf_ ? sizeof(__half) : sizeof(float));
-        cudaMemsetAsync(kvK_, 0, static_cast<size_t>(nGpu) * kvBytes, g_stream);
-        cudaMemsetAsync(kvV_, 0, static_cast<size_t>(nGpu) * kvBytes, g_stream);
+        // Zero only the slots actually allocated (qwen35/MoE skip the recurrent
+        // layers; kvSlots_ == nGpu for the dense arch and <= nGpu otherwise).
+        const uint64_t kvAllocBytes =
+                static_cast<uint64_t>(kvSlots_) * kvLayerStride_;
+        cudaMemsetAsync(kvK_, 0, static_cast<size_t>(kvAllocBytes), g_stream);
+        cudaMemsetAsync(kvV_, 0, static_cast<size_t>(kvAllocBytes), g_stream);
         // Qwen35 / Qwen35MoE: also reset the persistent gated-delta-net + conv1d
         // state so a fresh session starts from an empty recurrent state (matches
         // the CPU kvCache_.q35ConvState / q35GdnState zeroing on clearKVCache).

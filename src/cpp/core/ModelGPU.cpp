@@ -315,8 +315,22 @@ namespace tinycoder {
                         addMat(w.ffnDown);
                     }
                     layerBytes = (layerBytes + cfg.numLayers - 1) / cfg.numLayers;
-                    layerBytes += static_cast<uint64_t>(cfg.maxSeqLen) * kvLen *
-                                  sizeof(float) * 2;
+                    // KV slots exist ONLY for the full-attention layers (the
+                    // recurrent gated-delta-net layers store no K/V; mirrors
+                    // GPUModel's kvLayerOffset slotting).  This is the PER-LAYER
+                    // accumulator, so scale the single-layer KV bytes by the
+                    // attention FRACTION (nAttnLayers / numLayers), NOT by the
+                    // attention COUNT — charging the count multiplied the KV by
+                    // numLayers (a 64x over-count on Bonsai-2-27B) and pushed
+                    // the auto-fit from full offload down to 24/64.
+                    uint32_t nAttnLayers = cfg.numLayers;
+                    if (cfg.fullAttentionInterval > 1u) {
+                        nAttnLayers = (cfg.numLayers + cfg.fullAttentionInterval - 1u) /
+                                      cfg.fullAttentionInterval;
+                    }
+                    layerBytes += static_cast<uint64_t>(nAttnLayers) *
+                                  cfg.maxSeqLen * kvLen * sizeof(float) * 2 /
+                                  static_cast<uint64_t>(cfg.numLayers);
                     layerBytes += static_cast<uint64_t>(cfg.ssmConvKernel - 1) *
                                   convChannels * sizeof(float);
                     // GDN persistent state: [nVHeads][headV][headV] floats.
@@ -342,6 +356,19 @@ namespace tinycoder {
                 const uint32_t embBlocksPerRow = blocksPerRowFor(emb.type, emb.hiddenSize);
                 const uint64_t embedBytes =
                         static_cast<uint64_t>(cfg.vocabSize) * embBlockBytes * embBlocksPerRow;
+                // Separate LM head (output.weight): mirrored to the device ONLY
+                // on a full offload (upload()'s useGpuLmHead), and it is NOT
+                // counted in layerBytes.  ~1.4 GB of Q8_K on Bonsai-2-27B —
+                // omitting it made the auto-fit believe the whole model fit and
+                // attempt a full offload that OOM'd.  Tied heads reuse the
+                // (already-charged) embedding matrix, so the cost is 0.
+                uint64_t lmHeadBytes = 0;
+                if (!m.lmHeadTied_ && !m.lmHead_.empty()) {
+                    const uint32_t lmBlocks =
+                            blocksPerRowFor(m.lmHead_.type, m.lmHead_.cols);
+                    lmHeadBytes = static_cast<uint64_t>(cfg.vocabSize) *
+                                  typeBlockBytes(m.lmHead_.type) * lmBlocks;
+                }
                 // Free VRAM: authoritative cudaMemGetInfo; conservative fallback.
                 int64_t freeVram = 8ll << 30;
                 size_t freeBytes = 0, totalBytes = 0;
@@ -358,19 +385,61 @@ namespace tinycoder {
                 // prefills the wF16 twin (largest dense matrix, e.g. ffnGate
                 // 17408x5120 fp16 = 178 MB) reuses this fixed reservation.
                 const int64_t fixedOverhead = 900ll << 20;
+                // Budget WITHOUT the LM head: funds the quantized weight layers.
                 const int64_t budget =
                         freeVram - static_cast<int64_t>(embedBytes) - fixedOverhead;
                 if (layerBytes > 0 && budget > 0) {
+                    // The 10% pad is a PARTIAL-fit safety margin.  Keep the
+                    // unpadded per-layer estimate for the FULL-offload test:
+                    // the estimate already over-counts the real residency (every
+                    // layer is charged its own matrices plus the averaged
+                    // scratch/state), so padding it again needlessly drops a
+                    // model that fits fully onto a partial offload.
+                    const uint64_t rawLayerBytes = layerBytes;
                     layerBytes = static_cast<uint64_t>(static_cast<double>(layerBytes) * 1.10);
-                    uint32_t fit = static_cast<uint32_t>(budget / static_cast<int64_t>(layerBytes));
+                    // Layers that fit WITHOUT the LM head.  Keeping the head off
+                    // the device lets the partial-offload CPU tail run it, so
+                    // this is the correct layer count when a FULL offload is not
+                    // affordable.
+                    uint32_t fit = static_cast<uint32_t>(
+                            budget / static_cast<int64_t>(layerBytes));
+                    // Also test a TRUE full offload: every layer PLUS the
+                    // separate LM head must fit in the budget.  Only then does
+                    // the device run the final norm + LM head (upload()'s
+                    // useGpuLmHead); a single LM_head.cpp automatic fit.  Prefer
+                    // it when affordable; otherwise the LM head stays on the CPU
+                    // with the partial tail.
+                    if (lmHeadBytes > 0) {
+                        const int64_t fullBudget =
+                                budget - static_cast<int64_t>(lmHeadBytes);
+                        const uint32_t fitFull =
+                                (fullBudget > 0)
+                                        ? static_cast<uint32_t>(
+                                                  fullBudget /
+                                                  static_cast<int64_t>(rawLayerBytes))
+                                        : 0u;
+                        if (fitFull >= nGpu) {
+                            fit = nGpu;// the whole model + head fits: full offload
+                        } else if (fit >= cfg.numLayers) {
+                            // All layers fit WITHOUT the head, but the head does
+                            // not: cap one layer short so nGpu < numLayers and
+                            // the CPU tail runs the final norm + LM head
+                            // (upload() then leaves lmHeadQ_ null).  Attempting
+                            // the full offload here would allocate lmHeadQ_ and
+                            // OOM.
+                            fit = (cfg.numLayers > 0u) ? cfg.numLayers - 1u : 0u;
+                        }
+                    }
                     if (fit > 0 && fit < nGpu) {
                         nGpu = fit;
                         std::fprintf(stderr,
                                      "[gpu] auto-ngl: offloading %u of %u layers "
-                                     "(~%.1f GB free, %llu B/layer)\n",
+                                     "(~%.1f GB free, %llu B/layer, LM head %s)\n",
                                      nGpu, cfg.numLayers,
                                      static_cast<double>(freeVram) / (1ll << 30),
-                                     static_cast<unsigned long long>(layerBytes));
+                                     static_cast<unsigned long long>(layerBytes),
+                                     (nGpu == cfg.numLayers) ? "on GPU"
+                                                             : "on CPU");
                     }
                 }
             }

@@ -68,8 +68,8 @@ public:
             // tinycoder_bench measures WARM (the reference benchmark tgen protocol: a
             // warmup prefill+decode rep runs before the timed reps), while this
             // gtest previously measured COLD first-touch of the weight pages.
-            // On a 35 GB qwen35moe model in a ~29 GB-RAM machine the cold/warm
-            // delta is 15-23x (measured: 0.4 vs 9.5 pp tok/s, 0.5 vs 7.3 tg
+            // On a 35 GB qwen35moe model in a RAM-constrained host the cold/warm
+            // delta is large (measured: 0.4 vs 9.5 pp tok/s, 0.5 vs 7.3 tg
             // tok/s), which made the two harnesses report wildly different
             // numbers for the SAME engine.  To make the test's reported tok/s
             // comparable to the bench's, run the same deterministic

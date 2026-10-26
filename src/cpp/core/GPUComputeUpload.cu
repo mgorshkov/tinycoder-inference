@@ -67,7 +67,6 @@ namespace tinycoder::gpu {
             f16OtherW = std::max(f16OtherW, geom_.expertFF);
             f16OtherW = std::max(f16OtherW, geom_.expertSharedFF);
         }
-        uint64_t v = static_cast<uint64_t>(cap) * geom_.vocabSize * sizeof(float);
         auto allocT = [&](auto *&p, uint64_t n, const char *what) -> bool {
             p = nullptr;
             cudaError_t e = cudaMalloc(&p, n);
@@ -107,12 +106,10 @@ namespace tinycoder::gpu {
             !allocT(scratch_.up, static_cast<uint64_t>(cap) * I * sizeof(float),
                     "up") ||
             !allocT(scratch_.ffnOut,
-                    static_cast<uint64_t>(cap) * H * sizeof(float), "ffnOut") ||
-            !allocT(scratch_.logits, v, "logits")) {
+                    static_cast<uint64_t>(cap) * H * sizeof(float), "ffnOut")) {
             destroyScratch();
             return false;
         }
-
         // ---- Qwen35 recurrent-layer scratch (dense gated delta net) ----
         // The dense projection outputs (qkv/z/beta/gateV) are BATCHED over
         // tokens ([seqLen][...]) because attnQKV/attnGate/ssmBetaQ/ssmAlphaQ are
@@ -277,6 +274,47 @@ namespace tinycoder::gpu {
                         "attnPartialL")) {
                 destroyScratch();
                 return false;
+            }
+        }
+        // ---- LM-head logits scratch (allocated LAST) ----
+        // The generation path always requests ONLY the last token's logits, so
+        // one [vocab] row suffices.  The historical [cap][vocab] buffer (2 GB
+        // for cap=2048, vocab=248320) is wasteful: at Bonsai-2-27B's full
+        // offload it is what starves the per-layer scratch (gateF16/q35qkv/...)
+        // that ensureScratch allocates here, so the forward OOM'd at gateF16 and
+        // dropped to the CPU ("out of memory").  Allocating it AFTER every other
+        // scratch buffer — and only when the FULL buffer comfortably fits the
+        // residual free VRAM — keeps those buffers safe.  Otherwise fall back to
+        // a single row and flag it (logitsCapOneRow_) so the LM head writes just
+        // the last token; computeAllLogits (all rows) is a debug/tool request
+        // never made by the OpenAI generation path.
+        logitsCapOneRow_ = false;
+        {
+            const uint64_t fullLogits =
+                    static_cast<uint64_t>(cap) * geom_.vocabSize * sizeof(float);
+            size_t freeB = 0, totB = 0;
+            const bool memInfo = (cudaMemGetInfo(&freeB, &totB) == cudaSuccess);
+            const uint64_t reserve = 512ull * 1024 * 1024;
+            if (memInfo &&
+                static_cast<uint64_t>(freeB) > fullLogits + reserve) {
+                if (!allocT(scratch_.logits, fullLogits, "logits")) {
+                    destroyScratch();
+                    return false;
+                }
+            } else {
+                if (!allocT(scratch_.logits,
+                            static_cast<uint64_t>(geom_.vocabSize) * sizeof(float),
+                            "logits")) {
+                    destroyScratch();
+                    return false;
+                }
+                logitsCapOneRow_ = true;
+                std::fprintf(stderr,
+                             "[gpu] logits scratch sized for ONE token "
+                             "(%.1f MB) to conserve VRAM; full-sequence "
+                             "logits unavailable\n",
+                             static_cast<double>(geom_.vocabSize) *
+                                     sizeof(float) / (1024.0 * 1024));
             }
         }
         scratch_.seqCap = cap;
@@ -919,13 +957,28 @@ namespace tinycoder::gpu {
             kvHalf_ = (geom_.architecture == 0) && (kh != nullptr && kh[0] == '1');
         }
         const uint64_t kvElem = kvHalf_ ? sizeof(__half) : sizeof(float);
-        uint64_t kvBytes = static_cast<uint64_t>(geom_.maxSeqLen) *
-                           geom_.numKVHeads * geom_.headDim * kvElem;
-        if (!allocRaw(&kvK_, static_cast<size_t>(nGpu) * kvBytes, "kvK") ||
-            !allocRaw(&kvV_, static_cast<size_t>(nGpu) * kvBytes, "kvV"))
+        // Per-layer KV slot bytes (ONE layer's K or V).
+        kvLayerStride_ = static_cast<uint64_t>(geom_.maxSeqLen) *
+                         geom_.numKVHeads * geom_.headDim * kvElem;
+        // Slot COUNT: dense archs slot every offloaded layer; qwen35/qwen35moe
+        // store K/V ONLY on the full-attention layers (every
+        // fullAttentionInterval-th layer, at L ≡ interval-1 (mod interval)), so
+        // the recurrent (gated-delta-net) layers get NO slot.  Slot index for
+        // layer L is floor(L / interval) — see kvLayerOffset().  This frees
+        // ~3/4 of the KV VRAM on the 48-recurrent/16-attention Bonsai-2-27B.
+        kvSlots_ = nGpu;
+        if ((geom_.architecture == 1u || geom_.architecture == 2u) &&
+            geom_.fullAttentionInterval > 1u) {
+            kvSlots_ = (nGpu + geom_.fullAttentionInterval - 1u) /
+                       geom_.fullAttentionInterval;
+        }
+        const uint64_t kvAllocBytes =
+                static_cast<uint64_t>(kvSlots_) * kvLayerStride_;
+        if (!allocRaw(&kvK_, static_cast<size_t>(kvAllocBytes), "kvK") ||
+            !allocRaw(&kvV_, static_cast<size_t>(kvAllocBytes), "kvV"))
             return false;
-        cudaMemsetAsync(kvK_, 0, static_cast<size_t>(nGpu) * kvBytes, g_stream);
-        cudaMemsetAsync(kvV_, 0, static_cast<size_t>(nGpu) * kvBytes, g_stream);
+        cudaMemsetAsync(kvK_, 0, static_cast<size_t>(kvAllocBytes), g_stream);
+        cudaMemsetAsync(kvV_, 0, static_cast<size_t>(kvAllocBytes), g_stream);
 
         // ---- Persistent fp16 twins: DEFERRED partial-set pass (2026-10-01) ----
         // Every quantized weight / KV / embed / scratch buffer is now resident,
@@ -963,12 +1016,18 @@ namespace tinycoder::gpu {
                     if (b > largestMat) largestMat = b;
                 }
             }
-            // scratchEst mirrors ensureScratch's dominant terms (logits is
-            // cap*vocab*4; the rest is a small multiple of cap*hidden) plus a
-            // fragmentation allowance.
+            // scratchEst mirrors ensureScratch's dominant terms.  The logits
+            // term is ONE row when ensureScratch fell back to the one-row
+            // buffer (logitsCapOneRow_); only a full [maxSeqLen][vocab] buffer
+            // needs the cap*vocab reservation.  The rest is a small multiple of
+            // cap*hidden plus a fragmentation allowance.
+            const uint64_t logitsEst =
+                    logitsCapOneRow_
+                            ? static_cast<uint64_t>(geom_.vocabSize) * sizeof(float)
+                            : static_cast<uint64_t>(geom_.maxSeqLen) *
+                                      geom_.vocabSize * sizeof(float);
             const uint64_t scratchEst =
-                    static_cast<uint64_t>(geom_.maxSeqLen) * geom_.vocabSize *
-                            sizeof(float) +
+                    logitsEst +
                     static_cast<uint64_t>(geom_.maxSeqLen) * geom_.hiddenSize *
                             sizeof(float) * 24 +
                     128ull * 1024 * 1024;

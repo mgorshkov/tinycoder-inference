@@ -53,10 +53,10 @@ namespace tinycoder {
 
         // LOGICAL-CPU count (sysconf(_SC_NPROCESSORS_ONLN) on Linux,
         // std::thread::hardware_concurrency elsewhere) — the measured optimum.
-        // 8-way parallelism keeps DRAM saturated even at the physical-core
-        // pool's ~equal efficiency — the fine 8-way row split plus the pooled
-        // HT lanes keep the memory bus busier than 4 dedicated cores on this
-        // 2-channel DDR3-1600.
+        // A fine row split across the pooled HT lanes keeps DRAM saturated even
+        // at the physical-core pool's ~equal efficiency — the extra in-flight
+        // rows keep the memory bus busier on the memory-bound shape (reference
+        // host: 2x Xeon E5-2686 v4, 36C/72T, quad-channel DDR4).
 #if defined(__linux__)
         long nCpus = sysconf(_SC_NPROCESSORS_ONLN);
         if (nCpus > 0) {
@@ -73,8 +73,8 @@ namespace tinycoder {
     size_t ThreadPool::physicalThreadCount() {
 #if defined(__linux__)
         // Two logical CPUs sharing an HT lane report identical masks, so the
-        // distinct-mask count equals the number of physical cores (4 on the
-        // i7-4790K reference: masks 1,2,4,8).
+        // distinct-mask count equals the number of physical cores (36 across
+        // the two E5-2686 v4 sockets on the reference host).
         {
             unsigned long long masks[64];
             uint32_t n = 0;
@@ -198,8 +198,8 @@ namespace tinycoder {
         // for the same HT lane. The main thread participates in every parallel
         // dispatch too, so CPU 0 is reserved for it (see initialize(), which
         // pins the main thread to CPU 0); workers occupy the remaining CPUs
-        // 1..numThreads_-1. On the reference host (i7-4790K, 4 physical / 8
-        // logical) this gives the full 0..7 coverage:
+        // 1..numThreads_-1. On the reference host (2x Xeon E5-2686 v4, 36
+        // physical / 72 logical) an 8-thread pool thus gives 0..7 coverage:
         //   main -> CPU0, worker0 -> CPU1, ..., worker6 -> CPU7,
         // keeping every lane busy and NOT pairing a worker with its HT sibling
         // on a memory-bound kernel (which would thrash the shared L3). Earlier

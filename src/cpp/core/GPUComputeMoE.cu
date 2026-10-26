@@ -1315,10 +1315,13 @@ namespace tinycoder::gpu {
                 kQ35MRoPE<<<dim3(seqLen, nKV), 32, 0, g_stream>>>(
                         s.k, seqLen, nKV, hd, nDims, pos, mropeCos_, mropeSin_);
                 // Store K/V into the layer's KV cache.
-                float *kvK = reinterpret_cast<float *>(kvK_) +
-                             static_cast<size_t>(L) * geom_.maxSeqLen * kvLen;
-                float *kvV = reinterpret_cast<float *>(kvV_) +
-                             static_cast<size_t>(L) * geom_.maxSeqLen * kvLen;
+                // Only FULL-ATTENTION layers reach here (the recurrent branch
+                // above is the alternative), and the cache is slotted by
+                // floor(L/interval) — NOT by L (see kvLayerOffset()).
+                float *kvK = reinterpret_cast<float *>(
+                                     static_cast<uint8_t *>(kvK_) + kvLayerOffset(L));
+                float *kvV = reinterpret_cast<float *>(
+                                     static_cast<uint8_t *>(kvV_) + kvLayerOffset(L));
                 kQ35StoreKV<<<seqLen, 256, 0, g_stream>>>(s.k, s.v, kvK, kvV,
                                                           seqLen, nKV, hd, pos);
                 // Flash attention (warp per (token, q-head), HD=256).
@@ -1414,7 +1417,9 @@ namespace tinycoder::gpu {
         uint32_t lmBlocks = hostBlocksPerRow(lmType, H);
         // Prism: the (folded) LM head also consumes H S P x.
         const bool lmFolded = (geom_.prismFold != 0) && (lmType == kTypePQ2_0);
-        if (computeAllLogits) {
+        // logitsCapOneRow_: the s.logits scratch holds ONE row; write only the
+        // last token (the generation path never requests all rows anyway).
+        if (computeAllLogits && !logitsCapOneRow_) {
             for (uint32_t si = 0; si < seqLen; ++si) {
                 const float *lh = s.hidden + si * H;
                 if (lmFolded) lh = prismFoldForward(lh, H, false);
