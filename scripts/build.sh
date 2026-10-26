@@ -33,6 +33,10 @@
 #   --no-cuda | --cpu   CPU-only build: -DENABLE_CUDA=OFF
 #   --no-tests       Skip unit tests and benchmarks: -DBUILD_TESTS=OFF
 #
+# Parallelism:
+#   TINYCODER_BUILD_DIR   Build tree (default: build)
+#   TINYCODER_JOBS        Parallel compile jobs (default: all logical CPUs)
+#
 # SIMD (each can be --X to enable or --no-X to disable):
 #   --sse2 / --no-sse2
 #   --avx  / --no-avx
@@ -55,8 +59,27 @@ set -euo pipefail
 # ---- CLI parsing ----
 CUDA_FLAGS="-DENABLE_CUDA=ON"      # GPU build is the default
 TESTS_FLAGS="-DBUILD_TESTS=ON"     # tests + bench are the default
-BUILD_DIR="build"
+# Build tree: override with TINYCODER_BUILD_DIR (e.g. to keep a CPU and a CUDA
+# tree side by side).
+BUILD_DIR="${TINYCODER_BUILD_DIR:-build}"
 EXTRA_CMAKE_ARGS=()
+
+# ---- Parallelism ----
+# Use as many cores as possible: default to the number of logical CPUs the OS
+# reports (nproc), falling back to getconf/_SC_NPROCESSORS_ONLN.  Override with
+# TINYCODER_JOBS=<n> (or JOBS) when you want to cap the parallelism.
+detect_jobs() {
+    local n=""
+    if command -v nproc >/dev/null 2>&1; then
+        n="$(nproc)"
+    elif command -v getconf >/dev/null 2>&1; then
+        n="$(getconf _NPROCESSORS_ONLN)"
+    fi
+    [[ "${n}" =~ ^[1-9][0-9]*$ ]] || n=1
+    printf '%s' "${n}"
+}
+JOBS="${TINYCODER_JOBS:-${JOBS:-$(detect_jobs)}}"
+[[ "${JOBS}" =~ ^[1-9][0-9]*$ ]] || JOBS=1
 
 usage() {
     sed -n '2,100p' "$0" | sed 's/^# \{0,1\}//'
@@ -123,6 +146,8 @@ cd "${ROOT_DIR}"
 
 echo "=== TinyCoder Inference Engine Build ==="
 echo "Root: ${ROOT_DIR}"
+echo "Build dir: ${BUILD_DIR}"
+echo "Parallel jobs: ${JOBS}"
 if [[ "${CUDA_FLAGS}" == "-DENABLE_CUDA=ON" ]]; then
     echo "Mode: GPU offload build (-DENABLE_CUDA=ON)"
 else
@@ -141,8 +166,8 @@ cmake -B "${BUILD_DIR}" -DCMAKE_BUILD_TYPE=Release ${CUDA_FLAGS} ${TESTS_FLAGS} 
 
 # ---- 2. Build ----
 echo ""
-echo "--- Step 2/3: Building ---"
-cmake --build "${BUILD_DIR}" --config Release
+echo "--- Step 2/3: Building (${JOBS} jobs) ---"
+cmake --build "${BUILD_DIR}" --config Release --parallel "${JOBS}"
 
 # ---- 3. Run tests (when enabled) ----
 if [[ "${TESTS_FLAGS}" == "-DBUILD_TESTS=ON" ]]; then

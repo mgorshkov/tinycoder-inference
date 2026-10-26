@@ -793,7 +793,8 @@ namespace tinycoder {
         // shared with the page cache and reclaimable, so the loader holds no
         // private heap copy of the 16.4 GB weight section. Without this the
         // load path peaked near 41 GB (heap read + per-layer weight copies +
-        // pre-dequantized embeddings) and was OOM-killed on 32 GB hosts.
+        // pre-dequantized embeddings) and was OOM-killed on RAM-constrained
+        // (32 GB class) hosts.
         mmapFd_ = ::open(filePath_.c_str(), O_RDONLY);
         if (mmapFd_ < 0) {
             std::cerr << "[TinyCoder] Failed to open model file for mmap: "
@@ -830,15 +831,15 @@ namespace tinycoder {
         // ---- Load-time page-cache prefetch (2026-09-16) ----
         // The mmap is faulted in lazily: pages are read from disk only on first
         // touch.  On a model larger than RAM that first-touch cost lands inside
-        // the FIRST inference pass (measured on the 35 GB Ornith Q8_0 in 29 GB
-        // usable RAM: the question harness "warm-up" prefill took 140 s and
+        // the FIRST inference pass (measured on the 35 GB Ornith Q8_0 on a
+        // 32 GB-RAM host: the question harness "warm-up" prefill took 140 s and
         // question decode crawled at 0.6-1.7 tok/s).  Pulling the whole tensor
         // section into the page cache at LOAD time moves that cost out of the
         // timed work whenever the section can stay resident.
         //
         // ADAPTIVE GATE (measured 2026-09-16): an eager whole-file prefetch
         // only pays when the section FITS in RAM.  For an over-RAM file (35 GB
-        // section vs 32 GB physical) the eager read (a) wastes ~4 min of load
+        // section vs finite physical RAM) the eager read (a) wastes ~4 min of load
         // time and (b) perturbs the LRU: the prefetch reads layer-0..k pages
         // FIRST, so by the time inference starts they are the OLDEST cache
         // entries and get evicted in favour of later-layer pages — the layer

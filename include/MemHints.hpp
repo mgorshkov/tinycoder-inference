@@ -38,7 +38,8 @@ namespace tinycoder {
     /// @brief Transparent-Huge-Page (THP) hints for large inference buffers.
     //
     // Background (measured 2026-08-29, plans/generation_optimizations.md
-    // §6.10): on the reference host the forward pass streams multi-hundred-MB
+    // §6.10): on the reference host (2x Xeon E5-2686 v4 + RTX 2080 Ti) the
+    // forward pass streams multi-hundred-MB
     // weight buffers (tensorData_ ~750 MB, pre-dequantized embeddings ~890 MB,
     // LM-head Q8_K ~253 MB) from DRAM every token. Hinting the kernel to back
     // big buffers with 2 MB pages collapses that dTLB working set ~512x.
@@ -56,7 +57,8 @@ namespace tinycoder {
     /// heap-resident and madvise works on any mapped private anonymous range).
     //
     // Opt-in: `TINYCODER_HUGE_PAGES=1` enables the hints. **Default OFF**
-    // (2026-08-29, measured): with THP=madvise on the reference host the hint
+    // (2026-08-29, measured): with THP=madvise on the reference host (125 GB
+    // DDR4) the hint
     // hands khugepaged a ~2.4 GB range to collapse DURING inference (10 s scan
     // cycle, `defrag=1`). Each collapse copies 512 x 4K pages into a 2 MB page
     // + TLB-shootdowns all cores; only ~16 MB / 750 MB actually promoted, so

@@ -137,8 +137,8 @@ namespace tinycoder {
         ///
         /// - Bit-exact vs halfToFloat() (verified — the LUT replicates the
         ///   scalar math for every one of the 65536 patterns).
-        /// - 64 KiB table, L1-resident (L1D on Haswell is 32 KiB per core, so a
-        ///   hot working set of block d/dmin pairs stays cached).
+        /// - 64 KiB table, L1-resident (L1D on Broadwell-EP / E5 v4 is 32 KiB
+        ///   per core, so a hot working set of block d/dmin pairs stays cached).
         /// - Read-only after first touch; function-local static with built-in
         ///   thread-safety (magic static).
         static const float *halfToFloatTable() {

@@ -47,9 +47,10 @@ int main(int argc, char **argv) {
 
     // Initialize the thread pool with the LOGICAL-CPU count
     // (ThreadPool::recommendedThreadCount: $TINYCODER_THREADS override, else
-    // sysconf(_SC_NPROCESSORS_ONLN) on Linux). Measured optimum on the
-    // reference host is the logical count (8); oversubscribing beyond it
-    // regresses ~6x — see plans/generation_optimizations.md Appendix B.
+    // sysconf(_SC_NPROCESSORS_ONLN) on Linux). The measured optimum tracks the
+    // logical-CPU count rather than the physical-core count; oversubscribing
+    // past it regresses sharply — see plans/generation_optimizations.md
+    // Appendix B.
     tinycoder::ThreadPool::instance().initialize(
             tinycoder::ThreadPool::recommendedThreadCount());
 

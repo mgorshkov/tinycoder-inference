@@ -95,8 +95,8 @@ namespace tinycoder {
         /// @brief Recommended initial thread count.
         //
         // The finer 8-way row split plus the pooled HT lanes keeps DRAM busier
-        // than 4 dedicated cores on this 2-channel DDR3-1600 memory-bound
-        // shape.
+        // than a narrow dedicated-core pool on this memory-bound shape
+        // (reference host: quad-channel DDR4).
         static size_t recommendedThreadCount();
 
         static size_t physicalThreadCount();
