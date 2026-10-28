@@ -65,9 +65,11 @@ namespace tinycoder {
             name == "Qwen3.6 35B A3B Claude 4.7 Opus Reasoning Distilled" ||
             name == "Qwen3.6-35B-A3B")
             return true;
-        // Qwen35 (dense) models — Qwen3.8 series
+        // Qwen35 (dense) models — Qwen3.8 series and the Ornith-1.5 dense
+        // GDN hybrid (Ornith-1.5-9B, GGUF general.architecture = "qwen35").
         if (name == "Qwen3.8-27B" ||
-            name == "Qwen3.8-27B-UD")
+            name == "Qwen3.8-27B-UD" ||
+            name == "Ornith 1.5 9B")
             return true;
         return false;
     }

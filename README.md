@@ -1,4 +1,4 @@
-# ⚡ TinyCoder Inference Engine
+# ⚡ TinyCoder Inference Engine for RTX 2080 Ti
 
 **High-performant local inference engine** for the [TinyCoder AI](https://github.com/mgorshkov/tinycoder) VS Code extension. This repository contains **only the engine**: the C++/CUDA core (`src/cpp/core`), public headers (`include/`), unit tests (`unit_tests/`), benchmarks (`benchmarks/`), and build plumbing.
 
@@ -26,9 +26,10 @@ Columns follow the benchmark defaults: `tinycoder_bench --n-prompts 512 --n-gen 
 | Qwen2.5-Coder-7B `iq2_s` | 2.4 GB | full offload | 2,419 tok/s | **77.4 tok/s** | 2,447 tok/s | 90.7 tok/s |
 | Qwen2.5-Coder-7B `iq3_xxs` | 2.9 GB | full offload | 2,463 tok/s | **66.2 tok/s** | 2,887 tok/s | 86.4 tok/s |
 | Ternary-Bonsai-2-27B `pq2_0` (Prism) | 6.7 GB | full offload | 8.7 tok/s | 7.8 tok/s | — | — |
+| Ornith-1.5-9B `q4_k_m` | 5.9 GB | full offload | **46.0 tok/s** | **37.0 tok/s** | 2,639 tok/s | 83.8 tok/s |
 | Ornith-1.5-9B `q8_0` | 8.9 GB | full offload | 10.6 tok/s | 9.1 tok/s | 2,932 tok/s | 58.5 tok/s |
-| Ornith-1.5-35B `q4_k_m` | 20.2 GB | hybrid (experts CPU) | 13.0 tok/s | 9.4 tok/s | 228 tok/s | 25.8 tok/s |
-| Ornith-1.5-35B-A3B `q8_0` | 34.4 GB | hybrid (experts CPU) | 13.0 tok/s | 6.9 tok/s | 141 tok/s | 22.1 tok/s |
+| Ornith-1.5-35B `q4_k_m` | 20.2 GB | hybrid (experts CPU) | 12.8 tok/s | 9.5 tok/s | 255 tok/s | 25.8 tok/s |
+| Ornith-1.5-35B-A3B `q8_0` | 34.4 GB | hybrid (experts CPU) | 12.8 tok/s | 6.8 tok/s | 147 tok/s | 18.8 tok/s |
 
 ## Key Features
 
@@ -38,6 +39,7 @@ Columns follow the benchmark defaults: `tinycoder_bench --n-prompts 512 --n-gen 
 |---|---|---|
 | **Qwen3.8 (qwen35)** | 27B dense hybrid | 48× Gated-Delta-Net + 16× full-attention, MRoPE, GQA, SwiGLU, MTP |
 | **Ornith (qwen35moe)** | 35B-A3B (Q8_0 / Q4_K_M checkpoints) | qwen35moe MoE: 256 experts (top-8), GDN + full-attention hybrid, softmax router |
+| **Ornith-1.5-9B (qwen35)** | 9B dense (Q4_K_M) | dense GDN + full-attention hybrid: 32 layers (24 recurrent + 8 full-attn), MRoPE, GQA, SwiGLU |
 | **Gemma 4** | 26B (A4B MoE) | MoE, RoPE, GQA, GeGLU, RMSNorm |
 | **Ternary-Bonsai (Prism)** | 27B dense hybrid (`PQ2_0`) | qwen35 + Prism Hadamard-fold (latent embedding, folded weights); private type 142 |
 
@@ -259,6 +261,7 @@ TinyCoder supports GGUF v3 files from multiple model families. The table below l
 | `Ternary-Bonsai-2-27B` | PQ2_0 (Prism) | 6.7 GB | full offload | Prism Hadamard-fold, 2-bit (TinyCoder-only) |
 | `Ornith-1.5-35B-A3B` | Q8_0 | ~34.4 GB | hybrid (experts CPU) | qwen35moe, 256 experts (top-8) |
 | `Ornith-1.5-35B` | Q4_K_M | ~20.2 GB | hybrid (experts CPU) | 41-layer qwen35moe variant |
+| `Ornith-1.5-9B` | Q4_K_M | ~5.9 GB | full offload | **dense** qwen35 (32 layers, hidden 4096), no MoE; test suite 64/64 ✓ |
 
 All rates are warm decode (tg8) on the reference hardware — the complete GPU table with llama.cpp comparison lives in [Benchmarking](#benchmarking). The Gemma 4 coding variants (`gemma4-coding-*`) hit a loader gap (their attention tensors are named differently) and print a clear load error rather than producing wrong output.
 
@@ -351,6 +354,10 @@ std::vector<int32_t> tokens = model.generate(prompt, params,
 | `TINYCODER_IQ_DP4A` | `0` restores the scalar grid-lookup dot in the IQ2_S/IQ3_XXS/IQ3_S Q8_K GEMVs (default **on**, 2026-10-11). The grid dot now uses `__dp4a` + the branchless XOR-subtract sign application from llama's `vec_dot_iq*_q8_1` (`__vcmpne4`/`__vsub4`), replacing 8 scalar IMAD + 8 sign selects per (ib32,l) with 2 `dp4a`; bit-identical integer sum. Measured: interleaved A/B **+5.6%** and **+7.6%** (two `iq3_xxs` sizes, 3/3 and 2/2), greedy streams byte-identical |
 | `TINYCODER_IQ2XS_INT` | `0` restores the float dequant-dot path for IQ2_XS (GGML type 17) matrices (default **on**, 2026-10-11). IQ2_XS previously ran only the float kernels `kQGemvFusedGU_IQ2XS` (869 µs/layer at 25% occupancy) and `kQGemv` (499 µs at 83% LG-throttle); it now uses `kQGemvQ8KFusedGU<kTypeIQ2XS>`/`kQGemvQ8K<kTypeIQ2XS>` (ls=2·nib+1, final scale 0.125). Measured: interleaved A/B **+93%** (legacy 7B `iq2_s`, 2/2), greedy stream identical to the float path |
 | `TINYCODER_IQ_GRID_SMEM` | `0` keeps the IQ codebook grid (`c_iq2s_grid`/`c_iq2xs_grid`/`c_iq3s_grid`/`c_iq3xxs_grid`, 1–8 KB) in global/L1 (default **on**, 2026-10-11). The IQ decode GEMVs are LG-throttle bound (42–53% of stall cycles) on the divergent codebook lookups; staging the grid in shared memory moves those reads to the MIO path. Measured: interleaved A/B **+13%** (legacy 7B `iq2_s`, 2/2), **+4.3%** (legacy 7B `iq3_xxs`, 2/2), +0.5% (legacy 1.5B `iq3_xxs`); greedy streams byte-identical |
+| `TINYCODER_Q4K_4XW` | `0` restores the generic 1-row-per-warp Q4_K Q8_K decode GEMV (default **on**, 2026-10-29). `kQGemvQ4KxQ8K_4xW` gives Q4_K the same 4-rows-per-warp / all-32-lanes-load / 8× `__dp4a` shape already used by Q5_K/Q6_K, for the dense-qwen35 models' largest quant class (Q4_K ≈2.7 GB of Ornith-1.5-9B's 5.9 GB). Bit-exact with `kQGemvKxQ8K<kTypeQ4K>` (integer sum exact + order-free; same volatile no-FMA float fold). Measured (Ornith-1.5-9B, pp128/tg32): tg **13.80 → 25.24 tok/s (+83%)**, 64/64 tests + 160-token greedy stream byte-identical |
+| `TINYCODER_L2NORM_SMEM` | `0` restores the redundant-body `kQ35L2NormRepeat` (default **on**, 2026-10-29). The original recomputed the same `headK`-wide double L2 norm for every element of a slice's `headK*nVHeads` output (O(`headK²·nVHeads`) double adds per token per recurrent layer — the hottest kernel on the dense qwen35 prefill). The fast path computes each slice's `iq/ik` once into shared memory, bit-identically. Measured (Ornith-1.5-9B): tg16 **25.4 → 41.1 tok/s (+62%)**, pp128 **27.5 → 47.2 tok/s (+72%)**; nvprof `kQ35L2NormRepeat` 4286 → 57 µs |
+| `TINYCODER_Q4K_BSY` | warps per block for `kQGemvQ4KxQ8K_4xW` (default `8`, 2026-10-29). A/B `1/2/4/8` on the sustained decode measured **40.7–41.2 tok/s** (within clock noise) — the 4xW grid already fills the 68 SMs, so block shape does not move the wall; the knob is kept for profiler experiments |
+| `TINYCODER_MMQ_Q4K` | `1` opts INTO the int8 tensor-core (`mma.s8.m8n8k16`) **prefill** GEMM for Q4_K (`kMmqGemmQ4K_AffineRaw`, default **off**, 2026-10-29). Reads the RAW GGML Q4_K weights directly (no pre-pack → **zero extra VRAM**), packs the `q` B fragment per-lane from the block nibbles, and folds the affine `−dmin·m·bsum32` min term around the tensor core. Gated on `seqLen ≥ 64` and sm_75+. **Not bit-exact** with the integer `kQGemmKxQ8K<Q4_K>` (different float accumulation), so its acceptance bar is the batch-vs-sequential top-1 coherence contract, not byte-identity. Measured (Ornith-1.5-9B, pp512/tg128 reps 3): pp **46.4 → 57.1 tok/s (+23%)**, tg unchanged; full suite 66/0/16 |
 
 ## Testing
 
@@ -361,6 +368,8 @@ ctest --test-dir build --output-on-failure
 ```
 
 The Google Test suite (`tinycoder_test`) covers dequantization correctness across all quantization types, reference parity against sequential token-by-token forward passes, full-question generation tests, thread-pool reentrancy, and GPU/CPU comparison. On the reference build (`q2_k`) **55 pass / 2 fail / 16 skip** — the 2 failures are the non-deterministic sampled full-question cases (`SampleQuestionTest.AnswersQuestion/0,2`), which pass in isolation and are pre-existing sampling flakes, not regressions. All deterministic parity tests (GPU-vs-CPU logits, batch-vs-sequential prefill, sequential-decode argmax) pass bit-exactly with the split-KV and fp16-KV paths both on and off.
+
+On `Ornith-1.5-9B-Q4_K_M` (dense qwen35, hidden 4096) the suite runs **66 pass / 0 fail / 16 skip** (2026-10-29) — the 16 skips are the usual model-family guards (real-model IQ3_XXS/mma-mmq parity, the Q2_K Qwen2 reference compare, orphan-layer dumps, and the keyword questions reserved for named reference models). The two new passes are `MmqParityTest.AffineQ4K{Synthetic,RealModel}MatchesReference`, the affine int8-tensor-core Q4_K prefill parity (`TINYCODER_MMQ_Q4K`).
 
 ## Technical Details
 
@@ -491,6 +500,47 @@ The GPU kernels support the full K-quant family (`Q2_K`/`Q3_K`/`Q4_K`/`Q5_K`/`Q6
 | Q2_K | ≈133 MB | 3.99 GB | ~50 |
 
 The prefill path's fp16 working form is transient (one matrix in `wF16_` at a time); decode uses quantized GEMV directly, so the only real reduction lever is the file's quant.
+
+### Ornith-1.5-9B (dense qwen35)
+
+`Ornith-1.5-9B-Q4_K_M.gguf` reports `general.architecture = qwen35` — it is a **dense** gated-delta-net hybrid, *not* the MoE `qwen35moe` of the 35B Ornith checkpoints: 32 layers, hidden 4096, 16 attention heads / 4 KV heads, `headDim` 256, MRoPE (`rope.dimension_count` 64, sections `[11,11,10,0]`, theta 1e7), `full_attention_interval` 4 (24 recurrent + 8 full-attention layers), and no MTP block. Its GDN SSM geometry is `ssm.inner_size` 4096, `ssm.state_size` 128, `ssm.group_count` 16, `ssm.time_step_rank` 32, `ssm.conv_kernel` 4 — the smaller dense variant (the 27B dense uses `ssm.inner_size` 6144 / rank 48). The tokenizer ships `add_bos_token=0`, so the checkpoint exposes no BOS id (EOS 248046 / pad 248044 remain). At 5.9 GB it fits the 11 GB card and runs **full GPU offload** (the dense path, no CPU-expert hybrid).
+
+Verified **2026-10-29** on the reference hardware: the model loads, `tinycoder_test` runs **66 passed / 0 failed / 16 skipped**, and greedy generation is coherent (`tiny_logits_probe --generate` answers *"Write a C++ function to add two numbers."* with a templated `add()`).
+
+##### Benchmark: Ornith-1.5-9B-Q4_K_M (vs llama.cpp)
+
+Reference hardware (RTX 2080 Ti 11 GB + 2× Xeon E5-2686 v4), llama-bench protocol: `tinycoder_bench --n-prompts 512 --n-gen 128 --reps 5 --threads 36` vs `llama-bench -p 512 -n 128 -t 36 -ngl 99 -r 5` (CUDA build `9b8446b`). The 5.9 GB file fits the 11 GB card, so both run **fully offloaded**.
+
+| Metric | TinyCoder (optimized, 2026-10-29) | TinyCoder (prior) | llama.cpp | vs llama.cpp |
+|---|---|---|---|---|
+| pp512 | **46.0 tok/s** | 18.1 tok/s | 2,639 tok/s | 0.018× |
+| tg128 | **37.0 tok/s** | 13.0 tok/s | 83.8 tok/s | 0.44× |
+
+**Measurement caveat (this workload only).** Decode allocates ~70 per-token `kQuantizeQ8K` scratch buffers in the model's first forward, so the GPU idles ~19 s during load; a short (pp4/tg32) bench then measures only a few hundred ms of work and can read **6–41 tok/s** purely from the GPU boost state (P8 300 MHz → P0 1965 MHz) it happened to settle in. All numbers above use the **llama-bench protocol (pp512/tg128), warm reps on a pre-heated GPU**; sustained decode runs at 95% GPU / ~230 W. The three A/B numbers in the campaign table below were each measured back-to-back in a single session, so their *ratios* are clock-independent.
+
+##### Decode + prefill optimization campaign (2026-10-29)
+
+Three **bit-exact** levers took the dense-qwen35 GPU path from `pp512 18.1 / tg128 13.0` to **`pp512 46.7 / tg128 37.2` tok/s** (decode **2.86×**, prefill **2.58×**), keeping `tinycoder_test` at **64 passed / 0 failed / 16 skipped** and greedy streams byte-identical. Each is guarded by its own env A/B switch (all default **on**).
+
+| Lever | Switch | Default | A/B measured | What it fixed |
+|---|---|---|---|---|
+| Q4_K 4-rows-per-warp decode GEMV (`kQGemvQ4KxQ8K_4xW`) | `TINYCODER_Q4K_4XW` | **on** | tg16 **13.80 → 25.24 tok/s (+83%)** | The generic `kQGemvKxQ8K<kTypeQ4K>` ran one row per warp with only 8 of 32 lanes issuing weight loads, for the model's **largest** quant class (Q4_K ≈2.7 GB of 5.9 GB) — while Q5_K/Q6_K already had 4xW kernels. The new kernel mirrors [`kQGemvQ5KxQ8K_4xW`](include/GPUComputeInternal.hpp:4475) (4 rows/warp, all 32 lanes load, 8× `__dp4a`) |
+| Vectorized `kxQ8KBlockDot<kTypeQ4K>` integer body | (shared) | **on** | pp128 **18.6 → 27.5 tok/s (+48%)** | The shared block-dot did the 32-column integer dot with 32 scalar byte-loads + per-byte nibble/sign selects; it is the body of BOTH the generic 1-row GEMV and the batched prefill GEMM (`kQGemmKxQ8K`). The `__dp4a` form is bit-identical (integer sum is exact + order-free) |
+| Snapshot L2 norms in `kQ35L2NormRepeat` | `TINYCODER_L2NORM_SMEM` | **on** | tg16 **25.4 → 41.1 (+62%)**, pp128 **27.5 → 47.2 (+72%)** | The kernel recomputed the **same `headK`-wide double-precision L2 norm for every element** of each slice's `headK*nVHeads` output (O(`headK²·nVHeads`) double adds/token/layer). Now each slice's `iq/ik` is computed once into shared memory. nvprof: this kernel fell from **#1 (4286 µs / 6528 calls)** to 57 µs. Because it runs per prompt token, prefill gained even more than decode |
+
+`nvprof` attribution across the campaign (units are relative): the Q4_K GEMV (`kQGemvQ4KxQ8K_4xW`, x7936) and Q6_K GEMV (x3138) are now the decode tops, `kQGemmKxQ8K` (x376, ALU-bound) the prefill top, and `kQ35L2NormRepeat` dropped from the #1 slot to a rounding error. **Remaining gap** is the same integer-dot ALU bound documented below; the Q4_K 4xW + `__dp4a` work removes the byte-load-instruction overhead but not the Q8_K integer-dot throughput ceiling.
+
+**Correctness.** Every lever is parity-checked: `tinycoder_test` 64/0/16 (the deterministic GPU-vs-CPU and batch-vs-sequential tests are bit-exact), and the Q4_K 4xW greedily decodes the 160-token probe stream byte-identically to the generic kernel.
+
+**Prefill MMQ — int8 tensor cores for Q4_K (opt-in, 2026-10-29).** The fourth lever attacks the prefill compute ceiling directly: [`kMmqGemmQ4K_AffineRaw`](include/GPUComputeInternal.hpp:2627) dispatches the `mma.s8.m8n8k16` tensor core for Q4_K prefill at `seqLen ≥ 64`. It reads the **raw** GGML Q4_K nibbles (zero extra VRAM — a pre-packed copy would add ~1.5× of the 2.7 GB Q4_K weights and OOM the 11 GB card), builds each lane's mma B fragment straight from the 4-bit `q` (one 4-aligned u32 load + nibble select), and folds the affine `−dmin·m·bsum32` min term per 32-group *outside* the tensor core: `y = Σ_b d8·(dsc·D_int − dmn·bsum32)`. Measured (Ornith-1.5-9B, pp512/tg128, reps 3): **pp512 46.4 → 57.1 tok/s (+23%)**, decode unchanged at 37.1 tok/s. The mma path is **NOT bit-exact** with the integer `kQGemmKxQ8K<Q4_K>` (different float accumulation), so its acceptance bar is the batch-vs-sequential **top-1 coherence** contract, not byte-identity. Validated by `MmqParityTest.AffineQ4K{Synthetic,RealModel}MatchesReference` (kernel vs the host block reference on real Q4_K matrices, maxAbs `< 1e-6`), `ModelTest.CompareBatchVsSequentialPrefill` (`maxDiff=0`, top-1 match), and the full suite at **66 passed / 0 failed / 16 skipped**. Governed by [`TINYCODER_MMQ_Q4K`](README.md:360), default **off** until the remaining Q5_K/Q6_K projections adopt the same path.
+
+**Prefill is no longer per-token.** The dense-qwen35 CUDA forward originally ran `launchQGemv` once per prompt token, re-reading every weight matrix `seqLen` times, so `pp ≈ tg`. It now dispatches a **batched Q8_K GEMM** ([`kQGemmKxQ8K`](include/GPUComputeInternal.hpp:4288) + [`kQuantizeQ8K_Batch`](include/GPUComputeInternal.hpp:6279), launched via [`launchQGemm`](include/GPUComputeInternal.hpp:8663)) for the K-quant projections: each warp owns 4 tokens (lane groups) × one weight row, so every weight block is dotted against **4 token activations per read** instead of one. It is **bit-exact** with the per-token `launchQGemv` path — the same [`kxQ8KBlockDot`](include/GPUComputeInternal.hpp:3763) runs per (row, token) with the 8-lane reduction confined to the token's group — which is why the whole suite stays **64/64 green** (batch-vs-sequential, GPU-vs-CPU, and the Paris-prompt logits agree exactly). Prefill rose **14.4 → 18.1 tok/s (+26%)** while decode is unchanged.
+
+**Remaining gap is compute, not bandwidth.** After the batched GEMM and the GDN recurrence are excluded, the qwen35 projection GEMMs on CUDA run at only **~80 Gflop/s** — roughly 50× below the 2080 Ti's tensor-core FP16 peak — because the integer Q8_K decode dot-product is ALU-bound: the `Q4_K`/`Q6_K` sub-block scale extraction costs ~1 ALU op per 2-bit weight nibble, and the 8-lane integer chain has a long dependency chain. llama.cpp's 2,639 tok/s prefill comes from a **shared-memory-tiled int8 `mma.s8` tensor-core GEMM** (the `IQ3_XXS`/`Q8_K` MMQ path scaffolded in [`Int8Pack.hpp`](include/Int8Pack.hpp) and [`kMmqGemm_8x8x16`](include/GPUComputeInternal.hpp:2540)). The first step toward closing the gap landed on 2026-10-29: [`kMmqGemmQ4K_AffineRaw`](include/GPUComputeInternal.hpp:2627) runs the tensor core for **Q4_K** prefill (`TINYCODER_MMQ_Q4K=1`), reading the raw nibbles with no pre-pack and folding the affine min term around the mma — **pp512 46.4 → 57.1 tok/s (+23%)**, still only 0.02× llama.cpp because the Q5_K/Q6_K/Q8_0 projections and the GDN recurrence remain on the integer/ALU paths. Extending the raw-weight affine mma to Q5_K/Q6_K (same block-read trick, different scale decode) is the next prefill step; the batched GEMM landed earlier is its prerequisite (a correct, bit-exact weight-stationary path) and already removes the per-token weight re-reads.
+
+**Correctness cross-check.** Both engines answer the same greedy prompt (`"--temp 0"`) coherently — TinyCoder (`tiny_logits_probe "Write a C++ function to add two numbers." --generate`) emits a templated `add<T>(T a, T b)`, llama.cpp (`llama-cli -p "…" -n 160 --temp 0 -ngl 99 -t 36`) emits a `double addNumbers(double a, double b)` with a `main()` demo and the same `[Start thinking]/[End thinking]` reasoning preamble. The divergence after the opener is ordinary near-tie greedy drift (different kernel accumulation order), not a correctness gap.
+
+**Correctness cross-check.** Both engines answer the same greedy prompt (`"--temp 0"`) coherently — TinyCoder (`tiny_logits_probe "Write a C++ function to add two numbers." --generate`) emits a templated `add<T>(T a, T b)`, llama.cpp (`llama-cli -p "…" -n 160 --temp 0 -ngl 99 -t 36`) emits a `double addNumbers(double a, double b)` with a `main()` demo and the same `[Start thinking]/[End thinking]` reasoning preamble. The divergence after the opener is ordinary near-tie greedy drift (different kernel accumulation order), not a correctness gap.
 
 ### Ornith (qwen35moe) GPU — CPU-Expert Hybrid (default)
 

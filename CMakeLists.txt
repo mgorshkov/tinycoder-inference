@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.18.0)
 
-# TinyCoder Inference Engine
+# TinyCoder Inference Engine for RTX 2080 Ti
 # ---------------------------------------------------------------------------
 # Standalone C++/CUDA inference core used by the TinyCoder VS Code extension.
 # This repository contains ONLY the engine: src/cpp/core (C++/CUDA), include/
@@ -279,7 +279,7 @@ install(FILES ${TINYCODER_HEADERS} DESTINATION include/tinycoder)
 
 # ---- Print configuration summary ----
 message(STATUS "")
-message(STATUS "TinyCoder Inference Engine Build Configuration:")
+message(STATUS "TinyCoder Inference Engine for RTX 2080 Ti Build Configuration:")
 message(STATUS "  AVX2:          ${ENABLE_AVX2}")
 message(STATUS "  AVX-512:       ${ENABLE_AVX512}")
 message(STATUS "  AVX-512 VBMI:  ${ENABLE_AVX512_VBMI}")

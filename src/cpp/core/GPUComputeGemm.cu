@@ -227,6 +227,71 @@ namespace tinycoder::gpu {
         return true;
     }
 
+    // Host-side diagnostic: the AFFINE Q4_K int8 tensor-core MMQ GEMM/GEMV.
+    // Like debugMmqGemm the caller supplies the packed q B cells + the two
+    // per-(n8,k16,nrow) scale arrays from Int8Pack::packMmaQ4K, so the unit
+    // test compares the mma kernel against a reference built on the SAME packed
+    // weights and the SAME GPU-quantized activations.  The Q4_K affine term
+    // (w = d*sc*q - dmin*m) is handled by kMmqGemmQ4K_Affine: the tensor core
+    // produces sum(q*y8), the kernel subtracts dmn*bsum32 and folds d8.
+    bool GPUModel::debugMmqQ4K(const int8_t *qPacked, const float *dsc,
+                               const float *dmn, uint32_t rows, uint32_t cols,
+                               const float *x, uint32_t seq, float *out,
+                               uint8_t *outXq) {
+        if (!mmqS8Supported()) return false;
+        if (cols % 32u != 0u) return false;// a k16-tile must not straddle groups
+        const uint32_t n8Tiles = (rows + 7u) / 8u;
+        const uint32_t k16Tiles = (cols + 15u) / 16u;
+        const uint32_t blocksPerRow = (cols + 255u) / 256u;
+        const size_t bBytes = static_cast<size_t>(n8Tiles) * k16Tiles * 128;
+        const size_t scBytes = static_cast<size_t>(n8Tiles) * k16Tiles * 8;
+        const size_t xqBytes = static_cast<size_t>(seq) * blocksPerRow *
+                               kQ8K_STRIDE;
+
+        int8_t *dW = nullptr;
+        float *dDsc = nullptr, *dDmn = nullptr, *dX = nullptr, *dY = nullptr;
+        uint8_t *dXq = nullptr;
+        cudaMalloc(&dW, bBytes);
+        cudaMalloc(&dDsc, scBytes * sizeof(float));
+        cudaMalloc(&dDmn, scBytes * sizeof(float));
+        cudaMalloc(&dX, static_cast<size_t>(seq) * cols * sizeof(float));
+        cudaMalloc(&dXq, xqBytes);
+        cudaMalloc(&dY, static_cast<size_t>(seq) * rows * sizeof(float));
+        cudaMemcpy(dW, qPacked, bBytes, cudaMemcpyHostToDevice);
+        cudaMemcpy(dDsc, dsc, scBytes * sizeof(float),
+                   cudaMemcpyHostToDevice);
+        cudaMemcpy(dDmn, dmn, scBytes * sizeof(float),
+                   cudaMemcpyHostToDevice);
+        cudaMemcpy(dX, x, static_cast<size_t>(seq) * cols * sizeof(float),
+                   cudaMemcpyHostToDevice);
+        // Quantize each token's activation with the EXACT kQuantizeQ8K the
+        // production paths use (bit-exact with GGMLDequantize::quantizeQ8K).
+        for (uint32_t s = 0; s < seq; ++s) {
+            kQuantizeQ8K<<<blocksPerRow, 256, 0, g_stream>>>(
+                    dX + static_cast<size_t>(s) * cols,
+                    dXq + static_cast<size_t>(s) * blocksPerRow * kQ8K_STRIDE,
+                    cols);
+        }
+        const dim3 grid(n8Tiles, (seq + 63u) / 64u);
+        kMmqGemmQ4K_Affine<<<grid, 256, 0, g_stream>>>(
+                dW, dDsc, dDmn, reinterpret_cast<const int8_t *>(dXq), dY,
+                static_cast<int>(seq), static_cast<int>(rows),
+                static_cast<int>(cols), static_cast<int>(k16Tiles),
+                static_cast<int>(blocksPerRow * kQ8K_STRIDE));
+        cudaStreamSynchronize(g_stream);
+        cudaMemcpy(out, dY, static_cast<size_t>(seq) * rows * sizeof(float),
+                   cudaMemcpyDeviceToHost);
+        if (outXq != nullptr)
+            cudaMemcpy(outXq, dXq, xqBytes, cudaMemcpyDeviceToHost);
+        cudaFree(dW);
+        cudaFree(dDsc);
+        cudaFree(dDmn);
+        cudaFree(dX);
+        cudaFree(dXq);
+        cudaFree(dY);
+        return true;
+    }
+
     // Host-side diagnostic: run kQuantizeQ8K on x and copy the quantized
     // 256-wide Q8_K block bytes (kQ8K_STRIDE each) back to the host so a unit
     // test can diff the GPU activation quantization against the CPU's
