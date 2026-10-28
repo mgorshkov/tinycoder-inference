@@ -383,6 +383,32 @@ namespace tinycoder::gpu {
                           uint32_t rows, uint32_t cols, const float *x,
                           uint32_t seq, float *out, uint8_t *outXq);
 
+        /// @brief Debug: run the AFFINE Q4_K int8 tensor-core MMQ GEMM/GEMV
+        /// (kQuantizeQ8K + kMmqGemmQ4K_Affine, mma.s8.m8n8k16) on an
+        /// already-packed Q4_K matrix and a batch of activations.  Q4_K
+        /// dequantizes as w = d*sc*q - dmin*m, so unlike the pure-scale
+        /// kMmqGemm_8x8x16 this kernel adds the per-32-group activation-sum
+        /// min term outside the tensor core.  Used by unit tests to compare the
+        /// affine mma path against kQGemmKxQ8K<kTypeQ4K>.
+        /// @param qPacked int8 B cells from Int8Pack::packMmaQ4K
+        ///        (ceil(rows/8) * ceil(cols/16) * 128 bytes)
+        /// @param dsc,dmn per-(n8-tile, k16-tile, n-row) d*sc / dmin*m floats
+        ///        from Int8Pack::packMmaQ4K (ceil(rows/8)*ceil(cols/16)*8 each)
+        /// @param rows, cols PACKED matrix geometry (cols must be a multiple of
+        ///        32 so a weight k16-tile never straddles a 32-group)
+        /// @param x seq-row-major fp32 activation (seq * cols)
+        /// @param seq Number of activation rows (prefill batch / 1 for decode)
+        /// @param out seq-row-major fp32 output (seq * rows)
+        /// @param outXq Optional: receives the GPU-quantized Q8_K activations
+        ///        (seq * ceil(cols/256) * kQ8K_STRIDE bytes) so the caller can
+        ///        recompute the reference on the EXACT bytes the kernel used.
+        /// @return false (out untouched) if this GPU has no int8 m8n8k16
+        ///        tensor-core mma (pre-Turing) or CUDA is unavailable.
+        bool debugMmqQ4K(const int8_t *qPacked, const float *dsc,
+                         const float *dmn, uint32_t rows, uint32_t cols,
+                         const float *x, uint32_t seq, float *out,
+                         uint8_t *outXq);
+
         /// @brief Debug: quantize x with kQuantizeQ8_0x32 and emit the
         /// per-block float contributions kQGemvQ8_0xQ8K would accumulate.
         /// Fills outBlk[0..blocksPerRow) (host) and outQuant[0..
@@ -818,6 +844,14 @@ namespace tinycoder::gpu {
         // the largest blocksPerRow.
         uint8_t *q8k_ = nullptr;
         uint64_t q8kBytes_ = 0;
+        // Batched-prefill Q8_K scratch for the dense-qwen35 GEMM
+        // (launchQGemm / kQGemmKxQ8K): [seqLen][blocksPerRow] Q8_K blocks, so
+        // one quantize covers the whole prompt and every weight block is read
+        // once per 4-token group instead of once per token.  Separate from q8k_
+        // (which is single-token-sized and reused mid-layer).  Grown on demand;
+        // freed in destroy().
+        uint8_t *q8kPrefill_ = nullptr;
+        uint64_t q8kPrefillBytes_ = 0;
         // Pinned host staging for the logits D2H (2026-10-10): the caller's
         // logits buffer is pageable, so a direct async D2H runs through the
         // driver's slow staged path (~4 GB/s measured).  Device -> pinned

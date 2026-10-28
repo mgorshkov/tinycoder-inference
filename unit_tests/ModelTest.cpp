@@ -98,20 +98,35 @@ TEST(GGUFMetadataTest, LoadMetadata) {
         EXPECT_EQ(cfg.attentionKeyLength, cfg.attentionValueLength);
     }
     if (cfg.architecture == ARCH_QWEN35) {
-        // Qwen35 (dense) hybrid: 48 recurrent + 16 full-attention + 1 MTP.
-        EXPECT_EQ(cfg.numLayers - cfg.nextnPredictLayers, 64u);
+        // Qwen35 (dense) gated-delta-net hybrid.  The structural invariants
+        // below are shared by every dense qwen35 checkpoint (Qwen3.8-27B,
+        // Ternary-Bonsai-2-27B, Ornith-1.5-9B): full-attention every 4th
+        // layer, MRoPE with 64 rotated dims / sections [t, h, w, e] =
+        // [11, 11, 10, 0], and the GDN SSM geometry.
         EXPECT_EQ(cfg.fullAttentionInterval, 4u);
         EXPECT_EQ(cfg.ropeDimensionCount, 64u);
-        EXPECT_EQ(cfg.ssmInnerSize, 6144u);
         EXPECT_EQ(cfg.ssmStateSize, 128u);
         EXPECT_EQ(cfg.ssmGroupCount, 16u);
-        EXPECT_EQ(cfg.ssmTimeStepRank, 48u);
         EXPECT_EQ(cfg.ssmConvKernel, 4u);
-        // MRoPE sections [t, h, w, e] = [11, 11, 10, 0].
         EXPECT_EQ(cfg.ropeDimensionSections[0], 11u);
         EXPECT_EQ(cfg.ropeDimensionSections[1], 11u);
         EXPECT_EQ(cfg.ropeDimensionSections[2], 10u);
         EXPECT_EQ(cfg.ropeDimensionSections[3], 0u);
+        // Layer count and SSM width are file-shape specific, so key them on
+        // the hidden size instead of hard-coding the 27B constants.
+        if (cfg.hiddenSize == 5120) {
+            // Qwen3.8-27B / Ternary-Bonsai-2-27B: 48 recurrent + 16
+            // full-attention (plus a 1-layer MTP block on Qwen3.8-27B).
+            EXPECT_EQ(cfg.numLayers - cfg.nextnPredictLayers, 64u);
+            EXPECT_EQ(cfg.ssmInnerSize, 6144u);
+            EXPECT_EQ(cfg.ssmTimeStepRank, 48u);
+        } else if (cfg.hiddenSize == 4096) {
+            // Ornith-1.5-9B: 24 recurrent + 8 full-attention, 32 layers,
+            // no MTP block.
+            EXPECT_EQ(cfg.numLayers - cfg.nextnPredictLayers, 32u);
+            EXPECT_EQ(cfg.ssmInnerSize, 4096u);
+            EXPECT_EQ(cfg.ssmTimeStepRank, 32u);
+        }
     } else if (cfg.architecture != ARCH_QWEN35MOE) {
         EXPECT_EQ(cfg.headDim, cfg.hiddenSize / cfg.numAttentionHeads);
     }
@@ -166,11 +181,16 @@ TEST_F(ModelTest, TokenizerEncodeDecode) {
     }
     EXPECT_FALSE(decoded.empty());
 
-    // Test special tokens
+    // Test special tokens.  EOS is mandatory (it stops generation); BOS is
+    // optional — checkpoints such as Ornith-1.5 ship add_bos_token=0 and
+    // expose no BOS id, so only validate a BOS id when one is provided.
     int32_t bos = tokenizer.bosTokenId();
     int32_t eos = tokenizer.eosTokenId();
-    EXPECT_GE(bos, 0);
     EXPECT_GE(eos, 0);
+    if (bos >= 0) {
+        EXPECT_LT(static_cast<uint32_t>(bos),
+                  SharedTestEnv::config.vocabSize);
+    }
 }
 
 // ---------------------------------------------------------------------------

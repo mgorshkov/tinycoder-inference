@@ -2608,6 +2608,271 @@ namespace tinycoder::gpu {
             }
         }
 
+        // Affine Q4_K prefill/decode GEMM reading the RAW GGML Q4_K weights
+        // (no pre-pack), so the int8 tensor-core path costs ZERO extra VRAM --
+        // the packed kMmqGemmQ4K_Affine needs a ~1.5x weight copy that does not
+        // fit the 11 GB card for a 9B Q4_K model.  Q4_K is affine
+        // (w = d*sc*q - dmin*m); lane L of the mma B fragment needs weight row
+        // (n0 + L/4) at columns k0 + (L%4)*4 .. +3.  In the raw block those 4
+        // 4-bit q live in 4 consecutive bytes
+        //   qs[32*(i>>1) + (k0%32) + (L%4)*4 .. +3]   (i = covering 32-group)
+        // (low nibble for even i, high for odd), so one 4-aligned u32 load +
+        // nibble select yields the whole per-lane B word.  The dsc=d*sc /
+        // dmn=dmin*m of the covering 32-group come straight from the block
+        // header.  Geometry identical to kMmqGemm_8x8x16 (8 warps x 8 tokens x
+        // 8 rows); grid = (n8Tiles, ceil(seq/64)); actStride = blocksPerRow*kQ8K_STRIDE.
+        // Same accumulation class as kxQ8KBlockDot<Q4_K> (d8*(main-min)), NOT
+        // bit-exact; the batch-vs-sequential contract tolerates that.
+        __global__ void __launch_bounds__(256) kMmqGemmQ4K_AffineRaw(
+                const uint8_t *__restrict__ w, const int8_t *__restrict__ xq,
+                float *__restrict__ y, int seq, int rows, int cols,
+                int rowBytes, int k16Tiles, int actStride) {
+            const int lane = threadIdx.x & 31;
+            const int warp = threadIdx.x >> 5;
+            const int nt = blockIdx.x;
+            const int n0 = nt * 8;
+            const int m0 = (blockIdx.y * 8 + warp) * 8;
+            const int token = m0 + (lane >> 2);
+            const bool active = token < seq;
+            const int nrow0 = (lane & 3) * 2;
+            const int nrow1 = nrow0 + 1;
+            const int nGroups = (cols + 31) >> 5;
+            const int nB = n0 + (lane >> 2);// mma B row = W row for this lane
+            const uint8_t *rowBase = w + static_cast<size_t>(nB) * rowBytes;
+            const bool bRowValid = nB < rows;
+
+            int32_t D[2] = {0, 0};
+            float main0 = 0.0f, main1 = 0.0f;
+            float min0 = 0.0f, min1 = 0.0f;
+            float row0 = 0.0f, row1 = 0.0f;
+            for (int gg = 0; gg < nGroups; ++gg) {
+                const int kt = 2 * gg;
+#pragma unroll
+                for (int half = 0; half < 2; ++half) {
+                    const int k0 = (kt + half) * 16;
+                    if (kt + half >= k16Tiles) break;
+                    const int gblock = k0 >> 8;
+                    const int i = (k0 & 255) >> 5;
+                    const int jb = (k0 & 31) + (lane & 3) * 4;
+                    uint32_t qw = 0;
+                    if (bRowValid) {
+                        std::memcpy(&qw,
+                                    rowBase +
+                                            static_cast<size_t>(gblock) *
+                                                    kQ4K_BYTES +
+                                            16 + 32 * (i >> 1) + jb,
+                                    sizeof(uint32_t));
+                        qw = ((i & 1) == 0) ? (qw & 0x0F0F0F0Fu)
+                                            : ((qw >> 4) & 0x0F0F0F0Fu);
+                    }
+                    const uint32_t a = active
+                                               ? mmqLoadAFrag(xq, actStride,
+                                                              token, k0, lane)
+                                               : 0u;
+                    mmaS8_8x8x16(D, a, qw);
+                }
+                // dsc/dmn of the covering 32-group gg for the two output rows
+                // this lane owns.
+                const int i = gg & 7;
+                const int gblk = gg >> 3;
+                float dsc0 = 0.0f, dmn0 = 0.0f, dsc1 = 0.0f, dmn1 = 0.0f;
+                {
+                    const int n = n0 + nrow0;
+                    if (n < rows) {
+                        const uint8_t *b = w +
+                                           static_cast<size_t>(n) * rowBytes +
+                                           static_cast<size_t>(gblk) *
+                                                   kQ4K_BYTES;
+                        const float d = __half2float(
+                                *reinterpret_cast<const __half *>(b));
+                        const float dmin = __half2float(
+                                *reinterpret_cast<const __half *>(b + 2));
+                        const uint8_t *scales = b + 4;
+                        uint8_t sc, m;
+                        if (i < 4) {
+                            sc = scales[i] & 63u;
+                            m = scales[i + 4] & 63u;
+                        } else {
+                            sc = static_cast<uint8_t>(
+                                    (scales[i + 4] & 0xFu) |
+                                    ((scales[i - 4] >> 6) << 4));
+                            m = static_cast<uint8_t>(
+                                    (scales[i + 4] >> 4) |
+                                    ((scales[i] >> 6) << 4));
+                        }
+                        dsc0 = d * static_cast<float>(sc);
+                        dmn0 = dmin * static_cast<float>(m);
+                    }
+                }
+                {
+                    const int n = n0 + nrow1;
+                    if (n < rows) {
+                        const uint8_t *b = w +
+                                           static_cast<size_t>(n) * rowBytes +
+                                           static_cast<size_t>(gblk) *
+                                                   kQ4K_BYTES;
+                        const float d = __half2float(
+                                *reinterpret_cast<const __half *>(b));
+                        const float dmin = __half2float(
+                                *reinterpret_cast<const __half *>(b + 2));
+                        const uint8_t *scales = b + 4;
+                        uint8_t sc, m;
+                        if (i < 4) {
+                            sc = scales[i] & 63u;
+                            m = scales[i + 4] & 63u;
+                        } else {
+                            sc = static_cast<uint8_t>(
+                                    (scales[i + 4] & 0xFu) |
+                                    ((scales[i - 4] >> 6) << 4));
+                            m = static_cast<uint8_t>(
+                                    (scales[i + 4] >> 4) |
+                                    ((scales[i] >> 6) << 4));
+                        }
+                        dsc1 = d * static_cast<float>(sc);
+                        dmn1 = dmin * static_cast<float>(m);
+                    }
+                }
+                int32_t bsum32 = 0;
+                if (active) {
+                    const int8_t *blkA =
+                            xq + static_cast<size_t>(token) * actStride +
+                            static_cast<size_t>(gblk) * kQ8K_STRIDE;
+                    const int16_t *bs = reinterpret_cast<const int16_t *>(
+                            blkA + kQ8K_B);
+                    bsum32 = static_cast<int>(bs[2 * i]) +
+                             static_cast<int>(bs[2 * i + 1]);
+                }
+                main0 += dsc0 * static_cast<float>(D[0]);
+                main1 += dsc1 * static_cast<float>(D[1]);
+                min0 += dmn0 * static_cast<float>(bsum32);
+                min1 += dmn1 * static_cast<float>(bsum32);
+                D[0] = 0;
+                D[1] = 0;
+                if (((gg & 7) == 7) || (gg == nGroups - 1)) {
+                    const float ad = active
+                                             ? *reinterpret_cast<const float *>(
+                                                       xq + static_cast<size_t>(token) * actStride +
+                                                       static_cast<size_t>(
+                                                               gg >> 3) *
+                                                               kQ8K_STRIDE +
+                                                       kQ8K_D)
+                                             : 0.0f;
+                    row0 += ad * (main0 - min0);
+                    row1 += ad * (main1 - min1);
+                    main0 = 0.0f;
+                    main1 = 0.0f;
+                    min0 = 0.0f;
+                    min1 = 0.0f;
+                }
+            }
+            if (active) {
+                const int nOut0 = n0 + nrow0;
+                const int nOut1 = n0 + nrow1;
+                if (nOut0 < rows)
+                    y[static_cast<size_t>(token) * rows + nOut0] = row0;
+                if (nOut1 < rows)
+                    y[static_cast<size_t>(token) * rows + nOut1] = row1;
+            }
+        }
+
+        // Affine Q4_K prefill/decode GEMM on the int8 tensor cores (2026-10-29).
+        // Geometry identical to kMmqGemm_8x8x16 (8 warps x 8 tokens x 8 rows),
+        // but the weight is the AFFINE Q4_K decode  w = d*sc*q - dmin*m  (q in
+        // 0..15, exact), which the pure-scale kMmqGemm kernel does not model.
+        // Per 32-column Q8_K group the dot is
+        //   sum_c w*x = d8 * ( dsc*D_int - dmn*bsum32 )
+        // where D_int = sum_c q*y8 is produced by the tensor-core mma,
+        // dsc = d*sc and dmn = dmin*m are the packMmaQ4K per-(n8,k16,nrow)
+        // scales, bsum32 = bsums[2s]+bsums[2s+1] is the activation 32-group
+        // sum, and d8 the Q8_K block scale.  main/min are kept separate per
+        // 256-block and folded by d8, matching kxQ8KBlockDot<Q4_K>'s
+        // d8*(ms-mns) -- the same accumulation class, so it matches
+        // kQGemmKxQ8K<Q4_K> to ~1e-3 (it is NOT bit-exact: the Q8_K activation
+        // quantization and the float fold differ; the engine's batch-vs-
+        // sequential contract allows that, see ModelTest).
+        // grid = (n8Tiles, ceil(seq / 64)); actStride = blocksPerRow*kQ8K_STRIDE.
+        __global__ void __launch_bounds__(256) kMmqGemmQ4K_Affine(
+                const int8_t *__restrict__ qpk, const float *__restrict__ dsc,
+                const float *__restrict__ dmn, const int8_t *__restrict__ xq,
+                float *__restrict__ y, int seq, int rows, int cols,
+                int k16Tiles, int actStride) {
+            const int lane = threadIdx.x & 31;
+            const int warp = threadIdx.x >> 5;
+            const int nt = blockIdx.x;
+            const int n0 = nt * 8;
+            const int m0 = (blockIdx.y * 8 + warp) * 8;
+            const int token = m0 + (lane >> 2);
+            const bool active = token < seq;
+            const int nrow0 = (lane & 3) * 2;
+            const int nrow1 = nrow0 + 1;
+            const int scRowBase = nt * k16Tiles;
+            const int nGroups = (cols + 31) >> 5;
+
+            int32_t D[2] = {0, 0};
+            float main0 = 0.0f, main1 = 0.0f;
+            float min0 = 0.0f, min1 = 0.0f;
+            float row0 = 0.0f, row1 = 0.0f;
+            for (int gg = 0; gg < nGroups; ++gg) {
+                const int kt = 2 * gg;
+                {
+                    const uint32_t a = active ? mmqLoadAFrag(xq, actStride,
+                                                             token, kt * 16, lane)
+                                              : 0u;
+                    const uint32_t b = mmqLoadBCell(qpk, scRowBase + kt, lane);
+                    mmaS8_8x8x16(D, a, b);
+                }
+                if (kt + 1 < k16Tiles) {
+                    const uint32_t a = active
+                                               ? mmqLoadAFrag(xq, actStride,
+                                                              token, (kt + 1) * 16,
+                                                              lane)
+                                               : 0u;
+                    const uint32_t b =
+                            mmqLoadBCell(qpk, scRowBase + kt + 1, lane);
+                    mmaS8_8x8x16(D, a, b);
+                }
+                int32_t bsum32 = 0;
+                if (active) {
+                    const int8_t *blkA =
+                            xq + static_cast<size_t>(token) * actStride +
+                            static_cast<size_t>(gg >> 3) * kQ8K_STRIDE;
+                    const int16_t *bs = reinterpret_cast<const int16_t *>(
+                            blkA + kQ8K_B);
+                    bsum32 = static_cast<int>(bs[2 * (gg & 7)]) +
+                             static_cast<int>(bs[2 * (gg & 7) + 1]);
+                }
+                const int scIdx = (scRowBase + kt) * 8;
+                main0 += dsc[scIdx + nrow0] * static_cast<float>(D[0]);
+                main1 += dsc[scIdx + nrow1] * static_cast<float>(D[1]);
+                min0 += dmn[scIdx + nrow0] * static_cast<float>(bsum32);
+                min1 += dmn[scIdx + nrow1] * static_cast<float>(bsum32);
+                D[0] = 0;
+                D[1] = 0;
+                if (((gg & 7) == 7) || (gg == nGroups - 1)) {
+                    const float ad = active
+                                             ? *reinterpret_cast<const float *>(
+                                                       xq + static_cast<size_t>(token) * actStride +
+                                                       static_cast<size_t>(gg >> 3) * kQ8K_STRIDE +
+                                                       kQ8K_D)
+                                             : 0.0f;
+                    row0 += ad * (main0 - min0);
+                    row1 += ad * (main1 - min1);
+                    main0 = 0.0f;
+                    main1 = 0.0f;
+                    min0 = 0.0f;
+                    min1 = 0.0f;
+                }
+            }
+            if (active) {
+                const int nOut0 = n0 + nrow0;
+                const int nOut1 = n0 + nrow1;
+                if (nOut0 < rows)
+                    y[static_cast<size_t>(token) * rows + nOut0] = row0;
+                if (nOut1 < rows)
+                    y[static_cast<size_t>(token) * rows + nOut1] = row1;
+            }
+        }
+
         // ------------------------------------------------------------------
         // Q8_1 activation path (2026-10-08, Q8_1-Q2_K experiment). It differs
         // from our existing Q8_K path (256-wide, sign-forced d<0, per-16 bsums)
@@ -2981,6 +3246,88 @@ namespace tinycoder::gpu {
                 return (e != nullptr && std::atoi(e) != 0);
             }();
             return v;
+        }
+
+        // 2026-10-29: 4-rows-per-warp Q4_K Q8_K decode GEMV (kQGemvQ4KxQ8K_4xW).
+        // The generic kQGemvKxQ8K<kTypeQ4K> runs one row per warp (only 8 of 32
+        // lanes issue weight loads) and scalar-loads each 32-byte q's strip, so
+        // the LARGEST quant class of the dense qwen35 models (Q4_K ~2.7 GB of
+        // Ornith-1.5-9B's 5.9 GB) has no 4xW kernel while Q5_K/Q6_K do.  The
+        // new kernel mirrors kQGemvQ5KxQ8K_4xW (4 rows/warp, all 32 lanes load)
+        // with an 8x __dp4a integer body; bit-exact with the generic kernel.
+        // DEFAULT ON: TINYCODER_Q4K_4XW=0 restores the generic kernel for A/B.
+        inline bool q4k4xw() {
+            static const bool v = [] {
+                const char *e = std::getenv("TINYCODER_Q4K_4XW");
+                return (e == nullptr || std::atoi(e) != 0);
+            }();
+            return v;
+        }
+
+        // 2026-10-29: warps per block for the Q4_K 4xW decode GEMV.  The 4xW
+        // grid is rows/4/warps, so for the dense-qwen35 shapes (rows 4096/12288)
+        // the default 8-warp block yields only ~128-384 blocks -- often under
+        // one wave on the 68-SM 2080 Ti, i.e. occupancy-starved.  Smaller
+        // blocks give more blocks (better SM fill) at more block-fixed cost.
+        // TINYCODER_Q4K_BSY=N overrides the default 8.
+        inline int q4kBsy() {
+            static const int v = [] {
+                const char *e = std::getenv("TINYCODER_Q4K_BSY");
+                int n = (e != nullptr) ? std::atoi(e) : 8;
+                return (n >= 1 && n <= 32) ? n : 8;
+            }();
+            return v;
+        }
+
+        // 2026-10-29: kQ35L2NormRepeat previously recomputed the same headK-wide
+        // double L2 norm for every element of a slice's headK*nVHeads output
+        // (the per-slice norm depends only on the value head).  The fast path
+        // computes each slice's iq/ik once (shared memory), bit-identically.
+        // DEFAULT ON: TINYCODER_L2NORM_SMEM=0 restores the recompute body.
+        inline bool l2NormSmem() {
+            static const bool v = [] {
+                const char *e = std::getenv("TINYCODER_L2NORM_SMEM");
+                return (e == nullptr || std::atoi(e) != 0);
+            }();
+            return v;
+        }
+
+        // 2026-10-29: int8 tensor-core (mma.s8.m8n8k16) prefill GEMM for Q4_K.
+        // The affine Q4_K path (kMmqGemmQ4K_AffineRaw) reads the RAW GGML
+        // weights (no pre-pack), costs zero extra VRAM, and feeds the same
+        // Q8_K activations the integer kQGemmKxQ8K<Q4_K> path already produces.
+        // It is NOT bit-exact with that path (different float fold), so the
+        // batch-vs-sequential contract (top-1 coherence) is the acceptance bar;
+        // DEFAULT OFF until an A/B shows a clear prefill win.
+        // TINYCODER_MMQ_Q4K=1 enables; TINYCODER_MMQ_Q4K=0 forces it off.
+        inline bool mmqQ4k() {
+            static const bool v = [] {
+                const char *e = std::getenv("TINYCODER_MMQ_Q4K");
+                return (e != nullptr && std::atoi(e) != 0);
+            }();
+            return v;
+        }
+
+        // Runtime gate: does THIS device expose the int8 m8n8k16 mma the MMQ
+        // kernels need (Turing sm_75+)?  Cached after the first query.  The
+        // kernels are only COMPILED for the gencode arch list; this is the
+        // runtime half (so a pre-Turing device never launches them).
+        inline bool mmqS8Ok() {
+            static const int v = [] {
+                int dev = 0;
+                if (cudaGetDevice(&dev) != cudaSuccess) return 0;
+                int major = 0, minor = 0;
+                if (cudaDeviceGetAttribute(
+                            &major, cudaDevAttrComputeCapabilityMajor, dev) !=
+                    cudaSuccess)
+                    return 0;
+                if (cudaDeviceGetAttribute(
+                            &minor, cudaDevAttrComputeCapabilityMinor, dev) !=
+                    cudaSuccess)
+                    return 0;
+                return (major > 7 || (major == 7 && minor >= 5)) ? 1 : 0;
+            }();
+            return v != 0;
         }
 
         // bytes in flight -- not a different inner loop. Dot values are the
@@ -3806,13 +4153,33 @@ namespace tinycoder::gpu {
                     }
                     dsv = d * static_cast<float>(sc);
                     mnv = dmin * static_cast<float>(m);
+                    const uint32_t half = i & 1u;
                     const uint8_t *qsb = qsv + 32u * (i >> 1u);
-                    for (uint32_t j = 0; j < 32u; ++j) {
-                        const uint8_t qb = qsb[j];
-                        const uint8_t wv = ((i & 1u) == 0) ? (qb & 0xFu)
-                                                           : (qb >> 4);
-                        s32q += static_cast<int>(wv) *
-                                static_cast<int>(y8[i * 32u + j]);
+                    const int8_t *yp = y8 + i * 32u;
+                    // VECTORIZED integer body (2026-10-29): 8x __dp4a replaces
+                    // the 32 scalar byte-loads + per-byte nibble select that
+                    // made this the scalar bottleneck of BOTH the generic
+                    // 1-row GEMV and the batched prefill GEMM
+                    // (kQGemmKxQ8K).  qsb is 4-aligned (rowBytes 144 % 4 == 0,
+                    // qsv=blkW+16, 32*(i>>1), 4-B steps), so the u32 loads are
+                    // aligned.  w32 holds the 4 packed 0..15 weights, yb4 the 4
+                    // signed int8 activations; the integer sum is exact and
+                    // order-free, so s32q is bit-identical to the scalar body
+                    // and the float fold below is unchanged.  This is the same
+                    // dp4a body as kxQ4KBlockDotVec (4-rows-per-warp kernel);
+                    // it lifts the prefill GEMM (the dense-qwen35 prefill cost)
+                    // without touching any output bit.
+#pragma unroll
+                    for (uint32_t j = 0; j < 32u; j += 4u) {
+                        const uint32_t wb4 =
+                                *reinterpret_cast<const uint32_t *>(qsb + j);
+                        const uint32_t yb4 =
+                                *reinterpret_cast<const uint32_t *>(yp + j);
+                        const uint32_t w32 =
+                                (half == 0u) ? (wb4 & 0x0F0F0F0Fu)
+                                             : ((wb4 >> 4) & 0x0F0F0F0Fu);
+                        s32q = __dp4a(static_cast<int>(w32),
+                                      static_cast<int>(yb4), s32q);
                     }
                 }
                 int ss8[8];
@@ -4264,6 +4631,95 @@ namespace tinycoder::gpu {
             if (I == 0) out[row] = rr;
         }
 
+        // ---- Batched Q8_K prefill GEMM (K-quant weights x a TOKEN BATCH). ----
+        // The dense-qwen35 prefill used to run launchQGemv once per prompt
+        // token, re-reading every weight matrix seqLen times (pp == tg).  This
+        // kernel reads each weight block ONCE per 4-token group and dots it
+        // against 4 Q8_K activation planes, so prefill becomes weight-bound.
+        //
+        // BIT-EXACT with the per-token launchQGemv(Q8_K) path: one warp owns
+        // 4 tokens x 1 weight row -- lane group (lane>>3) = token rr in
+        // {0,1,2,3}, sub-lane Iid = lane&7 = the 8 sub-blocks of that row.
+        // kxQ8KBlockDot is called with GROUPED=true so the 8-lane reduction
+        // stays inside each token group (shuffle width 8) and every (row,
+        // token) reproduces the exact single-token association:
+        //   * Q4_K/Q5_K/IQ4_XS: lane-0 (Iid==0) serial block fold -- identical
+        //     `running = pFin + running` chain;
+        //   * Q6_K: the 8-lane tree (xor 4,1,2) of kQGemvKxQ8K, confined to the
+        //     token's group.
+        // So y[t*rows + row] is byte-identical to launchQGemv(m, token t).
+        // `x` is [seqLen][blocksPerRow] Q8_K blocks (actStride bytes/token);
+        // grid = (ceil(rows/8),), block = (32,8).  Rows must be %4-free: any
+        // rows count works (each warp handles 8 rows).
+        template<int TYPE>
+        __global__ void kQGemmKxQ8K(const uint8_t *__restrict__ w,
+                                    const uint8_t *__restrict__ x,
+                                    float *__restrict__ out, uint32_t rows,
+                                    uint32_t blocksPerRow, uint32_t rowBytes,
+                                    uint32_t actStride, uint32_t seqLen) {
+            const uint32_t lane = threadIdx.x;
+            // lane group (lane>>3) = token rr in {0,1,2,3}; sub-lane Iid = the
+            // 8 sub-blocks of the row.  grid.y steps 4 tokens, so every weight
+            // block is dotted against 4 token activations per read (vs ONE in
+            // the per-token GEMV), which is the whole prefill win.
+            const uint32_t rr = lane >> 3u;
+            const uint32_t Iid = lane & 7u;
+            const uint32_t tok = blockIdx.y * 4u + rr;
+            const bool tokValid = tok < seqLen;
+            const uint32_t tokc = tokValid ? tok : 0u;
+            const uint32_t row = blockIdx.x * blockDim.y + threadIdx.y;
+            if (row >= rows) return;
+            const uint8_t *rp = w + static_cast<uint64_t>(row) * rowBytes;
+            const uint8_t *xt = x + static_cast<uint64_t>(tokc) * actStride;
+            constexpr uint32_t kBlkBytes =
+                    (TYPE == kTypeQ4K)     ? kQ4K_BYTES
+                    : (TYPE == kTypeQ5K)   ? kQ5K_BYTES
+                    : (TYPE == kTypeIQ4XS) ? kIQ4XS_BYTES
+                                           : kQ6K_BYTES;
+            float sumf = 0.0f;
+            uint32_t b = 0;
+            for (; b + 4u <= blocksPerRow; b += 4u) {
+                float r0 = 0.0f, r1 = 0.0f, r2 = 0.0f, r3 = 0.0f;
+                kxQ8KBlockDot<TYPE, false, true>(
+                        r0, rp + static_cast<uint64_t>(b + 0u) * kBlkBytes,
+                        xt + static_cast<uint64_t>(b + 0u) * kQ8K_STRIDE, Iid);
+                kxQ8KBlockDot<TYPE, false, true>(
+                        r1, rp + static_cast<uint64_t>(b + 1u) * kBlkBytes,
+                        xt + static_cast<uint64_t>(b + 1u) * kQ8K_STRIDE, Iid);
+                kxQ8KBlockDot<TYPE, false, true>(
+                        r2, rp + static_cast<uint64_t>(b + 2u) * kBlkBytes,
+                        xt + static_cast<uint64_t>(b + 2u) * kQ8K_STRIDE, Iid);
+                kxQ8KBlockDot<TYPE, false, true>(
+                        r3, rp + static_cast<uint64_t>(b + 3u) * kBlkBytes,
+                        xt + static_cast<uint64_t>(b + 3u) * kQ8K_STRIDE, Iid);
+                if (TYPE == kTypeQ6K) {
+                    sumf = r0 + sumf;
+                    sumf = r1 + sumf;
+                    sumf = r2 + sumf;
+                    sumf = r3 + sumf;
+                } else if (Iid == 0) {
+                    sumf = r0 + sumf;
+                    sumf = r1 + sumf;
+                    sumf = r2 + sumf;
+                    sumf = r3 + sumf;
+                }
+            }
+            for (; b < blocksPerRow; ++b) {
+                kxQ8KBlockDot<TYPE, false, true>(
+                        sumf, rp + static_cast<uint64_t>(b) * kBlkBytes,
+                        xt + static_cast<uint64_t>(b) * kQ8K_STRIDE, Iid);
+            }
+            float *op = out + static_cast<uint64_t>(tokc) * rows + row;
+            if (TYPE == kTypeQ4K || TYPE == kTypeQ5K || TYPE == kTypeIQ4XS) {
+                if (Iid == 0 && tokValid) *op = sumf;
+            } else {
+                const float p = sumf + __shfl_xor_sync(0xffffffffu, sumf, 4);
+                const float q = p + __shfl_xor_sync(0xffffffffu, p, 1);
+                const float r = q + __shfl_xor_sync(0xffffffffu, q, 2);
+                if (Iid == 0 && tokValid) *op = r;
+            }
+        }
+
         // ---- Q5_K row GEMV (Q8_K activation), 4 ROWS PER WARP (2026-10-12).
         // Direct analogue of kQGemvQ6KxQ8K_4xW for the Q5_K LM head.  The
         // generic kQGemvKxQ8K<kTypeQ5K> runs one row per warp and only
@@ -4423,6 +4879,172 @@ namespace tinycoder::gpu {
             for (; b < blocksPerRow; ++b) {
                 kxQ5KBlockDotVec(
                         sumf, rp + static_cast<uint64_t>(b) * kQ5K_BYTES,
+                        x + static_cast<uint64_t>(b) * kQ8K_STRIDE, I);
+            }
+            // 8-lane shuffle-tree per row within each 4-row lane group (xor
+            // strides 4,1,2 stay inside the group's 8 lanes -- identical tree
+            // and store predicate to the 1-row-per-warp kernel).
+            const float p = sumf + __shfl_xor_sync(0xffffffffu, sumf, 4);
+            const float q = p + __shfl_xor_sync(0xffffffffu, p, 1);
+            const float rr = q + __shfl_xor_sync(0xffffffffu, q, 2);
+            if (I == 0) out[row] = rr;
+        }
+
+        // Group-local (4-rows-per-warp) Q4_K x Q8_K block dot, VECTORIZED.
+        // Direct analogue of kxQ5KBlockDotVec.  Same math as
+        // kxQ8KBlockDot<kTypeQ4K, false, true> (lines above) but the 32-column
+        // integer dot is done 4 columns at a time with __dp4a (signed int8,
+        // exact) instead of 32 scalar byte-loads + per-byte nibble/sign ops.
+        // Q4_K element map (bit-exact with the scalar body and with
+        // matMulVecBatchQ4K_Q8K_AVX2): for sub-block i (0..7), q-byte base
+        // qsv + 32*(i>>1), column j: byte j -> low nibble when (i&1)==0 else
+        // high nibble.  A u32 of 4 consecutive cols therefore yields the 4
+        // packed 4-bit weights exactly:
+        //   w32 = (half==0 ? wb4 : wb4>>4) & 0x0F0F0F0F
+        // Because integer addition is exact and associative, s32q is bit-
+        // identical to the scalar body; the dsv/mnv float fold (volatile
+        // no-FMA mul-then-add) and the d8*(ms-mns) epilogue are unchanged, so
+        // every row's output matches the generic kernel byte-for-byte.
+        __device__ __forceinline__ void kxQ4KBlockDotVec(
+                float &running, const uint8_t *__restrict__ blkW,
+                const uint8_t *__restrict__ blkA, uint32_t lane) {
+            const uint32_t Iid = lane & 7u;
+            const int16_t *bsums =
+                    reinterpret_cast<const int16_t *>(blkA + kQ8K_B);
+            const float d8 = *reinterpret_cast<const float *>(blkA + kQ8K_D);
+            int s32q = 0;
+            float dsv = 0.0f, mnv = 0.0f;
+            {
+                const uint32_t i = Iid;
+                const float d = __half2float(
+                        *reinterpret_cast<const __half *>(blkW));
+                const float dmin = __half2float(
+                        *reinterpret_cast<const __half *>(blkW + 2));
+                const uint8_t *scales = blkW + 4;
+                const uint8_t *qsv = blkW + 16;
+                uint8_t sc, m;
+                if (i < 4) {
+                    sc = scales[i] & 63u;
+                    m = scales[i + 4] & 63u;
+                } else {
+                    sc = static_cast<uint8_t>(
+                            (scales[i + 4] & 0xFu) |
+                            ((scales[i - 4] >> 6) << 4));
+                    m = static_cast<uint8_t>(
+                            (scales[i + 4] >> 4) |
+                            ((scales[i] >> 6) << 4));
+                }
+                dsv = d * static_cast<float>(sc);
+                mnv = dmin * static_cast<float>(m);
+                const uint32_t half = i & 1u;
+                const uint8_t *qsp = qsv + 32u * (i >> 1u);
+                const int8_t *yp =
+                        reinterpret_cast<const int8_t *>(blkA) + i * 32u;
+#pragma unroll
+                for (uint32_t j = 0; j < 32u; j += 4u) {
+                    // Q4_K rows are 144-B aligned (144 = 16*9), so qs (block
+                    // +16) stays 16-B aligned at 4-B steps -> direct aligned
+                    // u32 loads (same bytes as the scalar body, bit-identical).
+                    const uint32_t wb4 =
+                            *reinterpret_cast<const uint32_t *>(qsp + j);
+                    const uint32_t yb4 =
+                            *reinterpret_cast<const uint32_t *>(yp + j);
+                    const uint32_t w32 =
+                            (half == 0u) ? (wb4 & 0x0F0F0F0Fu)
+                                         : ((wb4 >> 4) & 0x0F0F0F0Fu);
+                    s32q = __dp4a(static_cast<int>(w32),
+                                  static_cast<int>(yb4), s32q);
+                }
+            }
+            int ss8[8];
+            float dss[8], mns8[8];
+#pragma unroll
+            for (uint32_t i = 0; i < 8; ++i) {
+                ss8[i] = __shfl_sync(0xffffffffu, s32q, i, 8u);
+                dss[i] = __shfl_sync(0xffffffffu, dsv, i, 8u);
+                mns8[i] = __shfl_sync(0xffffffffu, mnv, i, 8u);
+            }
+            if (Iid == 0) {
+                // Same volatile no-FMA discipline as kxQ8KBlockDot<kTypeQ4K>
+                // (the compiled CPU kernel has no ffp-contract; nvcc would
+                // otherwise fuse a*b+c into FFMA and break the bit-exact
+                // match).  Every expression below is verbatim from the scalar
+                // body so each row's output is byte-identical.
+                float ms = 0.0f, mns = 0.0f;
+#pragma unroll
+                for (uint32_t i = 0; i < 8; ++i) {
+                    const float bi = static_cast<float>(
+                            static_cast<int>(bsums[2 * i]) +
+                            static_cast<int>(bsums[2 * i + 1]));
+                    volatile float pMain = dss[i] * static_cast<float>(ss8[i]);
+                    ms = pMain + ms;
+                    volatile float pMin = mns8[i] * bi;
+                    mns = pMin + mns;
+                }
+                volatile float pFin = d8 * (ms - mns);
+                running = pFin + running;
+            }
+        }
+
+        // ---- Q4_K row GEMV (Q8_K activation), 4 ROWS PER WARP (2026-10-29).
+        // Direct analogue of kQGemvQ5KxQ8K_4xW.  The generic
+        // kQGemvKxQ8K<kTypeQ4K> runs one row per warp and only sub-lanes 0-7
+        // issue weight loads (24 of 32 lanes idle per instruction) AND serial-
+        // loads each 32-byte q's strip scalar (one LDG per column).  This
+        // kernel brings the two levers proven on the Q6_K/Q5_K 4xW kernels to
+        // the LARGEST quant class of the dense qwen35 models (Q4_K ~2.7 GB of
+        // Ornith-1.5-9B's 5.9 GB):
+        //   * all 32 lanes issue weight loads (8 sub-blocks x 4 rows per warp);
+        //   * the 32-column integer dot is 8x __dp4a instead of 32 byte loads.
+        // Bit-exact with kQGemvKxQ8K<kTypeQ4K>: the s32q integer sum is
+        // order-free and the float chain (volatile no-FMA dsv*ss8 / mnv*bi +
+        // d8*(ms-mns) epilogue) is verbatim, executed by every I, so each
+        // row's output is byte-identical to the generic kernel's lane-0 result.
+        // The terminal 8-lane shuffle tree stays inside each 4-row group and is
+        // the SAME association as the generic full-warp tree restricted to its
+        // 8 active lanes.  Requires rows % 4 == 0 (all real uses: dense qwen35
+        // attnO/ffnDown/ffnGate/ffnUp and the Q4_K LM head).
+        // Env gate TINYCODER_Q4K_4XW (default ON).
+        __global__ void kQGemvQ4KxQ8K_4xW(const uint8_t *__restrict__ w,
+                                          const uint8_t *__restrict__ x,
+                                          float *__restrict__ out, uint32_t rows,
+                                          uint32_t blocksPerRow,
+                                          uint32_t rowBytes) {
+            const uint32_t warpRowBase = blockIdx.x * blockDim.y + threadIdx.y;
+            const uint32_t base = warpRowBase * 4u;
+            if (base >= rows) return;
+            const uint32_t lane = threadIdx.x;
+            const uint32_t I = lane & 7u;
+            const uint32_t row = base + (lane >> 3u);
+            const uint8_t *rp = w + static_cast<uint64_t>(row) * rowBytes;
+            float sumf = 0.0f;
+            uint32_t b = 0;
+            for (; b + 4u <= blocksPerRow; b += 4u) {
+                float r0 = 0.0f, r1 = 0.0f, r2 = 0.0f, r3 = 0.0f;
+                kxQ4KBlockDotVec(
+                        r0,
+                        rp + static_cast<uint64_t>(b + 0u) * kQ4K_BYTES,
+                        x + static_cast<uint64_t>(b + 0u) * kQ8K_STRIDE, I);
+                kxQ4KBlockDotVec(
+                        r1,
+                        rp + static_cast<uint64_t>(b + 1u) * kQ4K_BYTES,
+                        x + static_cast<uint64_t>(b + 1u) * kQ8K_STRIDE, I);
+                kxQ4KBlockDotVec(
+                        r2,
+                        rp + static_cast<uint64_t>(b + 2u) * kQ4K_BYTES,
+                        x + static_cast<uint64_t>(b + 2u) * kQ8K_STRIDE, I);
+                kxQ4KBlockDotVec(
+                        r3,
+                        rp + static_cast<uint64_t>(b + 3u) * kQ4K_BYTES,
+                        x + static_cast<uint64_t>(b + 3u) * kQ8K_STRIDE, I);
+                sumf = r0 + sumf;
+                sumf = r1 + sumf;
+                sumf = r2 + sumf;
+                sumf = r3 + sumf;
+            }
+            for (; b < blocksPerRow; ++b) {
+                kxQ4KBlockDotVec(
+                        sumf, rp + static_cast<uint64_t>(b) * kQ4K_BYTES,
                         x + static_cast<uint64_t>(b) * kQ8K_STRIDE, I);
             }
             // 8-lane shuffle-tree per row within each 4-row lane group (xor
@@ -8578,6 +9200,94 @@ namespace tinycoder::gpu {
         __global__ void kQ35F32Gemv(const float *x, const float *w, float *out,
                                     uint32_t rows, uint32_t cols);
 
+        // Batched prefill GEMM: out[seqLen][rows] = X[seqLen][cols] @ W^T.
+        // Quantizes every token's activation to Q8_K once (into the caller's
+        // batched scratch) and runs kQGemmKxQ8K for the K-quant family, reading
+        // each weight block ONCE per 4-token group (vs once per token in the
+        // per-token launchQGemv loop).  Bit-exact with the per-token Q8_K
+        // launchQGemv path, so it is a drop-in for the qwen35 prefill that must
+        // stay numerically identical to decode.  Returns false (leaving `out`
+        // untouched) when the type/shape is not covered, so the caller can fall
+        // back to the exact per-token launchQGemv loop.
+        bool launchQGemm(int type, const void *wq, const float *x, float *out,
+                         uint32_t seqLen, uint32_t rows, uint32_t cols,
+                         uint32_t rowBytes, uint32_t blocksPerRow,
+                         uint8_t *q8kBatch, uint64_t q8kBatchBytes) {
+            if (seqLen == 0 || rows == 0 || cols == 0) return true;
+            // Which kernel template + block bytes for this type.
+            const uint32_t kBlkBytes =
+                    (type == kTypeQ4K)     ? kQ4K_BYTES
+                    : (type == kTypeQ5K)   ? kQ5K_BYTES
+                    : (type == kTypeIQ4XS) ? kIQ4XS_BYTES
+                    : (type == kTypeQ6K)   ? kQ6K_BYTES
+                                           : 0u;
+            if (kBlkBytes == 0) return false;
+            // The MMA-style kxQ8KBlockDot kernels write the Q6_K result on all
+            // 8 sub-lanes (shuffle tree); Q4_K/Q5_K/IQ4_XS write lane 0 only.
+            // Both are handled inside kQGemmKxQ8K, so no shape constraint here.
+            const uint64_t actStride =
+                    static_cast<uint64_t>(blocksPerRow) * kQ8K_STRIDE;
+            const uint64_t need = static_cast<uint64_t>(seqLen) * actStride;
+            if (q8kBatch == nullptr || q8kBatchBytes < need) return false;
+            // Quantize all tokens' activations (one block-row per token).
+            dim3 qgrid(blocksPerRow, seqLen);
+            kQuantizeQ8K_Batch<<<qgrid, 256, 0, g_stream>>>(
+                    x, q8kBatch, cols, seqLen,
+                    static_cast<uint32_t>(actStride));
+            cudaError_t qe = cudaGetLastError();
+            if (qe != cudaSuccess) {
+                std::fprintf(stderr, "kQuantizeQ8K_Batch: %s\n",
+                             cudaGetErrorString(qe));
+                return false;
+            }
+            dim3 block(32, 8);
+            // grid.x covers rows in 8-row blocks; grid.y steps 4 tokens/group.
+            dim3 grid((rows + 7) / 8, (seqLen + 3) / 4);
+            const uint32_t aStride = static_cast<uint32_t>(actStride);
+            if (type == kTypeQ4K) {
+                // int8 tensor-core (mma.s8.m8n8k16) affine Q4_K GEMM reading the
+                // RAW weights (kMmqGemmQ4K_AffineRaw, zero extra VRAM).  Opt-in
+                // (TINYCODER_MMQ_Q4K=1), gated on sm_75+ and a real prefill
+                // batch; NOT bit-exact with kQGemmKxQ8K<Q4_K> (accepted via the
+                // batch-vs-sequential coherence contract).
+                if (seqLen >= 64 && mmqQ4k() && mmqS8Ok()) {
+                    const uint32_t n8Tiles = (rows + 7u) / 8u;
+                    dim3 mgrid(n8Tiles, (seqLen + 63u) / 64u);
+                    kMmqGemmQ4K_AffineRaw<<<mgrid, 256, 0, g_stream>>>(
+                            static_cast<const uint8_t *>(wq),
+                            reinterpret_cast<const int8_t *>(q8kBatch), out,
+                            static_cast<int>(seqLen), static_cast<int>(rows),
+                            static_cast<int>(cols), static_cast<int>(rowBytes),
+                            static_cast<int>((cols + 15u) / 16u),
+                            static_cast<int>(aStride));
+                    cudaError_t me = cudaGetLastError();
+                    if (me == cudaSuccess) return true;
+                    // fall through to the integer GEMM on any launch error
+                }
+                kQGemmKxQ8K<kTypeQ4K><<<grid, block, 0, g_stream>>>(
+                        static_cast<const uint8_t *>(wq), q8kBatch, out, rows,
+                        blocksPerRow, rowBytes, aStride, seqLen);
+            } else if (type == kTypeQ5K) {
+                kQGemmKxQ8K<kTypeQ5K><<<grid, block, 0, g_stream>>>(
+                        static_cast<const uint8_t *>(wq), q8kBatch, out, rows,
+                        blocksPerRow, rowBytes, aStride, seqLen);
+            } else if (type == kTypeQ6K) {
+                kQGemmKxQ8K<kTypeQ6K><<<grid, block, 0, g_stream>>>(
+                        static_cast<const uint8_t *>(wq), q8kBatch, out, rows,
+                        blocksPerRow, rowBytes, aStride, seqLen);
+            } else {
+                kQGemmKxQ8K<kTypeIQ4XS><<<grid, block, 0, g_stream>>>(
+                        static_cast<const uint8_t *>(wq), q8kBatch, out, rows,
+                        blocksPerRow, rowBytes, aStride, seqLen);
+            }
+            cudaError_t e = cudaGetLastError();
+            if (e != cudaSuccess) {
+                std::fprintf(stderr, "kQGemmKxQ8K: %s\n", cudaGetErrorString(e));
+                return false;
+            }
+            return true;
+        }
+
         void launchQGemv(int type, const void *wq, const float *x, float *out,
                          uint32_t rows, uint32_t cols, uint32_t rowBytes,
                          uint32_t blocksPerRow, uint8_t *&q8k,
@@ -8720,9 +9430,23 @@ namespace tinycoder::gpu {
                     // kQGemv<kTypeQ4K> diverged (Q4K_Q6KKernelParityWithCPU
                     // proved the Q8_K path bit-exact).  Route through
                     // kQuantizeQ8K + kQGemvKxQ8K<kTypeQ4K>.
-                    kQGemvKxQ8K<kTypeQ4K><<<nBlocks, block, 0, g_stream>>>(
-                            static_cast<const uint8_t *>(wq), q8k, out, rows,
-                            blocksPerRow, rowBytes);
+                    // 4-ROWS-PER-WARP (2026-10-29, TINYCODER_Q4K_4XW): the
+                    // kQGemvQ4KxQ8K_4xW drop-in for rows % 4 == 0 (all real
+                    // uses: dense qwen35 attnO/ffnDown/ffnGate/ffnUp and the
+                    // Q4_K LM head) is bit-exact and lifts the LARGEST quant
+                    // class of this model to the Q5_K/Q6_K 4xW bandwidth shape.
+                    if (q4k4xw() && (rows & 3u) == 0u) {
+                        const uint32_t w4 =
+                                static_cast<uint32_t>(q4kBsy());
+                        const uint32_t gWarp = (rows / 4u + w4 - 1u) / w4;
+                        kQGemvQ4KxQ8K_4xW<<<gWarp, dim3(32, w4), 0, g_stream>>>(
+                                static_cast<const uint8_t *>(wq), q8k, out,
+                                rows, blocksPerRow, rowBytes);
+                    } else {
+                        kQGemvKxQ8K<kTypeQ4K><<<nBlocks, block, 0, g_stream>>>(
+                                static_cast<const uint8_t *>(wq), q8k, out, rows,
+                                blocksPerRow, rowBytes);
+                    }
                 } else if (type == kTypeQ6K) {
                     // Q6_K decode path: 4 rows per warp (all 32 lanes issue
                     // weight loads; the 8-active-lane generic kernel ran the
@@ -10123,12 +10847,24 @@ namespace tinycoder::gpu {
         // L2-norm of [headK]-wide slices repeated over value heads, then copy v.
         // Each of the nVHeads value heads reads k-head (hv % nKHeads).  One block
         // per token (128 threads).
+        // `smemFast` (2026-10-29, TINYCODER_L2NORM_SMEM, default on): the
+        // original body recomputed the SAME headK-wide double-precision L2 norm
+        // for every one of the headK*nVHeads elements (an O(headK^2 * nVHeads)
+        // double-add chain -- the per-slice norm depends only on hv, not on the
+        // element index d).  On the dense qwen35 prefill this was the single
+        // hottest kernel (nvprof: 4286 us / 6528 calls, #1 above the Q4_K
+        // projections).  The fast path computes each slice's iq/ik ONCE (one
+        // thread per value head, shared memory broadcast) using the SAME
+        // j=0..headK-1 double accumulation order, so iq/ik -- and therefore
+        // every qDst/kDst element -- are bit-identical.  nVHeads > 128 falls
+        // back to the original recompute body.
         __global__ void kQ35L2NormRepeat(const float *__restrict__ convOut,
                                          float *__restrict__ qN, float *__restrict__ kN,
                                          float *__restrict__ vN, uint32_t headK,
                                          uint32_t headV, uint32_t nKHeads,
                                          uint32_t nVHeads, uint32_t keyDim,
-                                         uint32_t valueDim, uint32_t seqLen) {
+                                         uint32_t valueDim, uint32_t seqLen,
+                                         uint32_t smemFast) {
             uint32_t s = blockIdx.x;
             if (s >= seqLen) return;
             const float *conv = convOut + static_cast<size_t>(s) *
@@ -10139,24 +10875,52 @@ namespace tinycoder::gpu {
             float *qDst = qN + static_cast<size_t>(s) * headK * nVHeads;
             float *kDst = kN + static_cast<size_t>(s) * headK * nVHeads;
             float *vDst = vN + static_cast<size_t>(s) * headV * nVHeads;
+            const bool fast = (smemFast != 0u) && (nVHeads <= 128u);
+            __shared__ float siq[128];
+            __shared__ float sik[128];
+            if (fast) {
+                for (uint32_t hv = threadIdx.x; hv < nVHeads; hv += blockDim.x) {
+                    uint32_t hk = hv % nKHeads;
+                    const float *qSrc = convQ + static_cast<size_t>(hk) * headK;
+                    const float *kSrc = convK + static_cast<size_t>(hk) * headK;
+                    double sq = 0.0, sk = 0.0;
+                    for (uint32_t j = 0; j < headK; ++j) {
+                        float qv = qSrc[j], kv = kSrc[j];
+                        sq += static_cast<double>(qv) * qv;
+                        sk += static_cast<double>(kv) * kv;
+                    }
+                    siq[hv] = static_cast<float>(
+                            1.0 / std::sqrt(fmax(sq, 1e-6)));
+                    sik[hv] = static_cast<float>(
+                            1.0 / std::sqrt(fmax(sk, 1e-6)));
+                }
+                __syncthreads();
+            }
             for (uint32_t i = threadIdx.x; i < headK * nVHeads; i += blockDim.x) {
                 uint32_t hv = i / headK;
-                uint32_t hk = hv % nKHeads;
                 uint32_t d = i - hv * headK;
+                float iq, ik;
+                if (fast) {
+                    iq = siq[hv];
+                    ik = sik[hv];
+                } else {
+                    uint32_t hk = hv % nKHeads;
+                    const float *qSrc = convQ + static_cast<size_t>(hk) * headK;
+                    const float *kSrc = convK + static_cast<size_t>(hk) * headK;
+                    double sq = 0.0, sk = 0.0;
+                    for (uint32_t j = 0; j < headK; ++j) {
+                        float qv = qSrc[j], kv = kSrc[j];
+                        sq += static_cast<double>(qv) * qv;
+                        sk += static_cast<double>(kv) * kv;
+                    }
+                    iq = static_cast<float>(
+                            1.0 / std::sqrt(fmax(sq, 1e-6)));
+                    ik = static_cast<float>(
+                            1.0 / std::sqrt(fmax(sk, 1e-6)));
+                }
+                uint32_t hk = hv % nKHeads;
                 const float *qSrc = convQ + static_cast<size_t>(hk) * headK;
                 const float *kSrc = convK + static_cast<size_t>(hk) * headK;
-                // per-slice L2 scale is computed per (hv,hk) once below; for
-                // simplicity recompute here (small: headK*nVHeads = 6144).
-                double sq = 0.0, sk = 0.0;
-                for (uint32_t j = 0; j < headK; ++j) {
-                    float qv = qSrc[j], kv = kSrc[j];
-                    sq += static_cast<double>(qv) * qv;
-                    sk += static_cast<double>(kv) * kv;
-                }
-                float iq = static_cast<float>(
-                        1.0 / std::sqrt(fmax(sq, 1e-6)));
-                float ik = static_cast<float>(
-                        1.0 / std::sqrt(fmax(sk, 1e-6)));
                 qDst[i] = qSrc[d] * iq;
                 kDst[i] = kSrc[d] * ik;
             }

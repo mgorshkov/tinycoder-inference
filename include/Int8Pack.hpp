@@ -66,6 +66,9 @@ namespace tinycoder {
         static constexpr uint32_t GROUPS_PER_BLOCK = BLOCK_SIZE / GROUP_SIZE;// 8
         static constexpr uint32_t SRC_BLOCK_BYTES = 98;                      // d(2) + qs[96]
 
+        // ---- Q4_K source geometry (GGML): d(2) + dmin(2) + scales[12] + qs[128]
+        static constexpr uint32_t Q4K_SRC_BLOCK_BYTES = 144;
+
         // ---- mma.s8.m8n8k16 geometry ----
         // Turing (sm_75) has no mma.m16n8k16 for int8 (that needs sm_80+); the
         // m8n8k16 shape IS available on Turing and Ampere+, so the pack targets
@@ -155,12 +158,44 @@ namespace tinycoder {
         static void emulateMmaCell(const int8_t *aTile, const int8_t *bCell,
                                    int32_t dOut[8][8]);
 
+        // ---- Q4_K (affine) mma pack (2026-10-29) ----
+        // Q4_K dequantizes AFFINELY: w = d*sc*q - dmin*m (q in [0,15]).  The
+        // pure-scale mma path common to IQ3_XXS/Q6_K folds the per-row scale
+        // into an integer mma and needs no extra term, but the Q4_K min term
+        // is a per-(row, 32-block) constant that multiplies the activation
+        // block-sum, so it lives OUTSIDE the tensor core.  This pack therefore
+        // emits, per (n8-tile, k16-tile):
+        //   qOut   : 128 int8 = the 4-bit q values (0..15), same B-fragment
+        //            layout as packMma (lane L byte i = W[n0+L/4][k0+(L&3)*4+i]);
+        //   dscOut : per n-row (8) float = d*sc of the 32-block covering the
+        //            k16 tile's columns;
+        //   dmnOut : per n-row (8) float = dmin*m of that same 32-block.
+        // The kernel computes  sum_k q*x  on the tensor core, then
+        //   y[n] += ad * ( dsc * D - dmn * bsum32 )
+        // where ad is the Q8_K activation scale and bsum32 the activation
+        // 32-group sum.  This re-quantizes the Q4_K weights 1:1 (no extra error
+        // from the affine fit -- the q are exact 4-bit values), so it matches
+        // kQGemmKxQ8K<Q4_K> up to the same float-accumulation class.
+        static void packMmaQ4K(const uint8_t *src, uint32_t rows, uint32_t cols,
+                               int8_t *qOut, float *dscOut, float *dmnOut);
+
     private:
         /// @brief int8 weight at matrix position (n, k) from packed blocks
         /// (0 for mma padding outside [rows x cols]).
         static int8_t weightAt(const PackedBlock *blocks, uint32_t blocksPerRow,
                                uint32_t n, uint32_t k, uint32_t rows,
                                uint32_t cols);
+
+        /// @brief Q4_K 4-bit q (0..15) at (n, k); 0 outside [rows x cols].
+        static uint8_t q4kWeightAt(const uint8_t *src, uint32_t blocksPerRow,
+                                   uint32_t n, uint32_t k, uint32_t rows,
+                                   uint32_t cols);
+
+        /// @brief Q4_K (d*sc, dmin*m) of the 32-sub-block covering column
+        /// `k16tile*16` of weight row n.  Returns (0,0) outside [rows x cols].
+        static void q4kScaleAt(const uint8_t *src, uint32_t blocksPerRow,
+                               uint32_t n, uint32_t k16tile, uint32_t rows,
+                               float &dscOut, float &dmnOut);
     };
 
     // -----------------------------------------------------------------------
@@ -398,6 +433,85 @@ namespace tinycoder {
                 dOut[m][n] = acc;
             }
         }
+    }
+
+    // ---- Q4_K (affine) mma pack ----
+    inline uint8_t Int8Pack::q4kWeightAt(const uint8_t *src,
+                                         uint32_t blocksPerRow, uint32_t n,
+                                         uint32_t k, uint32_t rows,
+                                         uint32_t cols) {
+        if (n >= rows || k >= cols) return 0;
+        const uint8_t *blk =
+                src + (static_cast<size_t>(n) * blocksPerRow + (k / BLOCK_SIZE)) *
+                              Q4K_SRC_BLOCK_BYTES;
+        const uint32_t c = k % BLOCK_SIZE;   // 0..255
+        const uint32_t i = c / GROUP_SIZE;   // sub-block 0..7
+        const uint32_t j = c % GROUP_SIZE;   // 0..31
+        const uint8_t *qsv = blk + 16;
+        const uint8_t qb = qsv[32u * (i >> 1u) + j];
+        return ((i & 1u) == 0u) ? (qb & 0xFu) : (qb >> 4);
+    }
+
+    inline void Int8Pack::q4kScaleAt(const uint8_t *src, uint32_t blocksPerRow,
+                                     uint32_t n, uint32_t k16tile, uint32_t rows,
+                                     float &dscOut, float &dmnOut) {
+        dscOut = 0.0f;
+        dmnOut = 0.0f;
+        if (n >= rows) return;
+        const uint32_t c = k16tile * MMA_K;   // a k16 tile stays inside a 32-group
+        const uint8_t *blk =
+                src + (static_cast<size_t>(n) * blocksPerRow + (c / BLOCK_SIZE)) *
+                              Q4K_SRC_BLOCK_BYTES;
+        const float d =
+                GGMLDequantize::halfToFloatBranchFree(*reinterpret_cast<const uint16_t *>(blk));
+        const float dmin = GGMLDequantize::halfToFloatBranchFree(
+                *reinterpret_cast<const uint16_t *>(blk + 2));
+        const uint8_t *scales = blk + 4;
+        const uint32_t i = (c % BLOCK_SIZE) / GROUP_SIZE;
+        uint8_t sc, m;
+        if (i < 4) {
+            sc = scales[i] & 63u;
+            m = scales[i + 4] & 63u;
+        } else {
+            sc = static_cast<uint8_t>((scales[i + 4] & 0xFu) |
+                                      ((scales[i - 4] >> 6) << 4));
+            m = static_cast<uint8_t>((scales[i + 4] >> 4) |
+                                     ((scales[i] >> 6) << 4));
+        }
+        dscOut = d * static_cast<float>(sc);
+        dmnOut = dmin * static_cast<float>(m);
+    }
+
+    inline void Int8Pack::packMmaQ4K(const uint8_t *src, uint32_t rows,
+                                     uint32_t cols, int8_t *qOut,
+                                     float *dscOut, float *dmnOut) {
+        const uint32_t n8Tiles = (rows + MMA_N - 1) / MMA_N;
+        const uint32_t k16Tiles = (cols + MMA_K - 1) / MMA_K;
+        const uint32_t blocksPerRow = (cols + BLOCK_SIZE - 1) / BLOCK_SIZE;
+
+        // Per (n8, k16) tile: the q B-cell, plus the per-row dsc/dmn.
+        ThreadPool::instance().parallelFor(0, n8Tiles * k16Tiles, [&](uint32_t t) {
+            const uint32_t nt = t / k16Tiles;
+            const uint32_t kt = t % k16Tiles;
+            const uint32_t n0 = nt * MMA_N;
+            const uint32_t k0 = kt * MMA_K;
+            int8_t *tile = qOut + static_cast<size_t>(t) * MMA_TILE_BYTES;
+            for (uint32_t lane = 0; lane < MMA_THREADS; ++lane) {
+                const uint32_t n = n0 + (lane >> 2u);
+                const uint32_t kBase = k0 + (lane & 3u) * 4u;
+                for (uint32_t i = 0; i < 4; ++i) {
+                    tile[lane * 4u + i] = static_cast<int8_t>(
+                            q4kWeightAt(src, blocksPerRow, n, kBase + i, rows,
+                                        cols));
+                }
+            }
+            for (uint32_t nr = 0; nr < MMA_N; ++nr) {
+                float dsc, dmn;
+                q4kScaleAt(src, blocksPerRow, n0 + nr, kt, rows, dsc, dmn);
+                dscOut[t * MMA_N + nr] = dsc;
+                dmnOut[t * MMA_N + nr] = dmn;
+            }
+        });
     }
 
 }// namespace tinycoder

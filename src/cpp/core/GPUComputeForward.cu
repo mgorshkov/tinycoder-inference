@@ -384,7 +384,8 @@ namespace tinycoder::gpu {
                     }
                     kQ35L2NormRepeat<<<1, 128, 0, g_stream>>>(
                             s.convOut, s.qN, s.kN, s.vN, headK, headV, nKHeads,
-                            nVHeads, keyDim, valueDim, 1);
+                            nVHeads, keyDim, valueDim, 1,
+                            l2NormSmem() ? 1u : 0u);
                     const float *betaRow = s.q35Beta + static_cast<size_t>(st) * nVHeads;
                     const float *gateRow = s.q35GateV + static_cast<size_t>(st) * nVHeads;
                     float *gdnRow = s.gdnOut + static_cast<size_t>(st) * valueDim;
@@ -3351,6 +3352,11 @@ namespace tinycoder::gpu {
             q8k_ = nullptr;
         }
         q8kBytes_ = 0;
+        if (q8kPrefill_) {
+            cudaFree(q8kPrefill_);
+            q8kPrefill_ = nullptr;
+        }
+        q8kPrefillBytes_ = 0;
         if (lmPinned_) {
             cudaFreeHost(lmPinned_);
             lmPinned_ = nullptr;

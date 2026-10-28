@@ -85,6 +85,59 @@ namespace {
             blk[2 + i] = static_cast<uint8_t>(rng() & 0xFFu);
     }
 
+    /// @brief Deterministic synthetic GGML Q4_K block (144 bytes:
+    /// d(2) + dmin(2) + scales[12] + qs[128]).  All 4-bit q values and the
+    /// 6-bit (sc, m) fields are random; the dequant w = d*sc*q - dmin*m is the
+    /// affine form the kernel must reproduce.
+    void makeSyntheticQ4KBlock(uint8_t *blk, uint64_t seed) {
+        std::mt19937_64 rng(seed);
+        const float d = std::ldexp(
+                1.0f + static_cast<float>(rng() % 1000) / 1000.0f,
+                static_cast<int>(rng() % 7) - 5);
+        const float dmin = std::ldexp(
+                1.0f + static_cast<float>(rng() % 1000) / 1000.0f,
+                static_cast<int>(rng() % 7) - 6);
+        const uint16_t dh = GGMLDequantize::floatToHalf(d);
+        const uint16_t dmh = GGMLDequantize::floatToHalf(dmin);
+        std::memcpy(blk, &dh, 2);
+        std::memcpy(blk + 2, &dmh, 2);
+        for (uint32_t i = 0; i < 12; ++i)
+            blk[4 + i] = static_cast<uint8_t>(rng() & 0xFFu);
+        for (uint32_t i = 0; i < 128; ++i)
+            blk[16 + i] = static_cast<uint8_t>(rng() & 0xFFu);
+    }
+
+    /// @brief Q4_K sub-block (sc, m) decode (mirror of Int8Pack::q4kScaleAt
+    /// and kxQ8KBlockDot<Q4_K>): returns d*sc and dmin*m for group i of blk.
+    void q4kSubScale(const uint8_t *blk, uint32_t i, float &dsc, float &dmn) {
+        const float d = GGMLDequantize::halfToFloatBranchFree(
+                *reinterpret_cast<const uint16_t *>(blk));
+        const float dmin = GGMLDequantize::halfToFloatBranchFree(
+                *reinterpret_cast<const uint16_t *>(blk + 2));
+        const uint8_t *scales = blk + 4;
+        uint8_t sc, m;
+        if (i < 4) {
+            sc = scales[i] & 63u;
+            m = scales[i + 4] & 63u;
+        } else {
+            sc = static_cast<uint8_t>((scales[i + 4] & 0xFu) |
+                                      ((scales[i - 4] >> 6) << 4));
+            m = static_cast<uint8_t>((scales[i + 4] >> 4) |
+                                     ((scales[i] >> 6) << 4));
+        }
+        dsc = d * static_cast<float>(sc);
+        dmn = dmin * static_cast<float>(m);
+    }
+
+    /// @brief Q4_K 4-bit q at column c (0..255) of blk (mirror of
+    /// Int8Pack::q4kWeightAt): qs[32*(i>>1) + j], low nibble for even i.
+    uint8_t q4kQ(const uint8_t *blk, uint32_t c) {
+        const uint32_t i = c / 32u;
+        const uint32_t j = c % 32u;
+        const uint8_t qb = blk[16 + 32u * (i >> 1u) + j];
+        return ((i & 1u) == 0u) ? (qb & 0xFu) : (qb >> 4);
+    }
+
     /// @brief Deterministic activation row (scaled soft-sines, several sign
     /// changes) with a per-token phase so batch rows differ.
     std::vector<float> makeActivation(uint32_t n, double phase) {
@@ -140,6 +193,53 @@ namespace {
         }
     }
 
+    /// @brief Host reference for the AFFINE Q4_K MMQ: the EXACT float tree of
+    /// kMmqGemmQ4K_Affine on the canonical Q4_K blocks and the GPU-quantized
+    /// Q8_K bytes.  Per 256-block the kernel computes
+    ///   d8 * ( sum_g dsc_g*D_g - sum_g dmn_g*bsum32_g )
+    /// where D_g = sum_{c in g} q_c * y8_c (exact int) and
+    /// bsum32_g = bsums[2g] + bsums[2g+1]; the reference does the same.
+    void refMmqQ4K(const uint8_t *src, uint32_t blocksPerRow, uint32_t rows,
+                   uint32_t cols, const uint8_t *xq, uint32_t seq, float *out) {
+        (void) cols;
+        for (uint32_t s = 0; s < seq; ++s) {
+            const uint8_t *xqTok = xq + static_cast<size_t>(s) * blocksPerRow *
+                                                kMmqQ8KStride;
+            for (uint32_t n = 0; n < rows; ++n) {
+                float total = 0.0f;
+                for (uint32_t g = 0; g < blocksPerRow; ++g) {
+                    const uint8_t *blkW =
+                            src + (static_cast<size_t>(n) * blocksPerRow + g) *
+                                          Int8Pack::Q4K_SRC_BLOCK_BYTES;
+                    const uint8_t *q8 = xqTok + static_cast<size_t>(g) *
+                                                         kMmqQ8KStride;
+                    const int8_t *yq = reinterpret_cast<const int8_t *>(q8);
+                    const int16_t *bsums =
+                            reinterpret_cast<const int16_t *>(q8 + 256);
+                    const float d8 = *reinterpret_cast<const float *>(q8 + 288);
+                    float mainS = 0.0f, minS = 0.0f;
+                    for (uint32_t gg = 0; gg < 8; ++gg) {
+                        int32_t acc = 0;
+                        for (uint32_t i = 0; i < 32; ++i) {
+                            const uint32_t c = gg * 32u + i;
+                            acc += static_cast<int32_t>(q4kQ(blkW, c)) *
+                                   static_cast<int32_t>(yq[c]);
+                        }
+                        float dsc, dmn;
+                        q4kSubScale(blkW, gg, dsc, dmn);
+                        const float bi = static_cast<float>(
+                                static_cast<int>(bsums[2 * gg]) +
+                                static_cast<int>(bsums[2 * gg + 1]));
+                        mainS += dsc * static_cast<float>(acc);
+                        minS += dmn * bi;
+                    }
+                    total += d8 * (mainS - minS);
+                }
+                out[static_cast<size_t>(s) * rows + n] = total;
+            }
+        }
+    }
+
     /// @brief Collect the model's IQ3_XXS matrices (name, data, rows, cols).
     struct Iq3XxsMat {
         std::string name;
@@ -168,14 +268,48 @@ namespace {
             for (size_t i = 0; i < sizeof(ms) / sizeof(ms[0]); ++i) {
                 if (!ms[i]->empty() && ms[i]->type == GGML_TYPE_IQ3_XXS)
                     mats.push_back({"L" + std::to_string(li) + " " + ns[i],
-                                    &ms[i]->data, ms[i]->rows, ms[i]->cols});
-            }
+                                &ms[i]->data, ms[i]->rows, ms[i]->cols});
         }
-        return mats;
     }
+    return mats;
+}
 
-    /// @brief Pack a synthetic matrix into Int8Pack blocks + mma cells.
-    struct PackedMatrix {
+/// @brief Collect the model's Q4_K matrices (name, data, rows, cols).
+struct Q4KMat {
+    std::string name;
+    const AlignedVector<uint8_t> *data;
+    uint32_t rows, cols;
+};
+
+std::vector<Q4KMat> collectQ4KMatrices() {
+    std::vector<Q4KMat> mats;
+    if (SharedTestEnv::model == nullptr) return mats;
+    const auto &layers = SharedTestEnv::model->debugGetLayers();
+    for (size_t li = 0; li < layers.size(); ++li) {
+        const auto &L = layers[li];
+        const QuantizedMatrix *ms[] = {
+                &L.attnQ, &L.attnK, &L.attnV, &L.attnO,
+                &L.ffnGate, &L.ffnUp, &L.ffnDown, &L.attnQKV,
+                &L.attnGate, &L.ssmAlphaQ, &L.ssmBetaQ, &L.ssmOut,
+                &L.ffnGateExps, &L.ffnUpExps, &L.ffnDownExpsMoe,
+                &L.ffnGateShexp, &L.ffnUpShexp, &L.ffnDownShexp};
+        const char *ns[] = {
+                "attnQ", "attnK", "attnV", "attnO",
+                "ffnGate", "ffnUp", "ffnDown", "attnQKV",
+                "attnGate", "ssmAlphaQ", "ssmBetaQ", "ssmOut",
+                "ffnGateExps", "ffnUpExps", "ffnDownExpsMoe",
+                "ffnGateShexp", "ffnUpShexp", "ffnDownShexp"};
+        for (size_t i = 0; i < sizeof(ms) / sizeof(ms[0]); ++i) {
+            if (!ms[i]->empty() && ms[i]->type == GGML_TYPE_Q4_K)
+                mats.push_back({"L" + std::to_string(li) + " " + ns[i],
+                                &ms[i]->data, ms[i]->rows, ms[i]->cols});
+        }
+    }
+    return mats;
+}
+
+/// @brief Pack a synthetic matrix into Int8Pack blocks + mma cells.
+struct PackedMatrix {
         std::vector<Int8Pack::PackedBlock> blocks;
         uint32_t blocksPerRow = 0;
         std::vector<int8_t> b;
@@ -393,6 +527,137 @@ TEST_F(MmqParityTest, RealModelKernelMatchesReference) {
                     << " gpu=" << yGpu[i] << " ref=" << yRef[i];
         }
         std::cout << "[Mmq] " << m.name << " " << m.rows << "x" << m.cols
+                  << " seq=" << seq << ": kernel==reference (maxAbs=" << maxAbs
+                  << " maxRel=" << maxRel << ")" << std::endl;
+    }
+    EXPECT_TRUE(ran);
+}
+
+// ---------------------------------------------------------------------------
+// 5. Affine Q4_K MMQ (kMmqGemmQ4K_Affine): synthetic decode + prefill parity
+// ---------------------------------------------------------------------------
+TEST_F(MmqParityTest, AffineQ4KSyntheticMatchesReference) {
+    tinycoder::gpu::GPUModel gm;
+    constexpr uint32_t kCols[][2] = {{24, 512}, {20, 768}, {8, 256}, {16, 1024}};
+    bool ran = false;
+    for (const auto &g: kCols) {
+        const uint32_t rows = g[0], cols = g[1];
+        SCOPED_TRACE(std::to_string(rows) + "x" + std::to_string(cols));
+        const uint32_t blocksPerRow =
+                (cols + Int8Pack::BLOCK_SIZE - 1) / Int8Pack::BLOCK_SIZE;
+        std::vector<uint8_t> src(static_cast<size_t>(rows) * blocksPerRow *
+                                 Int8Pack::Q4K_SRC_BLOCK_BYTES);
+        for (uint32_t b = 0; b < rows * blocksPerRow; ++b)
+            makeSyntheticQ4KBlock(
+                    src.data() +
+                            static_cast<size_t>(b) *
+                                    Int8Pack::Q4K_SRC_BLOCK_BYTES,
+                    0x4B4B0000ull + b + rows * 101u);
+
+        const uint32_t n8Tiles = (rows + Int8Pack::MMA_N - 1) / Int8Pack::MMA_N;
+        const uint32_t k16Tiles =
+                (cols + Int8Pack::MMA_K - 1) / Int8Pack::MMA_K;
+        const size_t tileN = static_cast<size_t>(n8Tiles) * k16Tiles;
+        std::vector<int8_t> qPk(tileN * Int8Pack::MMA_TILE_BYTES);
+        std::vector<float> dsc(tileN * Int8Pack::MMA_N);
+        std::vector<float> dmn(tileN * Int8Pack::MMA_N);
+        Int8Pack::packMmaQ4K(src.data(), rows, cols, qPk.data(), dsc.data(),
+                             dmn.data());
+
+        for (uint32_t seq: {1u, 40u}) {
+            std::vector<float> x(static_cast<size_t>(seq) * cols);
+            for (uint32_t s = 0; s < seq; ++s) {
+                const auto row = makeActivation(cols, 0.013 * s + 0.7);
+                std::copy(row.begin(), row.end(),
+                          x.begin() + static_cast<size_t>(s) * cols);
+            }
+            std::vector<float> yGpu(static_cast<size_t>(seq) * rows);
+            std::vector<uint8_t> xqGpu(static_cast<size_t>(seq) * blocksPerRow *
+                                       kMmqQ8KStride);
+            if (!gm.debugMmqQ4K(qPk.data(), dsc.data(), dmn.data(), rows, cols,
+                                x.data(), seq, yGpu.data(), xqGpu.data())) {
+                GTEST_SKIP() << "This GPU has no int8 m8n8k16 tensor-core mma";
+            }
+            ran = true;
+
+            std::vector<float> yRef(static_cast<size_t>(seq) * rows);
+            refMmqQ4K(src.data(), blocksPerRow, rows, cols, xqGpu.data(), seq,
+                      yRef.data());
+
+            float maxAbs = 0.0f;
+            for (size_t i = 0; i < yGpu.size(); ++i) {
+                const float absErr = std::fabs(yGpu[i] - yRef[i]);
+                const float relErr = absErr / (std::fabs(yRef[i]) + 1e-3f);
+                maxAbs = std::max(maxAbs, absErr);
+                EXPECT_TRUE(absErr < 1e-3f || relErr < 1e-4f)
+                        << "seq=" << seq << " row=" << (i / rows) << " n="
+                        << (i % rows) << " gpu=" << yGpu[i]
+                        << " ref=" << yRef[i] << " absErr=" << absErr;
+            }
+            std::cout << "[Mmq-Q4K] synthetic " << rows << "x" << cols
+                      << " seq=" << seq << " kernel==reference (maxAbs="
+                      << maxAbs << ")" << std::endl;
+        }
+    }
+    EXPECT_TRUE(ran);
+}
+
+// ---------------------------------------------------------------------------
+// 6. Real model Q4_K matrices: affine mma parity vs the block reference
+// ---------------------------------------------------------------------------
+TEST_F(MmqParityTest, AffineQ4KRealModelMatchesReference) {
+    const auto mats = collectQ4KMatrices();
+    if (mats.empty()) GTEST_SKIP() << "Model has no Q4_K matrices";
+
+    tinycoder::gpu::GPUModel gm;
+    bool ran = false;
+    for (const auto &m: mats) {
+        // The host reference folds whole 256-blocks; real Q4_K rows are
+        // 256-aligned, but guard anyway.
+        if (m.cols % Int8Pack::BLOCK_SIZE != 0) continue;
+        SCOPED_TRACE(m.name);
+        const uint32_t blocksPerRow = m.cols / Int8Pack::BLOCK_SIZE;
+        const uint32_t n8Tiles = (m.rows + Int8Pack::MMA_N - 1) / Int8Pack::MMA_N;
+        const uint32_t k16Tiles =
+                (m.cols + Int8Pack::MMA_K - 1) / Int8Pack::MMA_K;
+        const size_t tileN = static_cast<size_t>(n8Tiles) * k16Tiles;
+        std::vector<int8_t> qPk(tileN * Int8Pack::MMA_TILE_BYTES);
+        std::vector<float> dsc(tileN * Int8Pack::MMA_N);
+        std::vector<float> dmn(tileN * Int8Pack::MMA_N);
+        Int8Pack::packMmaQ4K(m.data->data(), m.rows, m.cols, qPk.data(),
+                             dsc.data(), dmn.data());
+
+        const uint32_t seq = 16;
+        std::vector<float> x(static_cast<size_t>(seq) * m.cols);
+        for (uint32_t s = 0; s < seq; ++s) {
+            const auto row = makeActivation(m.cols, 0.017 * s + 0.3);
+            std::copy(row.begin(), row.end(),
+                      x.begin() + static_cast<size_t>(s) * m.cols);
+        }
+        std::vector<float> yGpu(static_cast<size_t>(seq) * m.rows);
+        std::vector<uint8_t> xqGpu(static_cast<size_t>(seq) * blocksPerRow *
+                                   kMmqQ8KStride);
+        if (!gm.debugMmqQ4K(qPk.data(), dsc.data(), dmn.data(), m.rows, m.cols,
+                            x.data(), seq, yGpu.data(), xqGpu.data())) {
+            GTEST_SKIP() << "This GPU has no int8 m8n8k16 tensor-core mma";
+        }
+        ran = true;
+
+        std::vector<float> yRef(static_cast<size_t>(seq) * m.rows);
+        refMmqQ4K(m.data->data(), blocksPerRow, m.rows, m.cols, xqGpu.data(),
+                  seq, yRef.data());
+
+        float maxAbs = 0.0f, maxRel = 0.0f;
+        for (size_t i = 0; i < yGpu.size(); ++i) {
+            const float absErr = std::fabs(yGpu[i] - yRef[i]);
+            const float relErr = absErr / (std::fabs(yRef[i]) + 1e-3f);
+            maxAbs = std::max(maxAbs, absErr);
+            maxRel = std::max(maxRel, relErr);
+            EXPECT_TRUE(absErr < 1e-3f || relErr < 1e-4f)
+                    << m.name << " seq=" << (i / m.rows) << " n=" << (i % m.rows)
+                    << " gpu=" << yGpu[i] << " ref=" << yRef[i];
+        }
+        std::cout << "[Mmq-Q4K] " << m.name << " " << m.rows << "x" << m.cols
                   << " seq=" << seq << ": kernel==reference (maxAbs=" << maxAbs
                   << " maxRel=" << maxRel << ")" << std::endl;
     }

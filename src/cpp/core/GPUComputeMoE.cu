@@ -1146,25 +1146,38 @@ namespace tinycoder::gpu {
             }
         }
 
-        // Dense projection helper.  ALL qwen35 projections (decode AND
-        // prefill) run per-token quantized GEMVs via launchQGemv — NEVER an
-        // fp16 cuBLAS GEMM.
+        // Dense projection helper.  qwen35 projections run quantized kernels —
+        // NEVER an fp16 cuBLAS GEMM.
         //
+        //   * Prefill (seqLen > 1): the batched Q8_K GEMM
+        //     (launchQGemm -> kQuantizeQ8K_Batch + kQGemmKxQ8K) reads each
+        //     weight block ONCE per 4-token group and dots it against 4 token
+        //     activations, so the weight stream is no longer repeated per
+        //     prompt token.  It is bit-identical to the per-token Q8_K
+        //     launchQGemv path (same kxQ8KBlockDot per (row, token)), which is
+        //     the property that keeps batch == sequential == CPU.  Prism-folded
+        //     (PQ2_0) prefill takes the per-token loop (the activation must be
+        //     Hadamard-folded first).
+        //   * Decode (seqLen == 1) and every type/shape the GEMM does not
+        //     cover (Q8_0, IQ4_NL, F32, Q5_0, Prism) fall back to the
+        //     per-token launchQGemv loop.
         //   * launchQGemv covers every type these projections use with the
         //     exact CPU-matching float tree (K-quants, Q5_0/Q8_0/IQ4_NL via
         //     kQGemvSmall32, Q8_0 via the integer Q8_32 path, F32 via
         //     kQ35F32Gemv).  The IQ4NLKernelParityWithCPU row scan proves
         //     kQGemvSmall32<IQ4NL> reproduces matMulVecBatchIQ4NL_SIMD to
         //     ~1e-6 abs error on every IQ4_NL matrix in the model.
-        //   * The old batched path fp16-rounded the X-side AND the weights
-        //     (dequantMatrixF16 -> kF32ToF16 -> cublasGemmEx).  fp16 mantissa
-        //     noise (~2^-11 relative per element) is NOT tolerable in the
-        //     recurrent gated-delta-net: it compounds through the persistent
-        //     conv/GDN state and the hidden norm diverges ~2% by layer 0,
-        //     exploding past layer 8 (ParisPromptLogitsAgree NGL>=16 fails:
-        //     GPU top-1 248046 vs CPU 248068).  qwen35moe learned the same
-        //     lesson (see forwardQwen35MoE's gemv comment) — dense qwen35
-        //     must behave identically.
+        //   * The old fp16 batched path (dequantMatrixF16 -> kF32ToF16 ->
+        //     cublasGemmEx) fp16-rounded the X-side AND the weights.  fp16
+        //     mantissa noise (~2^-11 relative per element) is NOT tolerable in
+        //     the recurrent gated-delta-net: it compounds through the
+        //     persistent conv/GDN state and the hidden norm diverges ~2% by
+        //     layer 0, exploding past layer 8 (ParisPromptLogitsAgree NGL>=16
+        //     fails: GPU top-1 248046 vs CPU 248068).  qwen35moe learned the
+        //     same lesson (see forwardQwen35MoE's gemv comment) — dense qwen35
+        //     must behave identically, which is why the new batched GEMM keeps
+        //     the integer Q8_K math instead of fp16 tensor cores.
+        const bool gemmPrefill = (seqLen > 1) && (geom_.prismFold == 0);
         auto gemv = [&](const DeviceMatrix &m, const float *x, float *y,
                         uint32_t nRows, uint32_t nCols,
                         const char *what) -> bool {
@@ -1178,6 +1191,26 @@ namespace tinycoder::gpu {
             // transform in stream order.
             const bool folded = (geom_.prismFold != 0) && (m.type == kTypePQ2_0);
             const bool gdnPerm = folded && (std::strcmp(what, "ssmOut") == 0);
+            // Batched prefill GEMM (bit-exact Q8_K): one weight read per
+            // 4-token group.  Grown once and reused across every projection.
+            if (gemmPrefill && !folded && nCols == m.blocksPerRow * 256u) {
+                const uint64_t actStride =
+                        static_cast<uint64_t>(m.blocksPerRow) * kQ8K_STRIDE;
+                const uint64_t need = static_cast<uint64_t>(seqLen) * actStride;
+                if (q8kPrefill_ == nullptr || q8kPrefillBytes_ < need) {
+                    if (q8kPrefill_) cudaFree(q8kPrefill_);
+                    q8kPrefill_ = nullptr;
+                    q8kPrefillBytes_ = 0;
+                    if (cudaMalloc(&q8kPrefill_, need) == cudaSuccess) {
+                        q8kPrefillBytes_ = need;
+                    }
+                }
+                if (launchQGemm(m.type, m.q, x, y, seqLen, nRows, nCols,
+                                m.rowBytes, m.blocksPerRow, q8kPrefill_,
+                                q8kPrefillBytes_)) {
+                    return true;
+                }
+            }
             for (uint32_t st = 0; st < seqLen; ++st) {
                 const float *xp = x + static_cast<size_t>(st) * nCols;
                 if (folded) xp = prismFoldForward(xp, nCols, gdnPerm);
@@ -1263,7 +1296,8 @@ namespace tinycoder::gpu {
                     }
                     kQ35L2NormRepeat<<<1, 128, 0, g_stream>>>(
                             s.convOut, s.qN, s.kN, s.vN, headK, headV, nKHeads,
-                            nVHeads, keyDim, valueDim, 1);
+                            nVHeads, keyDim, valueDim, 1,
+                            l2NormSmem() ? 1u : 0u);
                     const float *betaRow = s.q35Beta + static_cast<size_t>(st) * nVHeads;
                     const float *gateRow = s.q35GateV + static_cast<size_t>(st) * nVHeads;
                     float *gdnRow = s.gdnOut + static_cast<size_t>(st) * valueDim;
