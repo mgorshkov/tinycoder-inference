@@ -26,28 +26,55 @@ public:
     // question tests annotate their reported tok/s with the actual cache
     // state (warm vs cold) instead of implying a fixed state.
     static bool warmedUp;
+    // Diagnostic explaining why the shared model is unavailable (missing path or
+    // a load failure).  Empty when the model loaded.  Model-dependent fixtures
+    // surface this via GTEST_SKIP() instead of failing the whole run.
+    static std::string loadError;
 
     void SetUp() override {
-        ASSERT_FALSE(modelPath.empty())
-                << "Model path must be provided via TINYCODER_MODEL_PATH env var or "
-                   "--model-path argument";
-        ASSERT_TRUE(fs::exists(modelPath)) << "Model file not found: " << modelPath;
+        // The shared model is an OPTIONAL convenience for the model-dependent
+        // suites.  It must NOT be loaded with a fatal assertion: a fatal
+        // failure here makes Google Test skip EVERY test in the binary
+        // (gtest's TestSuite::Run treats a global-environment failure as
+        // skip_all), including the self-contained suites that need no model
+        // at all (e.g. EXL3CodecTest, EXL3SafetensorsTest, EXL3LoaderTest).
+        // Instead, record the reason and let the model-dependent fixtures call
+        // GTEST_SKIP() themselves.
+        if (modelPath.empty()) {
+            loadError = "Model path must be provided via TINYCODER_MODEL_PATH env "
+                        "var or --model-path argument";
+            std::cerr << "[SharedTestEnv] " << loadError
+                      << "; model-dependent tests will be skipped." << std::endl;
+            modelLoaded = false;
+            return;
+        }
+        if (!fs::exists(modelPath)) {
+            loadError = "Model not found: " + modelPath;
+            std::cerr << "[SharedTestEnv] " << loadError
+                      << "; model-dependent tests will be skipped." << std::endl;
+            modelLoaded = false;
+            return;
+        }
 
         model = new tinycoder::Model();
-        std::string loadError;
+        std::string err;
         auto t0 = std::chrono::high_resolution_clock::now();
-        bool ok = model->load(modelPath, &loadError);
+        bool ok = model->load(modelPath, &err);
         auto t1 = std::chrono::high_resolution_clock::now();
         auto loadMs =
                 std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count();
 
         if (!ok) {
-            std::cerr << "Model load failed: " << loadError << std::endl;
+            // Non-fatal: record the reason so the model-dependent fixtures can
+            // GTEST_SKIP() while the self-contained suites still run.
+            loadError = "Model load failed: " + err;
+            std::cerr << "[SharedTestEnv] " << loadError
+                      << "; model-dependent tests will be skipped." << std::endl;
             delete model;
             model = nullptr;
             modelLoaded = false;
-            FAIL() << "Model load failed: " << loadError;
         } else {
+            loadError.clear();
             modelLoaded = true;
             config = model->config();
             std::cout << "Model loaded in " << loadMs << " ms" << std::endl;

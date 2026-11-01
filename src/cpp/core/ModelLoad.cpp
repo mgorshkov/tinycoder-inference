@@ -26,12 +26,15 @@ SOFTWARE.
 #include "Model.hpp"
 #include "ThreadPool.hpp"
 
+#include "EXL3Loader.hpp"
 #include "GGMLDequantize.hpp"
+#include "GGUFLoader.hpp"
 #include "ModelInternal.hpp"
 
 #include <algorithm>
 #include <chrono>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <sys/sysinfo.h>
@@ -70,22 +73,42 @@ namespace tinycoder {
         }
         testFile.close();
 
-        // Estimate memory requirements before loading
+        // Estimate memory requirements before loading.
+        // The path is either a GGUF file or an EXL3/HF checkpoint directory; for
+        // a directory the "size" is the sum of its file sizes (shards + config).
         uint64_t fileSize = 0;
         {
-            std::ifstream sizeFile(modelPath, std::ios::binary | std::ios::ate);
-            fileSize = static_cast<uint64_t>(sizeFile.tellg());
+            namespace fs = std::filesystem;
+            std::error_code ec;
+            if (fs::is_directory(fs::path(modelPath), ec)) {
+                for (const auto &entry: fs::recursive_directory_iterator(
+                             modelPath, fs::directory_options::skip_permission_denied, ec)) {
+                    if (entry.is_regular_file(ec)) {
+                        fileSize += entry.file_size(ec);
+                    }
+                }
+            } else {
+                std::ifstream sizeFile(modelPath, std::ios::binary | std::ios::ate);
+                const std::streampos end = sizeFile.tellg();
+                fileSize = end > 0 ? static_cast<uint64_t>(end) : 0;
+            }
         }
 
-        reportProgress(0.05f, "Reading GGUF metadata...");
+        reportProgress(0.05f, "Reading model file metadata...");
 
-        // Load GGUF metadata first to get config
-        GGUFLoader metaLoader;
-        if (!metaLoader.loadMetadata(modelPath)) {
-            setError("Failed to read GGUF metadata");
+        // Pick the loader from the path (extension/magic based): a *.gguf file
+        // (GGUF v3) or an EXL3/HF safetensors checkpoint. config_ is the only
+        // thing needed up front (for the memory estimate), so read metadata only.
+        const bool isExl3 = EXL3Loader::isExl3Path(modelPath);
+        std::unique_ptr<IModelLoader> metaLoader =
+                isExl3 ? std::unique_ptr<IModelLoader>(new EXL3Loader())
+                       : std::unique_ptr<IModelLoader>(new GGUFLoader());
+        if (!metaLoader->loadMetadata(modelPath)) {
+            setError(isExl3 ? "Failed to read EXL3 model config"
+                            : "Failed to read GGUF metadata");
             return false;
         }
-        config_ = metaLoader.config();
+        config_ = metaLoader->config();
 
         // Cap maxSeqLen to a reasonable value to avoid excessive memory usage.
         // The model may support up to 32768 tokens, but that requires ~1.8 GB for KV
@@ -121,20 +144,23 @@ namespace tinycoder {
                       << std::endl;
         }
 
-        reportProgress(0.1f, "Loading GGUF file...");
+        reportProgress(0.1f, isExl3 ? "Loading EXL3 checkpoint..." : "Loading GGUF file...");
 
-        // Load full GGUF file. The loader is kept alive for the Model's
+        // Load the full model file. The loader is kept alive for the Model's
         // lifetime in weightLoader_ (declared before every weight field in
         // Model.hpp so it is destroyed last): the quantized weight tensors are
         // adopted as EXTERNAL (zero-copy) buffers that alias this loader's
-        // file-backed mmap, so the mmap must outlive every QuantizedMatrix
+        // backing store (file-backed mmap for GGUF, loader-owned heap buffers
+        // for EXL3), so the backing store must outlive every QuantizedMatrix
         // that borrows a pointer into it.
-        weightLoader_ = std::make_unique<GGUFLoader>();
+        weightLoader_ = isExl3 ? std::unique_ptr<IModelLoader>(new EXL3Loader())
+                               : std::unique_ptr<IModelLoader>(new GGUFLoader());
         if (!weightLoader_->load(modelPath)) {
-            setError("Failed to parse GGUF file (invalid or corrupted format)");
+            setError(isExl3 ? "Failed to parse EXL3 checkpoint"
+                            : "Failed to parse GGUF file (invalid or corrupted format)");
             return false;
         }
-        GGUFLoader &loader = *weightLoader_;
+        IModelLoader &loader = *weightLoader_;
 
         config_ = loader.config();
 
@@ -183,19 +209,46 @@ namespace tinycoder {
         // Configure tokenizer for the model architecture FIRST (sets defaults)
         tokenizer_.configureForArchitecture(config_.architecture);
 
-        // Load tokenizer from GGUF (overrides BOS/EOS/PAD from metadata)
-        if (!tokenizer_.loadFromGGUF(modelPath)) {
-            std::cerr << "[TinyCoder] Failed to load tokenizer, using embedded data"
-                      << std::endl;
-        }
+        if (loader.isGguf()) {
+            // Load tokenizer from GGUF (overrides BOS/EOS/PAD from metadata)
+            if (!tokenizer_.loadFromGGUF(modelPath)) {
+                std::cerr << "[TinyCoder] Failed to load tokenizer, using embedded data"
+                          << std::endl;
+            }
 
-        // Sync vocab size to the tokenizer's actual vocabulary. Some GGUF
-        // writers (e.g. Unsloth Qwen3.8-27B-UD) omit tokenizer.ggml.vocab_size,
-        // leaving the Qwen2.5-Coder default here; the real vocab count comes
-        // from tokenizer.ggml.tokens (which matches token_embd.weight rows /
-        // output.weight rows = the LM head width).
-        if (tokenizer_.vocabSize() > 0) {
-            config_.vocabSize = static_cast<uint32_t>(tokenizer_.vocabSize());
+            // Sync vocab size to the tokenizer's actual vocabulary. Some GGUF
+            // writers (e.g. Unsloth Qwen3.8-27B-UD) omit tokenizer.ggml.vocab_size,
+            // leaving the Qwen2.5-Coder default here; the real vocab count comes
+            // from tokenizer.ggml.tokens (which matches token_embd.weight rows /
+            // output.weight rows = the LM head width).
+            if (tokenizer_.vocabSize() > 0) {
+                config_.vocabSize = static_cast<uint32_t>(tokenizer_.vocabSize());
+            }
+        } else {
+            // EXL3 checkpoints ship a Hugging Face tokenizer.json. Load it so
+            // the model-dependent tests (and generation) can tokenize prompts.
+            // config_.tokenizerPath is set by EXL3Loader when the file exists.
+            std::string tokPath = config_.tokenizerPath;
+            if (tokPath.empty()) {
+                const auto *exl3 = dynamic_cast<const EXL3Loader *>(&loader);
+                if (exl3 != nullptr) {
+                    const std::string candidate = exl3->directory() + "/tokenizer.json";
+                    if (std::filesystem::exists(candidate)) {
+                        tokPath = candidate;
+                    }
+                }
+            }
+            if (!tokPath.empty() &&
+                tokenizer_.loadFromHFTokenizer(tokPath, config_.architecture)) {
+                // Keep config_.vocabSize from the EXL3 loader: it is the LM-head /
+                // embedding row count (config.json / tensor shapes), which is the
+                // authoritative generation width.  The tokenizer's own vocab may
+                // differ by a few added tokens and must not resize the LM head.
+            } else {
+                std::cerr << "[TinyCoder] EXL3 tokenizer.json loading failed; "
+                             "using the architecture's embedded tokenizer defaults."
+                          << std::endl;
+            }
         }
 
         reportProgress(0.25f, "Loading model weights...");
@@ -251,14 +304,17 @@ namespace tinycoder {
     }
 
     uint64_t Model::estimateMemory(const std::string &modelPath) {
-        GGUFLoader loader;
-        if (!loader.loadMetadata(modelPath)) {
+        std::unique_ptr<IModelLoader> loader =
+                EXL3Loader::isExl3Path(modelPath)
+                        ? std::unique_ptr<IModelLoader>(new EXL3Loader())
+                        : std::unique_ptr<IModelLoader>(new GGUFLoader());
+        if (!loader->loadMetadata(modelPath)) {
             return 0;
         }
-        return loader.config().estimatedMemoryBytes();
+        return loader->config().estimatedMemoryBytes();
     }
 
-    bool Model::loadWeights(GGUFLoader &loader) {
+    bool Model::loadWeights(IModelLoader &loader) {
         auto t0 = std::chrono::high_resolution_clock::now();
 
         // ---- Prism Hadamard fold setup (Ternary-Bonsai-2-27B PQ2_0) ----
@@ -415,6 +471,12 @@ namespace tinycoder {
             qm.rows = rows;
             qm.cols = cols;
             qm.type = info->type;
+            // EXL3 checkpoints: keep the packed trellis available so the CUDA
+            // adapter can upload the native compressed linear instead of the
+            // F16 materialization (the CPU path still uses `data`).
+            if (const auto *ex = dynamic_cast<const EXL3Loader *>(&loader)) {
+                qm.exl3 = ex->nativeLinear(name);
+            }
             // Mark folded (Prism-rotated) weights so the forward pass routes
             // their activation through applyPrismTransform.
             if (isFoldedWeight(name)) {

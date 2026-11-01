@@ -23,6 +23,7 @@ SOFTWARE.
 */
 
 #include "Tokenizer.hpp"
+#include "SafetensorsReader.hpp"
 #include <algorithm>
 #include <cstring>
 #include <fstream>
@@ -483,6 +484,206 @@ namespace tinycoder {
         return true;
     }
 
+    bool Tokenizer::loadFromHFTokenizer(const std::string &tokenizerJsonPath,
+                                        const std::string &architecture) {
+        // Parse a Hugging Face tokenizer.json (the format EXL3 / safetensors
+        // checkpoints ship).  The model section is a ByteLevel BPE:
+        //   model.vocab  : { "<unicode token>": id }
+        //   model.merges : [ [left, right], ... ]  (priority order, possibly the
+        //                  legacy "left right" string form)
+        // and root.added_tokens carries the special tokens (<|im_end|>, ...).
+        std::ifstream file(tokenizerJsonPath, std::ios::binary);
+        if (!file.is_open()) {
+            std::cerr << "[TinyCoder] Failed to open tokenizer.json: "
+                      << tokenizerJsonPath << std::endl;
+            return false;
+        }
+        std::stringstream buf;
+        buf << file.rdbuf();
+        file.close();
+        const std::string text = buf.str();
+
+        JsonValue root;
+        std::string err;
+        if (!JsonValue::parse(text, root, &err)) {
+            std::cerr << "[TinyCoder] tokenizer.json parse error: " << err << std::endl;
+            return false;
+        }
+
+        const JsonValue *model = root.find("model");
+        if (model == nullptr) {
+            std::cerr << "[TinyCoder] tokenizer.json has no model section" << std::endl;
+            return false;
+        }
+        const JsonValue *vocabObj = model->find("vocab");
+        const JsonValue *mergesArr = model->find("merges");
+
+        // bytes_to_unicode() code point for a raw byte (GPT-2 / tiktoken).
+        auto bytesToUnicode = [](int b) -> int {
+            const bool good = (b >= 33 && b <= 126) || (b >= 161 && b <= 172) ||
+                              (b >= 174 && b <= 255);
+            if (good) return b;
+            int n = 0;
+            for (int x = 0; x < b; ++x) {
+                const bool gx = (x >= 33 && x <= 126) || (x >= 161 && x <= 172) ||
+                                (x >= 174 && x <= 255);
+                if (!gx) ++n;
+            }
+            return 256 + n;
+        };
+        auto utf8Encode = [](int cp) -> std::string {
+            std::string s;
+            if (cp < 0x80) {
+                s += static_cast<char>(cp);
+            } else if (cp < 0x800) {
+                s += static_cast<char>(0xC0 | (cp >> 6));
+                s += static_cast<char>(0x80 | (cp & 0x3F));
+            } else {
+                s += static_cast<char>(0xE0 | (cp >> 12));
+                s += static_cast<char>(0x80 | ((cp >> 6) & 0x3F));
+                s += static_cast<char>(0x80 | (cp & 0x3F));
+            }
+            return s;
+        };
+
+        // Reset all state (the loader is reused across Model instances).
+        vocab_.clear();
+        reverseVocab_.clear();
+        scores_.clear();
+        mergeRank_.clear();
+        tokenIdToByte_.clear();
+        bpeCache_.clear();
+        useMergeRank_ = false;
+
+        // ---- Vocabulary (token string -> id) ----
+        if (vocabObj != nullptr) {
+            for (const auto &kv: vocabObj->members) {
+                const int32_t id = static_cast<int32_t>(kv.second.asU64());
+                vocab_[id] = kv.first;
+                reverseVocab_[kv.first] = id;
+            }
+        }
+        // added_tokens (special markers) may be absent from model.vocab.
+        const JsonValue *added = root.find("added_tokens");
+        if (added != nullptr && added->type == JsonValue::Type::Array) {
+            for (const auto &tok: added->array) {
+                const JsonValue *content = tok.find("content");
+                const JsonValue *id = tok.find("id");
+                if (content == nullptr || id == nullptr) continue;
+                const int32_t tid = static_cast<int32_t>(id->asU64());
+                if (vocab_.find(tid) == vocab_.end()) {
+                    vocab_[tid] = content->str;
+                }
+                reverseVocab_[content->str] = tid;
+            }
+        }
+        if (vocab_.empty()) {
+            std::cerr << "[TinyCoder] tokenizer.json has an empty vocabulary"
+                      << std::endl;
+            return false;
+        }
+
+        // ---- Byte-level initial symbols ----
+        for (int b = 0; b < 256; ++b) {
+            const std::string u = utf8Encode(bytesToUnicode(b));
+            auto it = reverseVocab_.find(u);
+            if (it != reverseVocab_.end()) {
+                byteToTokenId_[b] = it->second;
+                tokenIdToByte_[it->second] = static_cast<uint8_t>(b);
+            } else {
+                byteToTokenId_[b] = b;
+                tokenIdToByte_[b] = static_cast<uint8_t>(b);
+            }
+        }
+
+        // ---- Merge ranks: the HF format gives an explicit priority order ----
+        if (mergesArr != nullptr && mergesArr->type == JsonValue::Type::Array) {
+            for (size_t r = 0; r < mergesArr->array.size(); ++r) {
+                const JsonValue &m = mergesArr->array[r];
+                std::string left, right;
+                if (m.type == JsonValue::Type::String) {
+                    const size_t sp = m.str.find(' ');
+                    if (sp == std::string::npos) continue;
+                    left = m.str.substr(0, sp);
+                    right = m.str.substr(sp + 1);
+                } else if (m.type == JsonValue::Type::Array && m.array.size() == 2) {
+                    left = m.array[0].str;
+                    right = m.array[1].str;
+                } else {
+                    continue;
+                }
+                auto li = reverseVocab_.find(left);
+                auto ri = reverseVocab_.find(right);
+                if (li == reverseVocab_.end() || ri == reverseVocab_.end()) continue;
+                const uint64_t key =
+                        (static_cast<uint64_t>(static_cast<uint32_t>(li->second)) << 32) |
+                        static_cast<uint32_t>(ri->second);
+                // First occurrence wins (the list is priority-ordered).
+                mergeRank_.emplace(key, static_cast<uint32_t>(r));
+            }
+            useMergeRank_ = !mergeRank_.empty();
+        }
+
+        // Architecture defaults (pre-tokenization regex, special-token sockets).
+        configureForArchitecture(architecture);
+
+        // Resolve the architecture's special-token IDs from the REAL vocabulary
+        // (the same post-processing loadFromGGUF performs), so chat framing and
+        // EOG termination match the generated continuation.  Qwen3.5 places the
+        // specials at the END of the vocab (248044/248045/248046 here).
+        specialTokenTexts_.clear();
+        auto findId = [&](const std::string &t) -> int32_t {
+            auto it = reverseVocab_.find(t);
+            return it != reverseVocab_.end() ? it->second : -1;
+        };
+        const char *specials[] = {
+                "<|endoftext|>", "<|im_start|>", "<|im_end|>", "<|fim_prefix|>",
+                "<|fim_middle|>", "<|fim_suffix|>", "<|repo_name|>", "<|file_sep|>",
+        };
+        for (const char *sp: specials) {
+            const int32_t id = findId(sp);
+            if (id >= 0) {
+                specialTokenTexts_.emplace_back(sp, id);
+            }
+        }
+        const int32_t endText = findId("<|endoftext|>");
+        const int32_t imStart = findId("<|im_start|>");
+        const int32_t imEnd = findId("<|im_end|>");
+        if (endText >= 0) {
+            eosTokenId_ = endText;
+        }
+        if (imStart >= 0) {
+            imStartId_ = imStart;
+        }
+        if (imEnd >= 0) {
+            imEndId_ = imEnd;
+        }
+        // Qwen3.5 uses <|endoftext|> as BOS/PAD (see generation_config.json).
+        if (bosTokenId_ < 0 && endText >= 0) {
+            bosTokenId_ = endText;
+        }
+        if (padTokenId_ < 0 && endText >= 0) {
+            padTokenId_ = endText;
+        }
+
+        eogTokens_.clear();
+        if (eosTokenId_ >= 0) eogTokens_.insert(eosTokenId_);
+        if (endText >= 0) eogTokens_.insert(endText);
+        if (imEnd >= 0) eogTokens_.insert(imEnd);
+
+        specialTokens_.clear();
+        if (bosTokenId_ >= 0) specialTokens_.insert(bosTokenId_);
+        if (eosTokenId_ >= 0) specialTokens_.insert(eosTokenId_);
+        if (padTokenId_ >= 0) specialTokens_.insert(padTokenId_);
+        for (const auto &p: specialTokenTexts_) specialTokens_.insert(p.second);
+        for (int32_t e: eogTokens_) specialTokens_.insert(e);
+
+        std::cout << "[TinyCoder] HF tokenizer loaded: " << vocab_.size()
+                  << " tokens, " << mergeRank_.size() << " merges, bos=" << bosTokenId_
+                  << " eos=" << eosTokenId_ << " pad=" << padTokenId_ << std::endl;
+        return true;
+    }
+
     bool Tokenizer::load(const std::string &vocabPath) {
         // Load from a tiktoken .tiktoken file or BPE .model file
         std::ifstream file(vocabPath);
@@ -701,15 +902,31 @@ namespace tinycoder {
         if (symbols.empty())
             return symbols;
 
-        // Greedy merging using token scores.
-        // At each step, find the adjacent pair whose concatenation exists
-        // in the vocabulary with the highest score, and merge it.
+        // Greedy merging.  Two selection rules:
+        //  - HF tokenizer.json (useMergeRank_): the pair's rank in model.merges
+        //    is the priority (lower merges first), the standard BPE rule.
+        //  - tiktoken-style: merge the adjacent pair whose concatenation exists
+        //    in the vocabulary with the highest score.
         while (symbols.size() > 1) {
             float bestScore = -std::numeric_limits<float>::infinity();
+            uint32_t bestRank = std::numeric_limits<uint32_t>::max();
             size_t bestPos = 0;
             bool found = false;
 
             for (size_t i = 0; i < symbols.size() - 1; ++i) {
+                if (useMergeRank_) {
+                    const uint64_t key =
+                            (static_cast<uint64_t>(static_cast<uint32_t>(symbols[i]))
+                             << 32) |
+                            static_cast<uint32_t>(symbols[i + 1]);
+                    auto rankIt = mergeRank_.find(key);
+                    if (rankIt != mergeRank_.end() && rankIt->second < bestRank) {
+                        bestRank = rankIt->second;
+                        bestPos = i;
+                        found = true;
+                    }
+                    continue;
+                }
                 std::string merged =
                         getTokenString(symbols[i]) + getTokenString(symbols[i + 1]);
                 auto revIt = reverseVocab_.find(merged);
@@ -731,7 +948,8 @@ namespace tinycoder {
                 break;// No more merges possible
             }
 
-            // Merge the best pair
+            // Merge the best pair.  The merged id is keyed on the concatenated
+            // token strings in both modes.
             std::string mergedStr =
                     getTokenString(symbols[bestPos]) + getTokenString(symbols[bestPos + 1]);
             int32_t mergedId = reverseVocab_.at(mergedStr);

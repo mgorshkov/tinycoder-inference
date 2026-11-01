@@ -25,7 +25,8 @@ SOFTWARE.
 /*
  * CUDA GPU offload engine for TinyCoder.
  *
- * Two execution strategies (RTX 2080 Ti / Turing reference target):
+ * Two execution strategies (reference target: the Turing RTX 2080 Ti; also runs
+ * on Ampere/Ada — RTX 3090/4090 — and newer GPUs via forward-compatible PTX):
  *
  * 1. Single-token generation (seqLen == 1) is DRAM-bandwidth-bound.
  *
@@ -65,6 +66,7 @@ SOFTWARE.
 
 #ifdef USE_CUDA
 
+#include "EXL3Kernels.hpp"
 #include "FFNPersistentKernel.hpp"
 #include "GPUCompute.hpp"
 #include "ThreadPool.hpp"
@@ -115,6 +117,7 @@ namespace tinycoder::gpu {
 
         // GGML type codes (GGUFLoader.hpp).
         constexpr uint32_t kTypeF32 = 0;
+        constexpr uint32_t kTypeF16 = 1;
         constexpr uint32_t kTypeQ5_0 = 6;
         constexpr uint32_t kTypeQ8_0 = 8;
         constexpr uint32_t kTypeQ2K = 10;
@@ -130,6 +133,9 @@ namespace tinycoder::gpu {
         constexpr uint32_t kTypeIQ3S = 21;
         constexpr uint32_t kTypeIQ2S = 22;
         // Prism ternary (Bonsai) — 2 bits/weight, 34-byte / 128-weight blocks.
+        // Native EXL3 trellis linear (not a GGML block type; see
+        // IModelLoader.hpp / EXL3Kernels.hpp).
+        constexpr uint32_t kTypeEXL3 = 200;
         constexpr uint32_t kTypePQ2_0 = 142;
         constexpr uint32_t kPQ2_0_BYTES = 34;// d(fp16,2) + qs[32]
         // Prism Hadamard-fold block size (prism.hadamard.block_size).
@@ -9292,6 +9298,18 @@ namespace tinycoder::gpu {
                          uint32_t rows, uint32_t cols, uint32_t rowBytes,
                          uint32_t blocksPerRow, uint8_t *&q8k,
                          uint64_t &q8kBytes) {
+            // Native EXL3 trellis: `wq` is the packed trellis device pointer
+            // registered by the uploader.  Decode + transform happens inside
+            // the fused kernel (no Q8_K activation quantization).
+            if (type == kTypeEXL3) {
+                std::string exl3Err;
+                if (!exl3gpu::gemvFused(wq, x, out, g_stream, exl3Err)) {
+                    std::fprintf(stderr, "EXL3 fused GEMV failed: %s\n",
+                                 exl3Err.c_str());
+                    cudaMemsetAsync(out, 0, sizeof(float) * rows, g_stream);
+                }
+                return;
+            }
             // x is read directly from global inside the kernel (coalesced, and
             // tiny enough to stay L1/L2-resident), so no shared memory is used.
             // cols must be a multiple of 32.  For this model hiddenSize=1536,
@@ -10453,6 +10471,25 @@ namespace tinycoder::gpu {
                     }
                 }
                 row += typeBytes;
+            }
+        }
+
+        // Token embedding copy for a plain F16 checkpoint table (EXL3 keeps
+        // the embedding as BF16->F16 rather than trellis-quantized).
+        __global__ void kEmbedF16(const uint8_t *__restrict__ embed,
+                                  const int32_t *__restrict__ tokens,
+                                  float *__restrict__ hidden, uint32_t seqLen,
+                                  uint32_t hiddenSize, uint32_t rowBytes,
+                                  uint32_t vocabSize) {
+            const uint32_t s = blockIdx.x;
+            if (s >= seqLen) return;
+            const int32_t t = tokens[s];
+            if (t < 0 || static_cast<uint32_t>(t) >= vocabSize) return;
+            const __half *row = reinterpret_cast<const __half *>(
+                    embed + static_cast<uint64_t>(t) * rowBytes);
+            float *h = hidden + static_cast<size_t>(s) * hiddenSize;
+            for (uint32_t i = threadIdx.x; i < hiddenSize; i += blockDim.x) {
+                h[i] = __half2float(row[i]);
             }
         }
 

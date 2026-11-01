@@ -26,6 +26,7 @@ add_executable(tinycoder_test
     Main.cpp
     ModelTest.cpp
     DequantizeTest.cpp
+    EXL3Test.cpp
     ReferenceCompareTest.cpp
     ThreadPoolReentrancyTest.cpp
     GPUCpuCompareTest.cpp
@@ -65,6 +66,60 @@ target_link_libraries(tiny_logits_probe
     PRIVATE
     tinycoder_core
 )
+
+# ---- EXL3 checkpoint smoke probe (diagnostic; not a gtest) ----
+# Loads a real EXL3 (ExLlamaV3) HF directory through EXL3Loader and validates
+# the materialized GGUF-named tensor inventory + numeric sanity, without a
+# tokenizer.  Runs on CPU (no CUDA needed).
+add_executable(exl3_model_smoke
+    ../tools/exl3_model_smoke.cpp
+)
+
+target_link_libraries(exl3_model_smoke
+    PRIVATE
+    tinycoder_core
+)
+
+# ---- EXL3 GPU kernel parity probe (diagnostic; not a gtest) ----
+# Cross-checks the EXL3 decode/reconstruct/GEMV GPU kernels against the CPU
+# reference codec.  Self-contained (synthetic trellis), so it runs without a
+# model file.  Only meaningful in a CUDA build.
+if(ENABLE_CUDA)
+    add_executable(exl3_gpu_parity
+        ../tools/exl3_gpu_parity.cpp
+    )
+
+    target_link_libraries(exl3_gpu_parity
+        PRIVATE
+        tinycoder_core
+    )
+
+    set_target_properties(exl3_gpu_parity PROPERTIES
+        CXX_STANDARD 20
+        CXX_STANDARD_REQUIRED ON
+    )
+
+    # ---- EXL3 GPU kernel benchmark (diagnostic; not a gtest) ----
+    # Times the reconstruct pipeline + steady-state GEMV over the real layer
+    # shapes of a checkpoint and projects a decode step.  Needs the CUDA runtime
+    # headers directly (cudaGetDeviceProperties), hence CUDA::cudart.
+    add_executable(exl3_kernel_bench
+        ../tools/exl3_kernel_bench.cpp
+    )
+
+    target_link_libraries(exl3_kernel_bench
+        PRIVATE
+        tinycoder_core
+    )
+
+    find_package(CUDAToolkit REQUIRED)
+    target_link_libraries(exl3_kernel_bench PRIVATE CUDA::cudart)
+
+    set_target_properties(exl3_kernel_bench PROPERTIES
+        CXX_STANDARD 20
+        CXX_STANDARD_REQUIRED ON
+    )
+endif()
 
 target_include_directories(tinycoder_test
     PRIVATE

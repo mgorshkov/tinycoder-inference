@@ -49,6 +49,8 @@ namespace tinycoder {
 
         uint32_t typeBlockBytes(uint32_t type) {
             switch (type) {
+                case GGML_TYPE_F16:
+                    return 2;
                 case GGML_TYPE_Q5_0:
                     return 22;
                 case GGML_TYPE_Q8_0:
@@ -126,6 +128,7 @@ namespace tinycoder {
                 case GGML_TYPE_IQ4_XS:
                 case GGML_TYPE_IQ4_NL:
                 case GGML_TYPE_PQ2_0:
+                case GGML_TYPE_EXL3:
                     return true;
                 default:
                     return false;
@@ -133,7 +136,8 @@ namespace tinycoder {
         }
 
         bool supportedEmbeddingType(uint32_t type) {
-            return type == GGML_TYPE_Q2_K || type == GGML_TYPE_Q5_0 ||
+            return type == GGML_TYPE_F16 ||
+                   type == GGML_TYPE_Q2_K || type == GGML_TYPE_Q5_0 ||
                    type == GGML_TYPE_Q8_0 || type == GGML_TYPE_IQ3_S ||
                    type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K ||
                    type == GGML_TYPE_IQ4_NL || type == GGML_TYPE_PQ2_0;
@@ -145,6 +149,17 @@ namespace tinycoder {
             dm.rows = m.rows;
             dm.cols = m.cols;
             dm.type = m.type;
+            if (m.exl3 != nullptr) {
+                // Native EXL3: upload the packed trellis via the fused path
+                // instead of the materialized F16 bytes.
+                dm.type = GGML_TYPE_EXL3;
+                dm.exl3 = m.exl3;
+                dm.blocksPerRow = 0;
+                dm.rowBytes = 0;
+                dm.q = const_cast<uint8_t *>(
+                        reinterpret_cast<const uint8_t *>(m.exl3->trellis));
+                return dm;
+            }
             // F32 weights (qwen35 ssm_alpha [nVHeads][hidden] and ssm_beta,
             // ssm_conv1d [channels][kernel]) are plain row-major floats.  There
             // is no dense-block encoding: rowBytes = cols*4 and upload() copies
@@ -213,8 +228,16 @@ namespace tinycoder {
                       "Q5_0/Q8_0/IQ3_S)";
                 return false;
             }
+            // A QuantizedMatrix is GPU-representable either by its GGML type
+            // or by the native EXL3 trellis (whose F16 materialization is a
+            // CPU-only fallback, so `type` alone must not decide).
+            auto supportedMatrix = [](const QuantizedMatrix &q) {
+                if (q.empty() || q.type == 0) return true;// empty / F32
+                if (q.exl3 != nullptr) return true;
+                return supportedWeightType(q.type);
+            };
             if (!m.lmHeadTied_ && !m.lmHead_.empty() &&
-                !supportedWeightType(m.lmHead_.type)) {
+                !supportedMatrix(m.lmHead_)) {
                 err = "GPU offload unsupported: LM head quant type " +
                       std::to_string(m.lmHead_.type) +
                       " not implemented by GPU kernels (need Q2_K/Q3_K/Q4_K/Q6_K)";
@@ -222,25 +245,18 @@ namespace tinycoder {
             }
             for (uint32_t L = 0; L < cfg.numLayers; ++L) {
                 const auto &w = layers[L];
-                const uint32_t types[] = {w.attnQ.type, w.attnK.type,
-                                          w.attnV.type, w.attnO.type,
-                                          w.ffnGate.type, w.ffnUp.type,
-                                          w.ffnDown.type,
-                                          w.attnQKV.type, w.attnGate.type,
-                                          w.ssmAlphaQ.type, w.ssmBetaQ.type,
-                                          w.ssmOut.type,
-                                          // qwen35moe MoE FFN tensors.
-                                          w.ffnGateInpMoe.type,
-                                          w.ffnGateExps.type, w.ffnUpExps.type,
-                                          w.ffnDownExpsMoe.type,
-                                          w.ffnGateShexp.type, w.ffnUpShexp.type,
-                                          w.ffnDownShexp.type};
-                for (uint32_t t: types) {
-                    if (t == 0) continue;// F32 / empty
-                    if (!supportedWeightType(t)) {
+                const QuantizedMatrix *mats[] = {
+                        &w.attnQ, &w.attnK, &w.attnV, &w.attnO, &w.ffnGate,
+                        &w.ffnUp, &w.ffnDown, &w.attnQKV, &w.attnGate,
+                        &w.ssmAlphaQ, &w.ssmBetaQ, &w.ssmOut,
+                        &w.ffnGateInpMoe, &w.ffnGateExps, &w.ffnUpExps,
+                        &w.ffnDownExpsMoe, &w.ffnGateShexp, &w.ffnUpShexp,
+                        &w.ffnDownShexp};
+                for (const QuantizedMatrix *q: mats) {
+                    if (!supportedMatrix(*q)) {
                         err = "GPU offload unsupported: layer " +
                               std::to_string(L) + " uses quant type " +
-                              std::to_string(t) +
+                              std::to_string(q->type) +
                               " not implemented by GPU kernels (need "
                               "Q2_K/Q3_K/Q4_K/Q5_K/Q6_K/IQ*)";
                         return false;
@@ -275,6 +291,12 @@ namespace tinycoder {
                 uint64_t layerBytes = 0;
                 const auto addMat = [&](const QuantizedMatrix &m) {
                     if (m.empty()) return;
+                    if (m.exl3 != nullptr) {
+                        layerBytes += m.exl3->trellisBytes;
+                        layerBytes += static_cast<uint64_t>(m.exl3->k + m.exl3->n) *
+                                      sizeof(float);
+                        return;
+                    }
                     if (m.type == GGML_TYPE_F32) {
                         // F32 weights (ssm_alpha/beta/conv1d) upload as raw
                         // row-major floats (rows*cols*4); K-quants use
@@ -364,10 +386,16 @@ namespace tinycoder {
                 // (already-charged) embedding matrix, so the cost is 0.
                 uint64_t lmHeadBytes = 0;
                 if (!m.lmHeadTied_ && !m.lmHead_.empty()) {
-                    const uint32_t lmBlocks =
-                            blocksPerRowFor(m.lmHead_.type, m.lmHead_.cols);
-                    lmHeadBytes = static_cast<uint64_t>(cfg.vocabSize) *
-                                  typeBlockBytes(m.lmHead_.type) * lmBlocks;
+                    if (m.lmHead_.exl3 != nullptr) {
+                        // Native EXL3: the uploaded form is the packed trellis
+                        // (~0.48 GB at 3 bpw), not the 2.5 GB F16 fallback.
+                        lmHeadBytes = m.lmHead_.exl3->trellisBytes;
+                    } else {
+                        const uint32_t lmBlocks =
+                                blocksPerRowFor(m.lmHead_.type, m.lmHead_.cols);
+                        lmHeadBytes = static_cast<uint64_t>(cfg.vocabSize) *
+                                      typeBlockBytes(m.lmHead_.type) * lmBlocks;
+                    }
                 }
                 // Free VRAM: authoritative cudaMemGetInfo; conservative fallback.
                 int64_t freeVram = 8ll << 30;
@@ -563,10 +591,16 @@ namespace tinycoder {
             uint32_t lmHeadType = emb.type;
             uint32_t lmHeadRowBytes = embRowBytes;
             if (!m.lmHeadTied_ && !m.lmHead_.empty()) {
-                lmHeadQ = m.lmHead_.data.data();
-                lmHeadType = m.lmHead_.type;
-                lmHeadRowBytes = typeBlockBytes(m.lmHead_.type) *
-                                 blocksPerRowFor(m.lmHead_.type, m.lmHead_.cols);
+                if (m.lmHead_.exl3 != nullptr) {
+                    lmHeadType = GGML_TYPE_EXL3;
+                    lmHeadRowBytes = 0;
+                    lmHeadQ = m.lmHead_.exl3->trellis;
+                } else {
+                    lmHeadQ = m.lmHead_.data.data();
+                    lmHeadType = m.lmHead_.type;
+                    lmHeadRowBytes = typeBlockBytes(m.lmHead_.type) *
+                                     blocksPerRowFor(m.lmHead_.type, m.lmHead_.cols);
+                }
             }
             geom.lmHeadTied = m.lmHeadTied_ ? 1u : 0u;
 
@@ -599,7 +633,8 @@ namespace tinycoder {
 
             if (!gpu_.uploadWithPrism(deviceLayers, geom, emb.data.data(),
                                       emb.type, embRowBytes, lmHeadQ, lmHeadType,
-                                      lmHeadRowBytes, prism, err)) {
+                                      lmHeadRowBytes, prism, err,
+                                      m.lmHead_.exl3)) {
                 // Failed to fit. IQ1_M fits the full-GPU upload on the first
                 // try and never reaches this path.
                 if (cfg.architecture == ARCH_QWEN35MOE && !moeCpuEnabled_) {
@@ -869,7 +904,7 @@ namespace tinycoder {
                     // starts from a clean device.
                     if (gpu_.upload(deviceLayers, geom, emb.data.data(), emb.type,
                                     embRowBytes, lmHeadQ, lmHeadType,
-                                    lmHeadRowBytes, err)) {
+                                    lmHeadRowBytes, err, m.lmHead_.exl3)) {
                         // ---- Expert placement policy (2026-09-15) ----
                         // DEFAULT-ON (2026-09-17): the per-layer expert LRU
                         // cache is BUILT BY DEFAULT now that the correctness

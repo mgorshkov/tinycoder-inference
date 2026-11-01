@@ -1091,7 +1091,11 @@ namespace tinycoder::gpu {
         {
             const uint32_t blocksPerRow = hostBlocksPerRow(embedType_, H);
             const uint8_t *eQ = reinterpret_cast<const uint8_t *>(embedQ_);
-            if (embedType_ == kTypeQ5K || embedType_ == kTypeQ5_0) {
+            if (embedType_ == kTypeF16) {
+                kEmbedF16<<<seqLen, 32, 0, g_stream>>>(
+                        eQ, s.tokens, s.hidden, seqLen, H, embedRowBytes_,
+                        geom_.vocabSize);
+            } else if (embedType_ == kTypeQ5K || embedType_ == kTypeQ5_0) {
                 kEmbedDequantQ5K<<<seqLen, 32, 0, g_stream>>>(
                         eQ, s.tokens, s.hidden, seqLen, H, blocksPerRow,
                         embedRowBytes_, geom_.vocabSize);

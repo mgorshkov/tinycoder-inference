@@ -52,6 +52,21 @@ namespace tinycoder {
         /// @return true if loading succeeded
         bool loadFromGGUF(const std::string &ggufPath);
 
+        /// @brief Load tokenizer from a Hugging Face `tokenizer.json` (the
+        /// format shipped with EXL3 / safetensors checkpoints).
+        ///
+        /// Parses the ByteLevel BPE `model.vocab` + `model.merges` + the
+        /// `added_tokens` list and resolves the architecture's special-token IDs
+        /// from the vocabulary — the same post-processing loadFromGGUF performs,
+        /// so encode()/decodeToken()/isEogToken() behave identically for GGUF
+        /// and EXL3 checkpoints.
+        /// @param tokenizerJsonPath Path to the checkpoint's tokenizer.json
+        /// @param architecture Engine architecture id (e.g. "qwen35"), used for
+        ///                     pre-tokenization defaults
+        /// @return true if loading succeeded
+        bool loadFromHFTokenizer(const std::string &tokenizerJsonPath,
+                                 const std::string &architecture);
+
         /// @brief Load tokenizer from separate files.
         /// @param vocabPath Path to vocab file (tiktoken .tiktoken or BPE .model)
         /// @return true if loading succeeded
@@ -111,6 +126,14 @@ namespace tinycoder {
         std::unordered_map<std::string, int32_t> reverseVocab_;
         // Token scores (log probabilities) for tiktoken-style greedy merging
         std::unordered_map<int32_t, float> scores_;
+
+        // Merge ranks for Hugging Face ByteLevel BPE (tokenizer.json).  Key =
+        // (leftTokenId << 32) | rightTokenId, value = merge priority (lower
+        // merges first).  Empty for in-vocab tiktoken-style merging.
+        std::unordered_map<uint64_t, uint32_t> mergeRank_;
+        // True when mergeRank_ drives bpeEncode() (HF tokenizer.json) instead of
+        // the tiktoken "concatenation exists in vocab, highest score wins" rule.
+        bool useMergeRank_ = false;
 
         // Special tokens set
         std::unordered_set<int32_t> specialTokens_;

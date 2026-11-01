@@ -9,6 +9,7 @@
 #ifdef USE_CUDA
 
 #include "GPUComputeInternal.hpp"
+#include "EXL3Kernels.hpp"
 
 #include <cublas_v2.h>
 #include <cuda_fp16.h>
@@ -388,11 +389,12 @@ namespace tinycoder::gpu {
                           const ModelGeometry &geom, const void *embedQ,
                           uint32_t embedType, uint32_t embedRowBytes,
                           const void *lmHeadQ, uint32_t lmHeadType,
-                          uint32_t lmHeadRowBytes, std::string &errMsg) {
+                          uint32_t lmHeadRowBytes, std::string &errMsg,
+                          const Exl3LinearInfo *lmHeadExl3) {
         // Backward-compatible entry point: no Prism fold (plain models).
         return uploadWithPrism(layers, geom, embedQ, embedType, embedRowBytes,
                                lmHeadQ, lmHeadType, lmHeadRowBytes,
-                               PrismGPUConfig{}, errMsg);
+                               PrismGPUConfig{}, errMsg, lmHeadExl3);
     }
 
     bool GPUModel::uploadWithPrism(const std::vector<DeviceLayer> &layers,
@@ -401,7 +403,8 @@ namespace tinycoder::gpu {
                                    const void *lmHeadQ, uint32_t lmHeadType,
                                    uint32_t lmHeadRowBytes,
                                    const PrismGPUConfig &prism,
-                                   std::string &errMsg) {
+                                   std::string &errMsg,
+                                   const Exl3LinearInfo *lmHeadExl3) {
         if (allocated_) destroy();
         // Clear any sticky CUDA error from a previous failed attempt (e.g. an
         // earlier upload's cudaMalloc OOM).  cudaGetLastError() consumes it;
@@ -495,7 +498,32 @@ namespace tinycoder::gpu {
         // partial allocations are always released on failure.
         auto uploadMat = [&](const DeviceMatrix &src, DeviceMatrix &dst,
                              const char *name) -> bool {
-            if (src.q == nullptr) return true;
+            if (src.q == nullptr && src.exl3 == nullptr) return true;
+            if (src.exl3 != nullptr) {
+                // Native EXL3: upload the packed trellis + signs and register
+                // the fused GEMV (no F16 materialization in VRAM).
+                dst = src;
+                exl3gpu::Exl3HostLinear h{};
+                h.packed = src.exl3->trellis;
+                h.k = src.exl3->k;
+                h.n = src.exl3->n;
+                h.bitrate10 = src.exl3->K * 10u + (src.exl3->frac ? 5u : 0u);
+                h.codebook = src.exl3->codebook;
+                h.suh = src.exl3->suh;
+                h.svh = src.exl3->svh;
+                exl3gpu::Exl3FusedLinear fl;
+                if (!exl3gpu::uploadFusedLinear(h, fl, errMsg)) {
+                    failCleanup(name);
+                    return false;
+                }
+                dst.q = const_cast<void *>(fl.trellis);
+                exl3Owned_.push_back({const_cast<void *>(fl.trellis),
+                                      const_cast<void *>(
+                                              static_cast<const void *>(fl.suh)),
+                                      const_cast<void *>(
+                                              static_cast<const void *>(fl.svh))});
+                return true;
+            }
             dst = src;
             const uint64_t qBytes =
                     static_cast<uint64_t>(src.rows) * src.rowBytes;
@@ -841,14 +869,42 @@ namespace tinycoder::gpu {
         // lmHeadQ_ stays null; the full-offload tail falls back to the tied
         // embedding matrix, which is correct because a full offload never has a
         // separate head without uploading it first.
-        const bool useGpuLmHead = (lmHeadQ != nullptr) && (nGpu == geom.numLayers);
+        const bool useGpuLmHead =
+                (lmHeadQ != nullptr || lmHeadExl3 != nullptr) &&
+                (nGpu == geom.numLayers);
         if (useGpuLmHead) {
-            uint64_t lmBytes = static_cast<uint64_t>(geom.vocabSize) * lmHeadRowBytes;
-            if (!allocRaw(reinterpret_cast<void **>(&lmHeadQ_), lmBytes, "lmHeadQ"))
-                return false;
-            if (!uploadRaw(lmHeadQ_, lmHeadQ, lmBytes, "lmHeadQ")) return false;
-            lmHeadType_ = lmHeadType;
-            lmHeadRowBytes_ = lmHeadRowBytes;
+            if (lmHeadExl3 != nullptr) {
+                exl3gpu::Exl3HostLinear h{};
+                h.packed = lmHeadExl3->trellis;
+                h.k = lmHeadExl3->k;
+                h.n = lmHeadExl3->n;
+                h.bitrate10 = lmHeadExl3->K * 10u +
+                              (lmHeadExl3->frac ? 5u : 0u);
+                h.codebook = lmHeadExl3->codebook;
+                h.suh = lmHeadExl3->suh;
+                h.svh = lmHeadExl3->svh;
+                exl3gpu::Exl3FusedLinear fl;
+                if (!exl3gpu::uploadFusedLinear(h, fl, errMsg)) {
+                    failCleanup("lmHeadQ");
+                    return false;
+                }
+                lmHeadQ_ = static_cast<float *>(const_cast<void *>(fl.trellis));
+                lmHeadType_ = GGML_TYPE_EXL3;
+                lmHeadRowBytes_ = 0;
+                exl3Owned_.push_back({const_cast<void *>(fl.trellis),
+                                      const_cast<void *>(
+                                              static_cast<const void *>(fl.suh)),
+                                      const_cast<void *>(
+                                              static_cast<const void *>(fl.svh))});
+            } else {
+                uint64_t lmBytes =
+                        static_cast<uint64_t>(geom.vocabSize) * lmHeadRowBytes;
+                if (!allocRaw(reinterpret_cast<void **>(&lmHeadQ_), lmBytes, "lmHeadQ"))
+                    return false;
+                if (!uploadRaw(lmHeadQ_, lmHeadQ, lmBytes, "lmHeadQ")) return false;
+                lmHeadType_ = lmHeadType;
+                lmHeadRowBytes_ = lmHeadRowBytes;
+            }
         }
 
         // ---- RoPE tables [maxSeqLen][headDim/2] ----
@@ -1044,6 +1100,9 @@ namespace tinycoder::gpu {
             auto twinMat = [&](DeviceMatrix &m) {
                 if (!twinEnabled_ || m.q == nullptr || m.rows == 0 || m.cols == 0)
                     return;
+                // Native EXL3 has no GGML block layout to dequantize here (the
+                // fused GEMV reads the trellis directly).
+                if (m.type == GGML_TYPE_EXL3) return;
                 const uint64_t need =
                         static_cast<uint64_t>(m.rows) * m.cols * sizeof(__half);
                 if (need == 0 || need > twinBytesRemaining_) return;

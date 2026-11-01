@@ -979,7 +979,7 @@ namespace tinycoder {
 #endif
     }
 
-    const GGUFLoader::TensorInfo *
+    const TensorInfo *
     GGUFLoader::getTensorInfo(const std::string &name) const {
         auto it = tensorNameIndex_.find(name);
         if (it == tensorNameIndex_.end()) {
@@ -995,7 +995,7 @@ namespace tinycoder {
         return &result;
     }
 
-    const std::vector<GGUFLoader::TensorInfo> &
+    const std::vector<TensorInfo> &
     GGUFLoader::tensorRecords() const {
         if (!tensorRecordCacheValid_) {
             tensorRecordCache_.clear();

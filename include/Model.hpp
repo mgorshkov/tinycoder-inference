@@ -38,6 +38,7 @@
 #include "AlignedVector.hpp"
 #include "GGMLDequantize.hpp"
 #include "GGUFLoader.hpp"
+#include "IModelLoader.hpp"
 #include "ModelConfig.hpp"
 #include "PrismHadamard.hpp"
 #include "Tokenizer.hpp"
@@ -60,6 +61,11 @@ namespace tinycoder {
         // Model::applyPrismTransform before the call. The weight itself stays in
         // its native PQ2_0 format (never expanded to F16).
         bool foldedWeight = false;
+
+        // Native EXL3 trellis metadata (null for GGUF / F16 tensors).  The CPU
+        // path uses `data` (materialized F16); the CUDA offload path uploads the
+        // packed trellis + signs and runs the fused EXL3 GEMV instead.
+        const Exl3LinearInfo *exl3 = nullptr;
 
         // Pre-packed Q2_K data (expanded 2-bit values to bytes 0-3).
         // Only populated for ffnGate and ffnUp when type == GGML_TYPE_Q2_K.
@@ -633,15 +639,15 @@ namespace tinycoder {
     private:
         // ---- Model weights (stored in native quantized format) ----
 
-        // Persistent GGUF file loader that owns the mmap backing store for the
-        // quantized weight tensors. Must be declared BEFORE every weight field
-        // whose AlignedVector buffers are set to EXTERNAL (non-owning) mode via
+        // Persistent model-file loader (GGUFLoader for .gguf, EXL3Loader for an
+        // EXL3/HF safetensors checkpoint) that owns the backing store for the
+        // weight tensors. Must be declared BEFORE every weight field whose
+        // AlignedVector buffers are set to EXTERNAL (non-owning) mode via
         // setExternal(): members are destroyed in reverse declaration order, so
         // this loader outlives all the QuantizedMatrix/QuantizedEmbedding
-        // buffers that borrow pointers into its mmap, and the mmap is only
-        // released after every borrowed buffer is gone. Without this, the
-        // loader's destructor would munmap memory the kernels still reference.
-        std::unique_ptr<GGUFLoader> weightLoader_;
+        // buffers that borrow pointers into its mmap, and the backing store is
+        // only released after every borrowed buffer is gone.
+        std::unique_ptr<IModelLoader> weightLoader_;
 
         QuantizedEmbedding quantizedEmbeddings_;
         std::vector<LayerWeights> layers_;
@@ -1064,8 +1070,9 @@ namespace tinycoder {
                           uint32_t qHeads, uint32_t kHeads,
                           const float *qNorm, const float *kNorm);
 
-        /// @brief Load weights from GGUF (stores in native quantized format).
-        bool loadWeights(GGUFLoader &loader);
+        /// @brief Load weights from the model file (stores in native quantized
+        /// format). Format-neutral: the loader materializes GGUF-named tensors.
+        bool loadWeights(IModelLoader &loader);
 
         /// @brief Initialize KV cache.
         bool initKVCache();

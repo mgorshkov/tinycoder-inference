@@ -31,81 +31,19 @@ SOFTWARE.
 #include <unordered_map>
 #include <vector>
 
+#include "IModelLoader.hpp"
 #include "ModelConfig.hpp"
-
-// GGML tensor types (shared between GGUFLoader and Model)
-enum GGMLType : uint32_t {
-    GGML_TYPE_F32 = 0,
-    GGML_TYPE_F16 = 1,
-    GGML_TYPE_Q4_0 = 2,
-    GGML_TYPE_Q4_1 = 3,
-    GGML_TYPE_Q5_0 = 6,
-    GGML_TYPE_Q5_1 = 7,
-    GGML_TYPE_Q8_0 = 8,
-    GGML_TYPE_Q8_1 = 9,
-    GGML_TYPE_Q2_K = 10,
-    GGML_TYPE_Q3_K = 11,
-    GGML_TYPE_Q4_K = 12,
-    GGML_TYPE_Q5_K = 13,
-    GGML_TYPE_Q6_K = 14,
-    GGML_TYPE_Q8_K = 15,
-    GGML_TYPE_IQ2_XXS = 16,
-    GGML_TYPE_IQ2_XS = 17,
-    GGML_TYPE_IQ3_XXS = 18,
-    GGML_TYPE_IQ1_S = 19,
-    GGML_TYPE_IQ4_NL = 20,
-    GGML_TYPE_IQ3_S = 21,
-    GGML_TYPE_IQ2_S = 22,
-    GGML_TYPE_IQ4_XS = 23,
-    GGML_TYPE_I8 = 24,
-    GGML_TYPE_I16 = 25,
-    GGML_TYPE_I32 = 26,
-    // bfloat16 (2 bytes/element). Used by the Ternary-Bonsai-2-27B export for
-    // the ssm_alpha / ssm_beta projection matrices (converted to F32 at load).
-    GGML_TYPE_BF16 = 30,
-    // Prism-private 2-bit type (Ternary-Bonsai PQ2_0 export): identical 2-bit
-    // codec to Q2_0 but with one fp16 scale per 128 weights (34-byte block).
-    GGML_TYPE_PQ2_0 = 142,
-    GGML_TYPE_COUNT = 143,
-};
 
 namespace tinycoder {
 
-    /// @brief Prism "Hadamard fold" metadata (prism.hadamard.* keys) for the
-    /// Ternary-Bonsai-2-27B export. When present, the listed linear weights are
-    /// stored pre-folded with a per-input-dimension rotation, so the activation
-    /// fed to each such matmul must undergo the same transform (sign flip +
-    /// blockwise normalized Hadamard rotation). The token embedding is stored
-    /// "latent" and its looked-up rows must be restored with the inverse
-    /// transform. See include/PrismHadamard.hpp.
-    struct PrismMetadata {
-        bool present = false;
-        uint32_t version = 0;
-        uint32_t blockSize = 0;                 // Hadamard block size (1024)
-        bool gdnVGrouped = false;               // ssm_out value-head tiled→grouped perm
-        std::vector<std::string> foldedWeights; // weights needing forward fold
-        std::vector<std::string> inverseWeights;// latent tables needing inverse
-        // Per-input-dimension sign vectors (width → ±1 values), concatenated in
-        // prism.hadamard.sign_values and sliced by prism.hadamard.sign_widths.
-        std::vector<uint32_t> signWidths;
-        std::vector<int8_t> signValues;// concatenated per-width ±1 values
-    };
-
-    /// @brief Get the byte size of one block for a GGML quantization type.
-    /// For non-quantized types (F32, etc.), returns 1.
-    /// For quantized types (Q4_K, Q5_K, etc.), returns the block size (e.g., 256).
-    uint32_t ggmlBlockSize(uint32_t type);
-
-    /// @brief Get the byte size of one block's data for a GGML quantization type.
-    /// For non-quantized types (F32, etc.), returns the element size (e.g., 4).
-    /// For quantized types (Q4_K, Q5_K, etc.), returns the block byte size (e.g.,
-    /// 144).
-    uint32_t ggmlTypeSize(uint32_t type);
-
-    /// @brief GGUF file format reader for loading quantized models.
+    /// @brief GGUF v3 file format reader (implements IModelLoader).
     ///
-    /// Supports GGUF v3 format with IQ3_XXS quantization blocks.
-    class GGUFLoader {
+    /// The GGML type enum, PrismMetadata, TensorInfo and the
+    /// ggmlBlockSize()/ggmlTypeSize() helpers now live in IModelLoader.hpp so
+    /// format-agnostic code (the EXL3 loader, its dequant kernels, Model) can
+    /// use them without pulling in the GGUF reader. This header re-exports them
+    /// to existing consumers (GGMLDequantize.hpp, tools, unit tests).
+    class GGUFLoader : public IModelLoader {
     public:
         GGUFLoader() = default;
         ~GGUFLoader();
@@ -113,42 +51,38 @@ namespace tinycoder {
         /// @brief Load a GGUF model file and extract tensor data.
         /// @param path Path to the .gguf file
         /// @return true if loading succeeded
-        bool load(const std::string &path);
+        bool load(const std::string &path) override;
 
         /// @brief Load only metadata from a GGUF file (no tensor data).
         /// Useful for estimating memory requirements before a full load.
         /// @param path Path to the .gguf file
         /// @return true if metadata was read successfully
-        bool loadMetadata(const std::string &path);
+        bool loadMetadata(const std::string &path) override;
 
         /// @brief Get the model configuration parsed from GGUF metadata.
-        const ModelConfig &config() const { return config_; }
+        const ModelConfig &config() const override { return config_; }
 
         /// @brief Prism Hadamard-fold metadata (empty/`present == false` for
         /// every non-Prism model).
-        const PrismMetadata &prism() const { return prism_; }
+        const PrismMetadata &prism() const override { return prism_; }
 
         /// @brief Get raw tensor data by name.
         /// @param name Tensor name (e.g., "blk.0.attn_q.weight")
         /// @return Pointer to tensor data, or nullptr if not found
-        const uint8_t *getTensor(const std::string &name) const;
+        const uint8_t *getTensor(const std::string &name) const override;
 
-        /// @brief Get tensor info (offset, size, shape).
-        struct TensorInfo {
-            std::string name;
-            uint64_t offset;
-            uint64_t size;
-            std::vector<uint32_t> shape;
-            uint32_t type;// GGML tensor type enum
-        };
-
-        const TensorInfo *getTensorInfo(const std::string &name) const;
+        /// @brief Get tensor info (offset, size, shape). TensorInfo is the
+        /// format-neutral record declared in IModelLoader.hpp.
+        const TensorInfo *getTensorInfo(const std::string &name) const override;
 
         /// @brief Read-only access to the enumerated tensor records (name,
         /// offset, shape, type) parsed from the GGUF header. Available after
         /// load() or loadMetadata(). Returns a lazily-built public view over
         /// the private records.
-        const std::vector<TensorInfo> &tensorRecords() const;
+        const std::vector<TensorInfo> &tensorRecords() const override;
+
+        /// @brief GGUFLoader is the native GGUF container reader.
+        bool isGguf() const override { return true; }
 
     private:
         // GGUF header structures

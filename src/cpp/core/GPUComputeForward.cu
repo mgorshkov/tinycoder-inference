@@ -9,6 +9,7 @@
 #ifdef USE_CUDA
 
 #include "GPUComputeInternal.hpp"
+#include "EXL3Kernels.hpp"
 
 #include <cublas_v2.h>
 #include <cuda_fp16.h>
@@ -217,7 +218,11 @@ namespace tinycoder::gpu {
         {
             const uint32_t blocksPerRow = hostBlocksPerRow(embedType_, H);
             const uint8_t *eQ = reinterpret_cast<const uint8_t *>(embedQ_);
-            if (embedType_ == kTypeQ5K || embedType_ == kTypeQ5_0) {
+            if (embedType_ == kTypeF16) {
+                kEmbedF16<<<seqLen, 32, 0, g_stream>>>(
+                        eQ, s.tokens, s.hidden, seqLen, H, embedRowBytes_,
+                        geom_.vocabSize);
+            } else if (embedType_ == kTypeQ5K || embedType_ == kTypeQ5_0) {
                 kEmbedDequantQ5K<<<seqLen, 32, 0, g_stream>>>(
                         eQ, s.tokens, s.hidden, seqLen, H, blocksPerRow,
                         embedRowBytes_, geom_.vocabSize);
@@ -1979,7 +1984,11 @@ namespace tinycoder::gpu {
         {
             uint32_t blocksPerRow = hostBlocksPerRow(embedType_, H);
             const uint8_t *eQ = reinterpret_cast<const uint8_t *>(embedQ_);
-            if (embedType_ == kTypeQ5_0) {
+            if (embedType_ == kTypeF16) {
+                kEmbedF16<<<seqLen, 32, 0, g_stream>>>(
+                        eQ, s.tokens, s.hidden, seqLen, H, embedRowBytes_,
+                        geom_.vocabSize);
+            } else if (embedType_ == kTypeQ5_0) {
                 kEmbedDequantSmall32<kTypeQ5_0><<<seqLen, 32, 0, g_stream>>>(
                         eQ, s.tokens, s.hidden, seqLen, H, blocksPerRow,
                         embedRowBytes_, geom_.vocabSize);
@@ -3277,6 +3286,13 @@ namespace tinycoder::gpu {
             for (uint32_t L = 0; L < nGpu; ++L) {
                 DeviceLayer &l = layers_[L];
                 auto freeMat = [](DeviceMatrix &m) {
+                    if (m.type == GGML_TYPE_EXL3) {
+                        // Owned by exl3Owned_ (released below via the fused
+                        // module, which also unregisters the GEMV).
+                        m.q = nullptr;
+                        m.f16Twin = nullptr;
+                        return;
+                    }
                     cudaFree(m.q);
                     m.q = nullptr;
                     cudaFree(m.f16Twin);
@@ -3324,11 +3340,23 @@ namespace tinycoder::gpu {
             delete[] layers_;
             layers_ = nullptr;
         }
+        // Native EXL3 buffers are owned by the fused module; release (and
+        // unregister) them before the generic frees.
+        for (auto &o: exl3Owned_) {
+            exl3gpu::Exl3FusedLinear fl;
+            fl.trellis = o.trellis;
+            fl.suh = static_cast<const float *>(o.suh);
+            fl.svh = static_cast<const float *>(o.svh);
+            exl3gpu::releaseFusedLinear(fl);
+        }
+        exl3Owned_.clear();
         cudaFree(kvK_);
         cudaFree(kvV_);
         cudaFree(finalNorm_);
         cudaFree(embedQ_);
-        cudaFree(lmHeadQ_);
+        if (lmHeadType_ != GGML_TYPE_EXL3) {
+            cudaFree(lmHeadQ_);
+        }
         cudaFree(ropeCos_);
         cudaFree(ropeSin_);
         cudaFree(mropeCos_);

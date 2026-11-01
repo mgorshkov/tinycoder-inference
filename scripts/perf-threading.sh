@@ -20,7 +20,8 @@ set -u
 MODEL="${TINYCODER_MODEL_PATH:-/data/models/qwen/qwen2.5-coder-1.5b-instruct-q2_k.gguf}"
 BENCH=./build/benchmarks/tinycoder_bench
 # Prefer the CUDA-enabled build (2026-08-29: rebuilt with -DGGML_CUDA=ON;
-# measured tg64 @ -ngl 99 = 290.8 t/s vs 27.35 CPU-only on the RTX 2080 Ti).
+# measured tg64 @ -ngl 99 = 290.8 t/s vs 27.35 CPU-only on the reference
+# RTX 2080 Ti — any Turing/Ampere/Ada GPU works).
 # Set REF to the CPU-only build path to re-run the plain-CPU comparison.
 REF="${REF_GPU:-$HOME/git/llama.cpp/build-cuda/bin/llama-bench}"
 [ -x "$REF" ] || REF="$HOME/git/llama.cpp/build/bin/llama-bench"

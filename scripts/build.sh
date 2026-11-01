@@ -1,7 +1,8 @@
 #!/bin/bash
 #
-# build.sh — Build the TinyCoder inference engine for RTX 2080 Ti as a static library
-#            (plus the unit tests and benchmarks when BUILD_TESTS=ON).
+# build.sh — Build the TinyCoder inference engine as a static library for
+#            NVIDIA GPUs (Turing / Ampere / Ada, incl. RTX 2080 Ti / 3090 / 4090 /
+#            5090) via CUDA, plus the unit tests and benchmarks when BUILD_TESTS=ON.
 #
 # This script:
 #   1. Configures the CMake build tree.
@@ -144,7 +145,7 @@ done
 ROOT_DIR="$(readlink -f "$(dirname "$BASH_SOURCE")/..")"
 cd "${ROOT_DIR}"
 
-echo "=== TinyCoder Inference Engine for RTX 2080 Ti Build ==="
+echo "=== TinyCoder Inference Engine for NVIDIA GPUs (Turing / Ampere / Ada) Build ==="
 echo "Root: ${ROOT_DIR}"
 echo "Build dir: ${BUILD_DIR}"
 echo "Parallel jobs: ${JOBS}"
