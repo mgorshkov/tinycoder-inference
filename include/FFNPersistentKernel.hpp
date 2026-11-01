@@ -46,7 +46,8 @@ namespace tinycoder::gpu {
     // bubbles inside the FFN disappear.  The grid is clamped to the exact
     // simultaneous residency (occupancy x SM count); the barrier is the classic
     // two-phase atomic counter/phase pair, NOT cooperative launch / grid_group,
-    // so it compiles for any arch (the build targets sm_52 + PTX-JIT sm_75).
+    // so it compiles for any arch (portable across the sm_75/80/86 targets and
+    // newer GPUs via forward-compatible PTX JIT).
     //
     // ONLY runs for gate/up == Q2_K and down == Q3_K with
     // cols == blocksPerRow*256 (the 1.5B q2_k dense FFN).  Per-row arithmetic

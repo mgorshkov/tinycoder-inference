@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.18.0)
 
-# TinyCoder Inference Engine for RTX 2080 Ti
+# TinyCoder Inference Engine for NVIDIA GPUs (Turing / Ampere / Ada)
 # ---------------------------------------------------------------------------
 # Standalone C++/CUDA inference core used by the TinyCoder VS Code extension.
 # This repository contains ONLY the engine: src/cpp/core (C++/CUDA), include/
@@ -96,7 +96,13 @@ file(GLOB TINYCODER_CORE_SOURCES CONFIGURE_DEPENDS
     ${CMAKE_CURRENT_SOURCE_DIR}/src/cpp/core/*.cpp
 )
 
-# CUDA source files (only compiled when CUDA is enabled)
+# CUDA source files (only compiled when CUDA is enabled).
+# GPU support: the shared cmake Config.cmake sets CMAKE_CUDA_ARCHITECTURES to
+# 75 80 86 (RTX 20xx/30xx native SASS + forward-compatible PTX for newer GPUs),
+# so the engine runs on Turing / Ampere / Ada and newer NVIDIA GPUs.  Override
+# per build for fully native code on other targets, e.g.
+#   -DCMAKE_CUDA_ARCHITECTURES=89     # Ada (RTX 40xx) native SASS
+#   -DCMAKE_CUDA_ARCHITECTURES=120    # Blackwell (RTX 50xx) native SASS
 if(ENABLE_CUDA)
     file(GLOB TINYCODER_CUDA_SOURCES CONFIGURE_DEPENDS
         ${CMAKE_CURRENT_SOURCE_DIR}/src/cpp/core/*.cu
@@ -126,6 +132,9 @@ endif()
 set(TINYCODER_HEADERS
     include/AlignedVector.hpp
     include/ChatTemplateRenderer.hpp
+    include/EXL3Codec.hpp
+    include/EXL3Kernels.hpp
+    include/EXL3Loader.hpp
     include/GGMLDequantize.hpp
     include/GGUFLoader.hpp
     include/GPUCompute.hpp
@@ -133,6 +142,7 @@ set(TINYCODER_HEADERS
     # engine (kernels/helpers shared by the split GPUCompute*.cu translation
     # units).  It is intentionally NOT listed here so it is not installed as a
     # public header.
+    include/IModelLoader.hpp
     include/Int8Pack.hpp
     include/IQ3XXS.hpp
     include/LMHead.hpp
@@ -141,6 +151,7 @@ set(TINYCODER_HEADERS
     include/Model.hpp
     include/ModelConfig.hpp
     include/ModelInternal.hpp
+    include/SafetensorsReader.hpp
     include/SIMDMatMulVec.hpp
     include/SIMDMatMulVecInternal.hpp
     include/ThreadPool.hpp
@@ -279,7 +290,7 @@ install(FILES ${TINYCODER_HEADERS} DESTINATION include/tinycoder)
 
 # ---- Print configuration summary ----
 message(STATUS "")
-message(STATUS "TinyCoder Inference Engine for RTX 2080 Ti Build Configuration:")
+message(STATUS "TinyCoder Inference Engine for NVIDIA GPUs (Turing / Ampere / Ada) Build Configuration:")
 message(STATUS "  AVX2:          ${ENABLE_AVX2}")
 message(STATUS "  AVX-512:       ${ENABLE_AVX512}")
 message(STATUS "  AVX-512 VBMI:  ${ENABLE_AVX512_VBMI}")

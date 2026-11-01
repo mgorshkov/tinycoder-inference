@@ -38,10 +38,11 @@ SOFTWARE.
  *   3. Prefill (seq > 1): kernel == host reference.
  *   4. Real model IQ3_XXS matrices: pack -> kernel == host reference.
  *
- * The target GPU is a Turing RTX 2080 Ti (sm_75): int8 tensor cores exist ONLY
- * for m8n8k16 / m8n8k32 there (mma.m16n8k16 for int8 needs sm_80+), so the pack
- * and the kernel use m8n8k16.  The kernel is skipped (GTEST_SKIP) on a GPU
- * without int8 mma.
+ * The reference GPU is a Turing RTX 2080 Ti (sm_75): there int8 tensor cores
+ * exist ONLY for m8n8k16 / m8n8k32 (mma.m16n8k16 for int8 needs sm_80+), so the
+ * pack and the kernel use m8n8k16 — which is also valid on Ampere/Ada, so the
+ * same test runs on RTX 3090/4090 and newer GPUs.  The kernel is skipped
+ * (GTEST_SKIP) on a GPU without int8 mma.
  */
 
 #include <algorithm>

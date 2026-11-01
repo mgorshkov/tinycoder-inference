@@ -38,7 +38,9 @@ SOFTWARE.
 #include "SharedTestEnv.hpp"
 #include "ThreadPool.hpp"
 #include <cstdlib>
+#include <filesystem>
 #include <gtest/gtest.h>
+#include <iostream>
 #include <string>
 #include <unistd.h>
 
@@ -54,7 +56,7 @@ int main(int argc, char **argv) {
     tinycoder::ThreadPool::instance().initialize(
             tinycoder::ThreadPool::recommendedThreadCount());
 
-    // Read model path from environment variable
+    // Read model path from environment variable.
     const char *envPath = std::getenv("TINYCODER_MODEL_PATH");
     if (envPath != nullptr && envPath[0] != '\0') {
         SharedTestEnv::modelPath = envPath;
@@ -66,9 +68,32 @@ int main(int argc, char **argv) {
             SharedTestEnv::modelPath = argv[++i];
         }
     }
-    // If no model path provided, use a default model for unit tests.
+    // If no model path was provided (neither TINYCODER_MODEL_PATH nor
+    // --model-path), fall back to the first candidate that actually exists on
+    // disk.  This keeps the self-contained suites (EXL3 codec/safetensors/
+    // loader) running even when no model is available: an empty path just makes
+    // the model-dependent fixtures skip themselves instead of failing the whole
+    // run.  The order prefers the small GGUF references, then any EXL3
+    // checkpoint directory.
     if (SharedTestEnv::modelPath.empty()) {
-        SharedTestEnv::modelPath = "/data/models/qwen/qwen2.5-coder-1.5b-instruct-q2_k.gguf";
+        namespace fs = std::filesystem;
+        const char *candidates[] = {
+                "/data/models/qwen/qwen2.5/qwen2.5-coder-1.5b-instruct-q2_k.gguf",
+                "/data/models/qwen/qwen2.5-coder-1.5b-instruct-q2_k.gguf",
+                "/data/models/qwen/qwen2.5/qwen2.5-coder-7b-instruct-iq3_xxs-imat.gguf",
+                "/data/models/qwen/qwen3.8-27b/qwen3.8-27B-exl3-1.60bpw",
+        };
+        for (const char *c: candidates) {
+            if (fs::exists(c)) {
+                SharedTestEnv::modelPath = c;
+                break;
+            }
+        }
+        if (SharedTestEnv::modelPath.empty()) {
+            std::cerr << "[tinycoder_test] No TINYCODER_MODEL_PATH and no default "
+                         "model found; model-dependent tests will be skipped."
+                      << std::endl;
+        }
     }
 
     // Register the shared test environment (loads model once before all tests)

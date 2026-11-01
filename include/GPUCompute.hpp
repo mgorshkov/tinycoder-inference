@@ -26,6 +26,8 @@ SOFTWARE.
 
 #include <cstdint>
 #include <functional>
+
+#include "IModelLoader.hpp"
 #include <string>
 #include <vector>
 
@@ -54,6 +56,11 @@ namespace tinycoder::gpu {
         // the per-layer streaming dequant kernel is skipped entirely.
         void *f16Twin = nullptr;
         uint64_t f16TwinBytes = 0;
+        // ---- Native EXL3 trellis linear (type == GGML_TYPE_EXL3) ----
+        // `q` then points at the packed trellis (not GGML blocks); the metadata
+        // below is the host descriptor consumed by the adapter's upload.  The
+        // device sign arrays are owned by GPUModel (see exl3Owned_).
+        const Exl3LinearInfo *exl3 = nullptr;
         bool empty_ = false;
         bool hasQ() const { return q != nullptr; }
     };
@@ -186,7 +193,8 @@ namespace tinycoder::gpu {
         bool upload(const std::vector<DeviceLayer> &layers, const ModelGeometry &geom,
                     const void *embedQ, uint32_t embedType, uint32_t embedRowBytes,
                     const void *lmHeadQ, uint32_t lmHeadType, uint32_t lmHeadRowBytes,
-                    std::string &errMsg);
+                    std::string &errMsg,
+                    const Exl3LinearInfo *lmHeadExl3 = nullptr);
         /// @brief Same as upload(), plus the Prism Hadamard-fold sign vectors.
         /// When cfg.enabled, the driver applies the forward activation transform
         /// before every folded PQ2_0 projection and the inverse transform to the
@@ -197,7 +205,8 @@ namespace tinycoder::gpu {
                              uint32_t embedType, uint32_t embedRowBytes,
                              const void *lmHeadQ, uint32_t lmHeadType,
                              uint32_t lmHeadRowBytes, const PrismGPUConfig &prism,
-                             std::string &errMsg);
+                             std::string &errMsg,
+                             const Exl3LinearInfo *lmHeadExl3 = nullptr);
 
         /// @brief Copy the current GPU-side hidden state (after the offloaded layer
         /// prefix) back to the host.  Used by the partial-offload path: the caller
@@ -961,6 +970,16 @@ namespace tinycoder::gpu {
         // moved range leaves a stale mapping).  [2] mirrors the two
         // double-buffer slots; nullptr = that slot is not pinned.
         void *moeNormPinned_[2] = {nullptr, nullptr};
+        // Native EXL3 buffers uploaded by the fused path (trellis + signs).
+        // Owned here so destroy() can release them and the merged freeMat()
+        // loops skip their device pointers.
+        struct Exl3OwnedBuffer {
+            void *trellis = nullptr;
+            void *suh = nullptr;
+            void *svh = nullptr;
+        };
+        std::vector<Exl3OwnedBuffer> exl3Owned_;
+
         // Optional CPU-expert callback (see setMoeCpuFn).  Null = full-GPU MoE
         // (all expert matrices uploaded).
         MoeCpuFn moeCpuFn_;

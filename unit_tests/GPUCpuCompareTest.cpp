@@ -61,6 +61,8 @@ SOFTWARE.
 #include "GPUCompute.hpp"
 #endif
 
+using namespace tinycoder;
+
 // ---------------------------------------------------------------------------
 // Fixture + helpers
 // ---------------------------------------------------------------------------
@@ -68,8 +70,12 @@ SOFTWARE.
 class GPUCpuCompareTest : public ::testing::Test {
 protected:
     void SetUp() override {
-        ASSERT_NE(SharedTestEnv::model, nullptr) << "Model not loaded -- skipping test";
-        ASSERT_TRUE(SharedTestEnv::modelLoaded);
+        if (SharedTestEnv::model == nullptr || !SharedTestEnv::modelLoaded) {
+            GTEST_SKIP() << "Model not loaded: "
+                         << (SharedTestEnv::loadError.empty()
+                                     ? std::string("no model path")
+                                     : SharedTestEnv::loadError);
+        }
     }
 };
 
