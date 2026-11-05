@@ -133,7 +133,7 @@ namespace tinycoder::exl3gpu {
     //
     // so the Hadamard transforms are applied to the ACTIVATION (O(k) and
     // O(n)) instead of to the O(k*n) weight.  Per token this reads only the
-    // packed trellis (~5.4 GB at 1.6 bpw) — the same traffic exllamav3's
+    // packed trellis (~5.4 GB at 1.6 bpw) — the same traffic the EXL3 reference
     // native EXL3 kernels stream.
     // =======================================================================
     struct Exl3FusedLinear {

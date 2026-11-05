@@ -141,7 +141,7 @@ namespace tinycoder {
             decodeTile(packed, K, codebook, tileRowMajor256);
             return;
         }
-        // CPU port of exllamav3 dq8_aligned_{1,2,3}bit + reconstruct_tile's
+        // CPU port of the EXL3 reference dq8_aligned_{1,2,3}bit + reconstruct_tile's
         // tensor-core shuffle.  The runtime layout is a per-lane 16-bit window
         // stream, not a straightforward K-bit-per-code stream: each lane decodes
         // 8 overlapping 16-bit windows through the codebook, then the tensor-core

@@ -30,9 +30,13 @@
 #include <fstream>
 
 #if defined(__linux__)
+#include <dirent.h>
 #include <pthread.h>
 #include <sched.h>
+#include <sys/syscall.h>
 #include <unistd.h>
+#include <string>
+#include <vector>
 #endif
 
 namespace tinycoder {
@@ -116,6 +120,100 @@ namespace tinycoder {
         return 1;
     }
 
+#if defined(__linux__)
+    namespace {
+        std::string readSmallFile(const std::string &path) {
+            std::ifstream in(path);
+            if (!in) return std::string();
+            std::string v;
+            std::getline(in, v);
+            while (!v.empty() && (v.back() == '\n' || v.back() == ' ' ||
+                                  v.back() == '\t'))
+                v.pop_back();
+            return v;
+        }
+
+        // Parse a Linux cpulist ("0-17,36-53") into explicit CPU ids.
+        std::vector<int> parseCpuList(const std::string &s) {
+            std::vector<int> out;
+            size_t i = 0;
+            while (i < s.size()) {
+                size_t j = s.find(',', i);
+                if (j == std::string::npos) j = s.size();
+                const std::string tok = s.substr(i, j - i);
+                const size_t dash = tok.find('-');
+                if (dash == std::string::npos) {
+                    int v = std::atoi(tok.c_str());
+                    if (v >= 0) out.push_back(v);
+                } else {
+                    int a = std::atoi(tok.substr(0, dash).c_str());
+                    int b = std::atoi(tok.substr(dash + 1).c_str());
+                    for (int v = a; v <= b && v - a < 4096; ++v)
+                        if (v >= 0) out.push_back(v);
+                }
+                i = j + 1;
+            }
+            return out;
+        }
+    }// namespace
+#endif
+
+    int ThreadPool::detectGpuNumaNode() {
+#if defined(__linux__)
+        // /sys/bus/pci/devices/<addr>/{vendor,class,numa_node}
+        const char *base = "/sys/bus/pci/devices";
+        DIR *dir = opendir(base);
+        if (dir == nullptr) return -1;
+        int best = -1;
+        while (struct dirent *e = readdir(dir)) {
+            if (e->d_name[0] == '.') continue;
+            const std::string d = std::string(base) + "/" + e->d_name;
+            const std::string vendor = readSmallFile(d + "/vendor");
+            if (vendor != "0x10de") continue;// NVIDIA
+            const std::string cls = readSmallFile(d + "/class");
+            // 0x030000 (VGA) / 0x030200 (3D controller)
+            if (cls.compare(0, 6, "0x0300") != 0 &&
+                cls.compare(0, 6, "0x0302") != 0)
+                continue;
+            const std::string node = readSmallFile(d + "/numa_node");
+            if (node.empty()) continue;
+            const int n = std::atoi(node.c_str());
+            if (n >= 0) {
+                best = n;
+                break;
+            }
+        }
+        closedir(dir);
+        return best;
+#else
+        return -1;
+#endif
+    }
+
+    void ThreadPool::resolveNumaCpus() {
+#if defined(__linux__)
+        numaCpus_.clear();
+        if (numaNode_ < 0) return;
+        char path[128];
+        std::snprintf(path, sizeof(path), "/sys/devices/system/node/node%d/cpulist",
+                      numaNode_);
+        const std::string list = readSmallFile(path);
+        if (!list.empty()) numaCpus_ = parseCpuList(list);
+#endif
+    }
+
+    void ThreadPool::bindMemoryPolicy() {
+#if defined(__linux__)
+        if (numaNode_ < 0) return;
+        // MPOL_BIND = 2.  Applies to this process's future page faults (scratch,
+        // anonymous buffers); file-backed page-cache pages are shared and keep
+        // their existing placement unless explicitly migrated.
+        unsigned long mask = 1UL << (numaNode_ & 63);
+        const unsigned long maxnode = sizeof(mask) * 8;
+        (void) syscall(SYS_set_mempolicy, 2, &mask, maxnode);
+#endif
+    }
+
     void ThreadPool::initialize(size_t numThreads) {
         if (initialized_) {
             return;
@@ -142,6 +240,36 @@ namespace tinycoder {
         }
         affinityEnabled_ = affinityDefault;
 
+        // NUMA policy (2026-11-04): TINYCODER_NUMA=auto|<node>|off.  "auto"
+        // (default) binds the pool to the GPU's node: on the reference
+        // 2-socket box the RTX 2080 Ti is on node 0 while the experts stream
+        // over PCIe, so cross-socket host reads are pure waste.  A NUMA bind
+        // implies affinity pinning within that node.
+        {
+            const char *envNuma = std::getenv("TINYCODER_NUMA");
+            if (envNuma != nullptr && (envNuma[0] == '0' || envNuma[0] == 'o' ||
+                                       envNuma[0] == 'O' || envNuma[0] == 'n' ||
+                                       envNuma[0] == 'N')) {
+                numaNode_ = -1;// off / none
+            } else if (envNuma != nullptr && envNuma[0] != '\0' &&
+                       std::atoi(envNuma) > 0) {
+                numaNode_ = std::atoi(envNuma);
+            } else {
+                numaNode_ = detectGpuNumaNode();
+            }
+            if (numaNode_ >= 0) {
+                affinityEnabled_ = true;
+                resolveNumaCpus();
+                if (numaCpus_.empty()) {
+                    // sysfs node CPU list unavailable: fall back to flat
+                    // pinning rather than binding to a node we cannot use.
+                    numaNode_ = -1;
+                } else {
+                    bindMemoryPolicy();
+                }
+            }
+        }
+
         workers_.reserve(numWorkers_);
         for (size_t i = 0; i < numWorkers_; ++i) {
             workers_.emplace_back(&ThreadPool::workerMain, this, i);
@@ -152,13 +280,11 @@ namespace tinycoder {
         // is used here with a sentinel index -1 -> workerIndex+1 wraps to CPU0.
 #if defined(__linux__) && defined(TINYCODER_AFFINITY)
         if (affinityEnabled_) {
-            long nCpus = sysconf(_SC_NPROCESSORS_ONLN);
-            if (nCpus > 0) {
-                cpu_set_t set;
-                CPU_ZERO(&set);
-                CPU_SET(0, &set);
-                pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &set);
-            }
+            const int mainCpu = numaCpus_.empty() ? 0 : numaCpus_.front();
+            cpu_set_t set;
+            CPU_ZERO(&set);
+            CPU_SET(mainCpu, &set);
+            pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &set);
         }
 #endif
 
@@ -188,26 +314,21 @@ namespace tinycoder {
             return;
         }
 
-        long nCpus = sysconf(_SC_NPROCESSORS_ONLN);
-        if (nCpus <= 0) {
-            return;
+        // Distinct logical CPUs, with the main thread on the first one.
+        // NUMA-aware mode (2026-11-04): the CPU set is the GPU node's cpulist,
+        // so every worker requests its expert weights from the same socket
+        // that feeds the PCIe link.  Flat mode keeps the historical
+        // workerIndex+1 distribution across all logical CPUs.
+        int cpu = -1;
+        if (!numaCpus_.empty()) {
+            const size_t n = numaCpus_.size();
+            cpu = numaCpus_[(workerIndex + 1) % n];
+        } else {
+            long nCpus = sysconf(_SC_NPROCESSORS_ONLN);
+            if (nCpus <= 0) return;
+            cpu = static_cast<int>((workerIndex + 1) %
+                                   static_cast<size_t>(nCpus));
         }
-        size_t nLogical = static_cast<size_t>(nCpus);
-
-        // Pin each worker to a DISTINCT logical CPU so no two workers contend
-        // for the same HT lane. The main thread participates in every parallel
-        // dispatch too, so CPU 0 is reserved for it (see initialize(), which
-        // pins the main thread to CPU 0); workers occupy the remaining CPUs
-        // 1..numThreads_-1. On the reference host (2x Xeon E5-2686 v4, 36
-        // physical / 72 logical) an 8-thread pool thus gives 0..7 coverage:
-        //   main -> CPU0, worker0 -> CPU1, ..., worker6 -> CPU7,
-        // keeping every lane busy and NOT pairing a worker with its HT sibling
-        // on a memory-bound kernel (which would thrash the shared L3). Earlier
-        // pinning mapped workers modulo the physical-core count (0-3), which
-        // crammed the 7 workers + main onto 4 cores — that is what AB/measured
-        // SLOWER than the OS default and why OFF is the default. This distinct
-        // logical-CPU distribution is the correct pin for the 8-thread model.
-        int cpu = static_cast<int>((workerIndex + 1) % nLogical);
 
         cpu_set_t set;
         CPU_ZERO(&set);

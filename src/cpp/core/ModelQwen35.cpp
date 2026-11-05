@@ -124,7 +124,7 @@ namespace tinycoder {
         // NOT the MRoPE theta_scale (computed with nDims=64), so the MRoPE cache
         // is computed inline here. The standard rope tables are unused for qwen35.
         //
-        // CRITICAL: ggml's ggml_mrope_cache_init() seeds theta_base with the
+        // CRITICAL: the GGUF reference mrope cache initialization seeds theta_base with the
         // token POSITION (ggml_compute_forward_rope_flt passes p = pos[i2]), so
         // the angular frequency of pair k is  theta(k) = p * theta_scale^k
         // (freq_base enters ONLY through theta_scale = freq_base^(-2/n_dims)).
@@ -144,7 +144,7 @@ namespace tinycoder {
         }
 
         // Rotation helper (Neox-style: pair (k, k + nDimsHalf)).
-        // Matches ggml's rotate_pairs(n_dims, n_dims/2): for k in [0, n_dims/2),
+        // Matches the GGUF reference rotate_pairs(n_dims, n_dims/2): for k in [0, n_dims/2),
         // rotate the pair (head[k], head[k + n_dims/2]) with cache index k.
         auto rotateHead = [&](float *head, uint32_t p) {
             const float *cosRow =
@@ -547,7 +547,7 @@ namespace tinycoder {
 
             // ---- Gated delta net recurrence ----
             // M layout per head: M[j*Sv + i] = S[i][j] (transposed store, so
-            // row j of M = column j of S, matching ggml's gated_delta_net).
+            // row j of M = column j of S, matching the reference gated delta net).
             for (uint32_t hv = 0; hv < nVHeads; ++hv) {
                 float *state = gdnState.data() + static_cast<size_t>(hv) * headV * headV;
                 const float *qHead = qN.data() + static_cast<size_t>(hv) * headK;

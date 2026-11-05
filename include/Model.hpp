@@ -72,7 +72,7 @@ namespace tinycoder {
         // Eliminates bit extraction overhead in the SIMD kernel.
         AlignedVector<uint8_t> prepackedData;
 
-        bool empty() const { return data.empty(); }
+        bool empty() const { return data.empty() && exl3 == nullptr; }
 
         /// @brief Compute y = x * W^T where W is this quantized matrix.
         /// Dequantizes the matrix and uses np::Array::dot() for multiplication.

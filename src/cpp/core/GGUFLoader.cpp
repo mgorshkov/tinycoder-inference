@@ -76,7 +76,7 @@ namespace tinycoder {
             case GGML_TYPE_BF16:
                 return 2;// 2 bytes/element (no quantized block)
             // Quantized types: bytes per block
-            // Reference: quants.h (block_q4_0, block_q4_1, etc.)
+            // Reference: the GGUF quant block layouts (block_q4_0, block_q4_1, etc.)
             case GGML_TYPE_Q4_0:
                 return 18;// 32 weights: d(fp16,2) + qs(16) = 18 bytes
             case GGML_TYPE_Q4_1:

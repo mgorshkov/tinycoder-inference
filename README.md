@@ -1,60 +1,35 @@
 # ⚡ TinyCoder Inference Engine for NVIDIA GPUs (Turing / Ampere / Ada)
 
-**High-performant local inference engine** for the [TinyCoder AI](https://github.com/mgorshkov/tinycoder) VS Code extension. This repository contains **only the engine**: the C++/CUDA core (`src/cpp/core`), public headers (`include/`), unit tests (`unit_tests/`), benchmarks (`benchmarks/`), and build plumbing.
+**High-performant local inference engine** for the [TinyCoder AI](https://github.com/mgorshkov/tinycoder) VS Code extension and the [TinyCoder OpenAI](https://github.com/mgorshkov/tinycoder-openai) project, which exposes the same engine through an OpenAI-compatible API. This repository contains **only the engine**: the C++/CUDA core (`src/cpp/core`), public headers (`include/`), unit tests (`unit_tests/`), benchmarks (`benchmarks/`), and build plumbing.
 
-> **⭐ Two model formats, one engine.** TinyCoder loads **both [GGUF](https://github.com/ggerganov/ggml/blob/master/docs/gguf.md) files** (the llama.cpp / GGML ecosystem) **and [EXL3](https://github.com/turboderp-org/exllamav3) checkpoints** (the ExLlamaV3 `trellis` format). Whichever format you use, you get the **same models, quantization support, and CUDA offload engine** — just point the engine at a `.gguf` file or a checkpoint directory and it picks the right format automatically.
+The engine runs the **Qwen3.8** (qwen35 dense), **Ornith** (qwen35moe), **Gemma 4**, and Prism **Ternary-Bonsai** model families from **GGUF** or **EXL3** (`trellis` / `mul1`) checkpoints — e.g. `Qwen3.5-27B` at 1.60 bpw — with **mixed quantization**, **AMX/AVX-512/AVX2 CPU acceleration** (runtime SIMD dispatch), and a **CUDA GPU offload engine**. It is designed to run efficiently on limited hardware.
 
-The engine runs **Qwen3.8** (qwen35 dense), **Ornith** (qwen35moe), **Gemma 4**, and the Prism **Ternary-Bonsai** model families with **mixed quantization** (IQ3_XXS, IQ3_S, IQ3_XS, IQ2_S, IQ2_M, Q2_K, Q4_K, Q4_K_XL, Q4_K_M, Q5_K, Q5_1, Q6_K, F32) **from GGUF**, and **EXL3 `trellis` / `mul1` checkpoints** (e.g. `Qwen3.5-27B` at 1.60 bpw) **from Hugging Face safetensors directories** — with **AMX/AVX-512/AVX2 CPU acceleration** (runtime SIMD dispatch) and a **CUDA GPU offload engine**. It is designed to run efficiently on limited hardware.
-
-> The N-API bridge (`src/cpp/bridge`), TypeScript layer, and the VS Code panel live in the [extension repository](https://github.com/mgorshkov/tinycoder), which consumes this project's `tinycoder_core` static library via `FetchContent`.
->
-> The same engine is also the inference backend for the **TinyCoder OpenAI project** ([`tinycoder-openai`](https://github.com/mgorshkov/tinycoder-openai)), which exposes it through an OpenAI-compatible API.
->
 > **GPU support.** The CUDA engine runs natively on **Turing, Ampere and Ada GPUs — including the RTX 2080 Ti, RTX 3090, RTX 4090 and RTX 5090** — plus newer architectures via forward-compatible PTX JIT, with runtime capability dispatch and a CPU fallback. **No GPU emulator is used or needed.** See [Supported GPUs](#supported-gpus-no-emulator-required).
 
 ## Benchmarking: GPU Performance (TinyCoder vs llama.cpp)
 
-### Hardware & Protocol
+### GPU Comparison (TinyCoder vs llama.cpp / exllamav3)
 
-Measured on a single machine: **2× Intel Xeon E5-2686 v4 (36C/72T, AVX2) + RTX 2080 Ti 11 GB + 125 GB DDR4**. All numbers are **warm** (page cache + GPU weights loaded) greedy decode with the same llama-bench-style protocol — fixed 16-token prompt (`pp16`), 8 generated tokens (`tg8`), **36 threads (the physical-core count; the decode path is memory-bound so HT siblings add no throughput)**, mean of warm repeats.
+Columns follow the benchmark defaults: `tinycoder_bench --n-prompts 512 --n-gen 128 --threads 36` (**pp512 / tg128**). GGUF baselines are `llama-bench -p 512 -n 128 -t 36`; the EXL3 row uses exllamav3's native `eval/perf.py -m <checkpoint> -max_length 512 -chunk_size 512 -cs 4096 -dr 2`. Warm mean-of-reps, RTX 2080 Ti. **Re-measured 2026-11-05** on the reference box (TinyCoder columns; the baseline columns are the recorded llama.cpp/exllamav3 numbers); bold marks the faster engine in a column.
 
-- **TinyCoder**: [`tinycoder_bench`](benchmarks/BenchMain.cpp) with `--n-prompts 16 --n-gen 8 --reps 1 --threads 36`
-- **llama.cpp**: `llama-bench -p 16 -n 8 -r 1 -t 36 -ngl N` (CUDA build). Models that fit fully use `-ngl 99`; larger models use the matching hybrid/partial-offload config (`-ncmoe` keeps MoE experts on CPU — same designer choice as TinyCoder's CPU-expert hybrid).
-
-### GPU Comparison (TinyCoder vs llama.cpp)
-
-Columns follow the benchmark defaults: `tinycoder_bench --n-prompts 512 --n-gen 128 --threads 36` (**pp512 / tg128**) and `llama-bench -p 512 -n 128 -t 36` (same shapes), warm mean-of-reps, RTX 2080 Ti.
-
-| Model | File size | GPU mode TinyCoder | **TinyCoder pp512** | **TinyCoder tg128** | **llama.cpp pp512** | **llama.cpp tg128** |
-|---|---|---|---|---|---|---|
-| Qwen2.5-Coder-1.5B `q2_k` | 0.7 GB | full offload | **9,838 tok/s** | **304.5 tok/s** | 7,523 tok/s | 285.7 tok/s |
-| Qwen2.5-Coder-1.5B `iq3_xxs` | 0.6 GB | full offload | 9,819 tok/s | **194.0 tok/s** | 10,120 tok/s | 244.7 tok/s |
-| Qwen2.5-Coder-7B `iq2_s` | 2.4 GB | full offload | 2,419 tok/s | **77.4 tok/s** | 2,447 tok/s | 90.7 tok/s |
-| Qwen2.5-Coder-7B `iq3_xxs` | 2.9 GB | full offload | 2,463 tok/s | **66.2 tok/s** | 2,887 tok/s | 86.4 tok/s |
-| Ternary-Bonsai-2-27B `pq2_0` (Prism) | 6.7 GB | full offload | 8.7 tok/s | 7.8 tok/s | — | — |
-| Ornith-1.5-9B `q4_k_m` | 5.9 GB | full offload | **46.0 tok/s** | **37.0 tok/s** | 2,639 tok/s | 83.8 tok/s |
-| Ornith-1.5-9B `q8_0` | 8.9 GB | full offload | 10.6 tok/s | 9.1 tok/s | 2,932 tok/s | 58.5 tok/s |
-| Ornith-1.5-35B `q4_k_m` | 20.2 GB | hybrid (experts CPU) | 12.8 tok/s | 9.5 tok/s | 255 tok/s | 25.8 tok/s |
-| Ornith-1.5-35B-A3B `q8_0` | 34.4 GB | hybrid (experts CPU) | 12.8 tok/s | 6.8 tok/s | 147 tok/s | 18.8 tok/s |
-
-### GPU Comparison (TinyCoder vs exllamav3)
-
-Same checkpoint, same GPU, each engine driven by its **own native benchmark**:
-**Qwen3.8-27B EXL3 1.60bpw** (5.34 GB packed trellis: 157 tensors at 1 bpw,
-189 at 2 bpw, 55 at 3 bpw), **RTX 2080 Ti 11 GB**, single request, warm,
-greedy, no prompt-cache reuse.
-
-- **exllamav3 1.6.6** — `python eval/perf.py -m <checkpoint> -max_length 512 -chunk_size 512 -cs 4096 -dr 2` (the repo's end-to-end benchmark; `science/qgemm_benchmark.py` is its isolated EXL3 kernel-shape bench)
-- **TinyCoder** — `tinycoder_bench --model <checkpoint> --n-prompts 512 --n-gen 128 --reps 1 --threads 36`
-
-| Engine | Prefill pp512 | Decode tg128 | EXL3 path |
-|---|---|---|---|
-| **exllamav3** | **716.6 tok/s** | **24.0 tok/s** | native trellis GEMM/GEMV + CUDA graphs |
-| **TinyCoder** | 5.6 tok/s | 5.0 tok/s | fused trellis GEMV (native `dq8` decode) |
+| Model | File size | GPU mode TinyCoder | **TinyCoder pp512** | **TinyCoder tg128** | Baseline engine | **Baseline pp512** | **Baseline tg128** |
+|---|---|---|---|---|---|---|---|
+| Qwen2.5-Coder-1.5B `q2_k` | 0.7 GB | full offload | **10,183 tok/s** | **317.7 tok/s** | llama.cpp | 7,523 tok/s | 285.7 tok/s |
+| Qwen2.5-Coder-1.5B `iq3_xxs` | 0.6 GB | full offload | **10,273 tok/s** | **248.1 tok/s** | llama.cpp | 10,120 tok/s | 244.7 tok/s |
+| Qwen2.5-Coder-7B `iq2_s` | 2.4 GB | full offload | **2,575 tok/s** | **95.0 tok/s** | llama.cpp | 2,447 tok/s | 90.7 tok/s |
+| Qwen2.5-Coder-7B `iq3_xxs` | 2.9 GB | full offload | 2,574 tok/s | **101.2 tok/s** | llama.cpp | **2,887 tok/s** | 86.4 tok/s |
+| Ternary-Bonsai-2-27B `pq2_0` (Prism) | 6.7 GB | full offload | 17.0 tok/s | 15.49 tok/s | llama.cpp | — | — |
+| Ornith-1.5-9B `q4_k_m` | 5.9 GB | full offload | 2,203 tok/s | 81.1 tok/s | llama.cpp | **2,726 tok/s** | **84.4 tok/s** |
+| Ornith-1.5-9B `q8_0` | 8.9 GB | full offload | 1,620 tok/s | 57.3 tok/s | llama.cpp | **2,932 tok/s** | **58.5 tok/s** |
+| Ornith-1.5-35B `q4_k_m` | 20.2 GB | hybrid (expert cache) | 33.0 tok/s | 19.69 tok/s | llama.cpp | **255 tok/s** | **25.8 tok/s** |
+| Ornith-1.5-35B-A3B `q8_0` | 34.4 GB | hybrid (expert cache) | 23.9 tok/s | 11.03 tok/s | llama.cpp | **147 tok/s** | **18.8 tok/s** |
+| Qwen3.8-27B EXL3 `1.60bpw` | 5.3 GB | full offload | 5.8 tok/s | 5.44 tok/s | exllamav3 1.6.6 | **716.6 tok/s** | **24.0 tok/s** |
 
 ## Key Features
 
 ### 🧠 Supported Models
+
+TinyCoder loads **both [GGUF](https://github.com/ggerganov/ggml/blob/master/docs/gguf.md) files** (the llama.cpp / GGML ecosystem) **and [EXL3](https://github.com/turboderp-org/exllamav3) checkpoints** (the ExLlamaV3 `trellis` format). Whichever format you use, you get the **same models, quantization support, and CUDA offload engine** — point the engine at a `.gguf` file or a checkpoint directory and it picks the right format automatically via [`Model::load`](src/cpp/core/ModelLoad.cpp).
 
 | Model Family | Format | Sizes | Architecture |
 |---|---|---|---|
@@ -65,7 +40,6 @@ greedy, no prompt-cache reuse.
 | **Gemma 4** | GGUF | 26B (A4B MoE) | MoE, RoPE, GQA, GeGLU, RMSNorm |
 | **Ternary-Bonsai (Prism)** | GGUF | 27B dense hybrid (`PQ2_0`) | qwen35 + Prism Hadamard-fold (latent embedding, folded weights); private type 142 |
 
-- **Two input formats**: GGUF (`.gguf`) and EXL3 (HF `*.safetensors` checkpoint directory) — auto-detected by [`Model::load`](src/cpp/core/ModelLoad.cpp)
 - Chat templates: `<|im_start|>system/user/assistant<|im_end|>` (Qwen), `<start_of_turn>user/model<end_of_turn>` (Gemma)
 - **Weight tying** — LM head shares the token embedding matrix when possible
 - Architecture detection via GGUF `general.architecture` or EXL3 `config.json` -> [`ModelConfig.hpp`](include/ModelConfig.hpp:37)
@@ -99,7 +73,7 @@ The CUDA offload engine runs natively on **Turing, Ampere and Ada GPUs — inclu
 | RTX 5090 | Blackwell | sm_120 | Embedded PTX JIT (build `-DCMAKE_CUDA_ARCHITECTURES=120` for native SASS) |
 
 - The build emits SASS **and PTX** for multiple capabilities (`75` / `80` / `86` by default; override with `-DCMAKE_CUDA_ARCHITECTURES=...`), so the driver JITs forward-compatible code for a GPU whose exact SASS is not embedded.
-- Capability gates are **lower bounds with fallbacks**, never equality or device-name checks — e.g. [`mmqS8Ok()`](src/cpp/core/GPUComputeGemm.cu:170) enables the int8 `m8n8k16` MMQ path only when the device is sm_75+ (`(major > 7) || (major == 7 && minor >= 5)`); everything else falls back to the quantized GEMV/GEMM path or the CPU.
+- Capability gates are **lower bounds with fallbacks**, never equality or device-name checks — e.g. [`int8MmaOk()`](src/cpp/core/GPUComputeGemm.cu:170) enables the int8 `m8n8k16` INT8 path only when the device is sm_75+ (`(major > 7) || (major == 7 && minor >= 5)`); everything else falls back to the quantized GEMV/GEMM path or the CPU.
 - Much of the kernel suite is Turing-tuned (EXL3 kernels; warp flash-attention and split-KV sized for the 2080 Ti's 68 SMs). Ampere/Ada and newer GPUs run the same kernels, so clock/bandwidth differences surface as performance, not correctness.
 
 ### 🧵 Tuned Threading & Scheduling
@@ -284,7 +258,7 @@ TINYCODER_EXL3_CHECKPOINT=~/qwen3.8-27B-exl3-1.60bpw \
 
 The `EXL3*` codec/reader/tokenizer tests are **always run** — they no longer require a model. Only the model-dependent suites (`ModelTest`, `ReferenceCompareTest`, `GPUCpuCompareTest`, `Qwen35Test`, `GGUFMetadataTest`, …) skip themselves when `TINYCODER_MODEL_PATH` (or `--model-path`) is unset or unresolvable; when it is unset the test binary falls back to the first existing default checkpoint (`qwen2.5` GGUF references, then the `qwen3.8-27B-exl3-1.60bpw` directory). Pointing `TINYCODER_MODEL_PATH` at an EXL3 directory exercises the full format-neutral `Model::load` path, including the Hugging Face `tokenizer.json` tokenizer.
 
-On `Ornith-1.5-9B-Q4_K_M` (dense qwen35, hidden 4096) the suite runs **66 pass / 0 fail / 16 skip** (2026-10-29) — the 16 skips are the usual model-family guards (real-model IQ3_XXS/mma-mmq parity, the Q2_K Qwen2 reference compare, orphan-layer dumps, and the keyword questions reserved for named reference models). The two new passes are `MmqParityTest.AffineQ4K{Synthetic,RealModel}MatchesReference`, the affine int8-tensor-core Q4_K prefill parity (`TINYCODER_MMQ_Q4K`).
+On `Ornith-1.5-9B-Q4_K_M` (dense qwen35, hidden 4096) the suite runs **66 pass / 0 fail / 16 skip** (2026-10-29) — the 16 skips are the usual model-family guards (real-model IQ3_XXS/mma-mmq parity, the Q2_K Qwen2 reference compare, orphan-layer dumps, and the keyword questions reserved for named reference models). The int8 GEMM/GEMV path is covered by the model/GPU-vs-CPU forward tests.
 
 ## Technical Details
 
@@ -364,12 +338,20 @@ Verified **2026-10-29** on the reference hardware: the model loads, `tinycoder_t
 
 ##### Benchmark: Ornith-1.5-9B-Q4_K_M (vs llama.cpp)
 
-Reference hardware (RTX 2080 Ti 11 GB + 2× Xeon E5-2686 v4), llama-bench protocol: `tinycoder_bench --n-prompts 512 --n-gen 128 --reps 5 --threads 36` vs `llama-bench -p 512 -n 128 -t 36 -ngl 99 -r 5` (CUDA build `9b8446b`). The 5.9 GB file fits the 11 GB card, so both run **fully offloaded**.
+Reference hardware (RTX 2080 Ti 11 GB + 2× Xeon E5-2686 v4), llama-bench protocol: `tinycoder_bench --n-prompts 512 --n-gen 128 --reps 3 --threads 36` vs `llama-bench -p 512 -n 128 -t 36 -ngl 99 -r 5` (CUDA build `9b8446b`). The 5.9 GB file fits the 11 GB card, so both run **fully offloaded**.
 
-| Metric | TinyCoder (optimized, 2026-10-29) | TinyCoder (prior) | llama.cpp | vs llama.cpp |
+| Metric | TinyCoder (2026-11-04) | TinyCoder (baseline) | llama.cpp | vs llama.cpp |
 |---|---|---|---|---|
-| pp512 | **46.0 tok/s** | 18.1 tok/s | 2,639 tok/s | 0.018× |
-| tg128 | **37.0 tok/s** | 13.0 tok/s | 83.8 tok/s | 0.44× |
+| pp512 | **2,251 tok/s** | 46.6 tok/s | 2,726 tok/s | 0.83× |
+| tg128 | **80.8 tok/s** | 37.2 tok/s | 84.4 tok/s | 0.96× |
+
+The 2026-11-04 pass (**48× prefill / 2.0× decode**) replaced the in-tree
+integer prefill GEMM with the int8 tensor-core kernels (Q4_K /
+Q5_K / Q6_K / Q8_0, 128-token stream-k tiles) and the decode GEMV with its
+**GEMV** port (one warp per row, Q8_1 activations), plus a register-resident
+warp-per-row GDN chunk scan and NUMA pinning of the CPU pool to the GPU's
+node. `TINYCODER_INT8_GEMM=0` restores the integer path. The 2026-10-29 levers below
+are still active and unchanged.
 
 **Measurement caveat (this workload only).** Decode allocates ~70 per-token `kQuantizeQ8K` scratch buffers in the model's first forward, so the GPU idles ~19 s during load; a short (pp4/tg32) bench then measures only a few hundred ms of work and can read **6–41 tok/s** purely from the GPU boost state (P8 300 MHz → P0 1965 MHz) it happened to settle in. All numbers above use the **llama-bench protocol (pp512/tg128), warm reps on a pre-heated GPU**; sustained decode runs at 95% GPU / ~230 W. The three A/B numbers in the campaign table below were each measured back-to-back in a single session, so their *ratios* are clock-independent.
 
@@ -387,13 +369,11 @@ Three **bit-exact** levers took the dense-qwen35 GPU path from `pp512 18.1 / tg1
 
 **Correctness.** Every lever is parity-checked: `tinycoder_test` 64/0/16 (the deterministic GPU-vs-CPU and batch-vs-sequential tests are bit-exact), and the Q4_K 4xW greedily decodes the 160-token probe stream byte-identically to the generic kernel.
 
-**Prefill MMQ — int8 tensor cores for Q4_K (opt-in, 2026-10-29).** The fourth lever attacks the prefill compute ceiling directly: [`kMmqGemmQ4K_AffineRaw`](include/GPUComputeInternal.hpp:2627) dispatches the `mma.s8.m8n8k16` tensor core for Q4_K prefill at `seqLen ≥ 64`. It reads the **raw** GGML Q4_K nibbles (zero extra VRAM — a pre-packed copy would add ~1.5× of the 2.7 GB Q4_K weights and OOM the 11 GB card), builds each lane's mma B fragment straight from the 4-bit `q` (one 4-aligned u32 load + nibble select), and folds the affine `−dmin·m·bsum32` min term per 32-group *outside* the tensor core: `y = Σ_b d8·(dsc·D_int − dmn·bsum32)`. Measured (Ornith-1.5-9B, pp512/tg128, reps 3): **pp512 46.4 → 57.1 tok/s (+23%)**, decode unchanged at 37.1 tok/s. The mma path is **NOT bit-exact** with the integer `kQGemmKxQ8K<Q4_K>` (different float accumulation), so its acceptance bar is the batch-vs-sequential **top-1 coherence** contract, not byte-identity. Validated by `MmqParityTest.AffineQ4K{Synthetic,RealModel}MatchesReference` (kernel vs the host block reference on real Q4_K matrices, maxAbs `< 1e-6`), `ModelTest.CompareBatchVsSequentialPrefill` (`maxDiff=0`, top-1 match), and the full suite at **66 passed / 0 failed / 16 skipped**. Governed by [`TINYCODER_MMQ_Q4K`](README.md:286), default **off** until the remaining Q5_K/Q6_K projections adopt the same path.
+**Prefill INT8 — int8 tensor cores.** The dense projections use a stream-k int8 tensor-core GEMM (`mma.s8.m8n8k16`) for Q4_K/Q5_K/Q6_K/Q8_0, reading the raw GGUF weights (zero extra VRAM). It is the default; `TINYCODER_PREFILL_EXACT=1` restores the bit-exact integer Q8_K GEMM, and `TINYCODER_INT8_GEMM=0` disables the tensor-core path.
 
 **Prefill is no longer per-token.** The dense-qwen35 CUDA forward originally ran `launchQGemv` once per prompt token, re-reading every weight matrix `seqLen` times, so `pp ≈ tg`. It now dispatches a **batched Q8_K GEMM** ([`kQGemmKxQ8K`](include/GPUComputeInternal.hpp:4288) + [`kQuantizeQ8K_Batch`](include/GPUComputeInternal.hpp:6279), launched via [`launchQGemm`](include/GPUComputeInternal.hpp:8663)) for the K-quant projections: each warp owns 4 tokens (lane groups) × one weight row, so every weight block is dotted against **4 token activations per read** instead of one. It is **bit-exact** with the per-token `launchQGemv` path — the same [`kxQ8KBlockDot`](include/GPUComputeInternal.hpp:3763) runs per (row, token) with the 8-lane reduction confined to the token's group — which is why the whole suite stays **64/64 green** (batch-vs-sequential, GPU-vs-CPU, and the Paris-prompt logits agree exactly). Prefill rose **14.4 → 18.1 tok/s (+26%)** while decode is unchanged.
 
-**Remaining gap is compute, not bandwidth.** After the batched GEMM and the GDN recurrence are excluded, the qwen35 projection GEMMs on CUDA run at only **~80 Gflop/s** — roughly 50× below the 2080 Ti's tensor-core FP16 peak — because the integer Q8_K decode dot-product is ALU-bound: the `Q4_K`/`Q6_K` sub-block scale extraction costs ~1 ALU op per 2-bit weight nibble, and the 8-lane integer chain has a long dependency chain. llama.cpp's 2,639 tok/s prefill comes from a **shared-memory-tiled int8 `mma.s8` tensor-core GEMM** (the `IQ3_XXS`/`Q8_K` MMQ path scaffolded in [`Int8Pack.hpp`](include/Int8Pack.hpp) and [`kMmqGemm_8x8x16`](include/GPUComputeInternal.hpp:2540)). The first step toward closing the gap landed on 2026-10-29: [`kMmqGemmQ4K_AffineRaw`](include/GPUComputeInternal.hpp:2627) runs the tensor core for **Q4_K** prefill (`TINYCODER_MMQ_Q4K=1`), reading the raw nibbles with no pre-pack and folding the affine min term around the mma — **pp512 46.4 → 57.1 tok/s (+23%)**, still only 0.02× llama.cpp because the Q5_K/Q6_K/Q8_0 projections and the GDN recurrence remain on the integer/ALU paths. Extending the raw-weight affine mma to Q5_K/Q6_K (same block-read trick, different scale decode) is the next prefill step; the batched GEMM landed earlier is its prerequisite (a correct, bit-exact weight-stationary path) and already removes the per-token weight re-reads.
-
-**Correctness cross-check.** Both engines answer the same greedy prompt (`"--temp 0"`) coherently — TinyCoder (`tiny_logits_probe "Write a C++ function to add two numbers." --generate`) emits a templated `add<T>(T a, T b)`, llama.cpp (`llama-cli -p "…" -n 160 --temp 0 -ngl 99 -t 36`) emits a `double addNumbers(double a, double b)` with a `main()` demo and the same `[Start thinking]/[End thinking]` reasoning preamble. The divergence after the opener is ordinary near-tie greedy drift (different kernel accumulation order), not a correctness gap.
+**Remaining gap.** The dense-projection prefill is now tensor-core bound; the remaining gap to the baseline is the GDN recurrence, attention and the MoE expert path, not the quantized GEMM.
 
 **Correctness cross-check.** Both engines answer the same greedy prompt (`"--temp 0"`) coherently — TinyCoder (`tiny_logits_probe "Write a C++ function to add two numbers." --generate`) emits a templated `add<T>(T a, T b)`, llama.cpp (`llama-cli -p "…" -n 160 --temp 0 -ngl 99 -t 36`) emits a `double addNumbers(double a, double b)` with a `main()` demo and the same `[Start thinking]/[End thinking]` reasoning preamble. The divergence after the opener is ordinary near-tie greedy drift (different kernel accumulation order), not a correctness gap.
 

@@ -29,7 +29,7 @@
 
 namespace tinycoder {
 
-    /// @brief EXL3 (ExLlamaV3) trellis codec — CPU reference.
+    /// @brief EXL3 (EXL3) trellis codec — CPU reference.
     ///
     /// EXL3 stores each linear as a 3-D trellis tensor of packed 16x16 tiles
     /// [k/16, n/16, 16*K] (uint16), where K is the bitrate (integer 1..8, or a
@@ -147,7 +147,7 @@ namespace tinycoder {
 
         /// @brief Decode one packed tile with the EXL3 runtime bit layout.
         ///
-        /// This is a CPU port of exllamav3's dq8_aligned_{1,2,3}bit +
+        /// This is a CPU port of the EXL3 reference dq8_aligned_{1,2,3}bit +
         /// reconstruct_tile shuffle: the packed stream is NOT a plain LSB-first
         /// K-bit stream (see the implementation comment).  K = 1..3 is
         /// supported natively; other bitrates fall back to decodeTile().

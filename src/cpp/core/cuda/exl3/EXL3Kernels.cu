@@ -174,7 +174,7 @@ namespace tinycoder::exl3gpu {
 
         // ---- Decode one tile grid into the rotated-basis weight [k][n] ----
         // Grid: one block per (ki, ni) tile, 256 threads (one per code).
-        __global__ void kDecodeTilesInt(const uint16_t *__restrict__ packed, uint32_t K,
+        __global__ void decodeTilesInt(const uint16_t *__restrict__ packed, uint32_t K,
                                         int codebook, uint32_t tilesN, uint32_t tileU16,
                                         float *__restrict__ recon, uint32_t n) {
             const uint32_t tile = blockIdx.x;
@@ -190,7 +190,7 @@ namespace tinycoder::exl3gpu {
             recon[(static_cast<size_t>(ki) * 16 + r) * n + ni * 16 + cc] = v;
         }
 
-        __global__ void kDecodeTilesFrac(const uint16_t *__restrict__ packed, uint32_t KA,
+        __global__ void decodeTilesFrac(const uint16_t *__restrict__ packed, uint32_t KA,
                                          uint32_t tilesN, uint32_t tileU16,
                                          float *__restrict__ recon, uint32_t n) {
             const uint32_t tile = blockIdx.x;
@@ -250,7 +250,7 @@ namespace tinycoder::exl3gpu {
 
         // Left Hadamard over k (128-wide row bands), per column, times suh.
         // Grid: one block per k-band.  128 threads.
-        __global__ void kLeftH128(const float *__restrict__ suh, float *__restrict__ recon,
+        __global__ void leftH128(const float *__restrict__ suh, float *__restrict__ recon,
                                   uint32_t k, uint32_t n) {
             const uint32_t kb = blockIdx.x * 128u;
             if (kb >= k) return;
@@ -269,7 +269,7 @@ namespace tinycoder::exl3gpu {
 
         // Right Hadamard over n (128-wide column bands), per row, times svh.
         // Grid: one block per row.  128 threads.
-        __global__ void kRightH128(const float *__restrict__ svh, float *__restrict__ recon,
+        __global__ void rightH128(const float *__restrict__ svh, float *__restrict__ recon,
                                    uint32_t k, uint32_t n) {
             const uint32_t r = blockIdx.x;
             if (r >= k) return;
@@ -290,7 +290,7 @@ namespace tinycoder::exl3gpu {
         // Block (bx, by) reads in-tile rows bx*32.., cols by*32.. and writes the
         // transposed tile; out[n][k] holds out[col][row] = in[row][col].
         // Grid must be dim3(ceil(k/32), ceil(n/32)).
-        __global__ void kTransposeKN(const float *__restrict__ in, float *__restrict__ out,
+        __global__ void transposeKN(const float *__restrict__ in, float *__restrict__ out,
                                      uint32_t k, uint32_t n) {
             __shared__ float t[32][33];
             const uint32_t inRow = blockIdx.x * 32u + threadIdx.y;
@@ -307,7 +307,7 @@ namespace tinycoder::exl3gpu {
         }
 
         // y[o] = dot(x, WT[o][0..k)) ; WT is [n][k] row-major.
-        __global__ void kGemvF32(const float *__restrict__ x, const float *__restrict__ wt,
+        __global__ void gemvF32(const float *__restrict__ x, const float *__restrict__ wt,
                                  float *__restrict__ out, uint32_t n, uint32_t k) {
             const uint32_t o = blockIdx.x;
             if (o >= n) return;
@@ -331,7 +331,7 @@ namespace tinycoder::exl3gpu {
 
         // Expand a packed ±1 bitfield into floats: set bit -> -1, clear -> +1;
         // bit i of word (e/16) maps to element e (mirrors expandPackedSigns).
-        __global__ void kExpandSigns(const uint16_t *__restrict__ packed,
+        __global__ void expandSigns(const uint16_t *__restrict__ packed,
                                      float *__restrict__ out, uint32_t count) {
             const uint32_t e = blockIdx.x * blockDim.x + threadIdx.x;
             if (e >= count) return;
@@ -428,7 +428,7 @@ namespace tinycoder::exl3gpu {
                            cudaMemcpyHostToDevice);
                 const uint32_t threads = 256;
                 const uint32_t blocks = (count + threads - 1u) / threads;
-                kExpandSigns<<<blocks, threads, 0, stream()>>>(tmp, *dst, count);
+                expandSigns<<<blocks, threads, 0, stream()>>>(tmp, *dst, count);
                 cudaStreamSynchronize(stream());
                 cudaFree(tmp);
                 return true;
@@ -472,21 +472,21 @@ namespace tinycoder::exl3gpu {
             const uint32_t tilesK = k / 16u;
             const uint32_t tilesN = n / 16u;
             if (lin.d.frac) {
-                kDecodeTilesFrac<<<tilesK * tilesN, 256, 0, stream()>>>(
+                decodeTilesFrac<<<tilesK * tilesN, 256, 0, stream()>>>(
                         static_cast<const uint16_t *>(lin.d.packed), lin.d.bitrate10 / 10u,
                         tilesN, lin.d.tileU16, lin.d.scratch, n);
             } else {
-                kDecodeTilesInt<<<tilesK * tilesN, 256, 0, stream()>>>(
+                decodeTilesInt<<<tilesK * tilesN, 256, 0, stream()>>>(
                         static_cast<const uint16_t *>(lin.d.packed), lin.d.bitrate10 / 10u,
                         lin.d.codebook, tilesN, lin.d.tileU16, lin.d.scratch, n);
             }
-            kLeftH128<<<tilesK, 128, 0, stream()>>>(lin.d.suh, lin.d.scratch, k, n);
-            kRightH128<<<k, 128, 0, stream()>>>(lin.d.svh, lin.d.scratch, k, n);
+            leftH128<<<tilesK, 128, 0, stream()>>>(lin.d.suh, lin.d.scratch, k, n);
+            rightH128<<<k, 128, 0, stream()>>>(lin.d.svh, lin.d.scratch, k, n);
             dim3 tblock(32, 32);
             // Grid.x covers the k (in-row) axis, grid.y the n (in-col) axis,
-            // matching the swapped-role indexing inside kTransposeKN.
+            // matching the swapped-role indexing inside transposeKN.
             dim3 tgrid((k + 31u) / 32u, (n + 31u) / 32u);
-            kTransposeKN<<<tgrid, tblock, 0, stream()>>>(lin.d.scratch, lin.wT, k, n);
+            transposeKN<<<tgrid, tblock, 0, stream()>>>(lin.d.scratch, lin.wT, k, n);
             cudaError_t e = cudaStreamSynchronize(stream());
             if (e != cudaSuccess) {
                 err = std::string("EXL3 reconstruct: ") + cudaGetErrorString(e);
@@ -547,7 +547,7 @@ namespace tinycoder::exl3gpu {
             err = std::string("EXL3 x H2D: ") + cudaGetErrorString(e);
             ok = false;
         } else {
-            kGemvF32<<<n, 256, 0, stream()>>>(dx, lin.wT, dy, n, k);
+            gemvF32<<<n, 256, 0, stream()>>>(dx, lin.wT, dy, n, k);
             // stream() is cudaStreamNonBlocking, so the synchronous D2H
             // cudaMemcpy (default stream) does NOT wait for the kernel; sync
             // explicitly or the copy races the GEMV and reads stale dy.
@@ -627,7 +627,7 @@ namespace tinycoder::exl3gpu {
         }
 
         // Decode 8 weights of one 16x16 EXL3 tile for one lane (CPU port of
-        // exllamav3 dq8_aligned_{1,2,3}bit).  The packed stream is a per-lane
+        // the EXL3 reference dq8_aligned_{1,2,3}bit).  The packed stream is a per-lane
         // 16-bit-window stream, NOT a plain K-bit code stream.
         template <int CB>
         __device__ __forceinline__ void exl3LaneFrag(const uint32_t *p, uint32_t K,
@@ -670,7 +670,7 @@ namespace tinycoder::exl3gpu {
         }
 
         template <int CB, int SPLIT>
-        __global__ void kExl3FusedMatVec(const uint16_t *__restrict__ trellis,
+        __global__ void exl3FusedMatVec(const uint16_t *__restrict__ trellis,
                                          const float *__restrict__ suh,
                                          uint32_t k, uint32_t K,
                                          uint32_t tilesN, uint32_t tileU16,
@@ -830,7 +830,7 @@ namespace tinycoder::exl3gpu {
         }
 
         // y = svh ⊙ H128(z) for each 128-wide output block.
-        __global__ void kExl3FusedOutTransform(const float *__restrict__ z,
+        __global__ void exl3FusedOutTransform(const float *__restrict__ z,
                                                const float *__restrict__ svh,
                                                float *__restrict__ y) {
             __shared__ float s[128];
@@ -867,7 +867,7 @@ namespace tinycoder::exl3gpu {
 #define LAUNCH_SPLIT(SP)                                                         \
     do {                                                                         \
         const uint32_t grid = gridTiles / (8u / (SP));                           \
-        kExl3FusedMatVec<CB, SP><<<grid, 256, 0, stream>>>(                      \
+        exl3FusedMatVec<CB, SP><<<grid, 256, 0, stream>>>(                      \
                 reinterpret_cast<const uint16_t *>(lin.trellis), lin.suh, lin.k, \
                 lin.K, tilesN, tileU16, xDev, yDev);                             \
     } while (0)
@@ -1015,7 +1015,7 @@ namespace tinycoder::exl3gpu {
         } else {
             launchFusedSplit<0>(split, lin, xDev, yDev, stream);
         }
-        kExl3FusedOutTransform<<<lin.n / 128u, 128, 0, stream>>>(
+        exl3FusedOutTransform<<<lin.n / 128u, 128, 0, stream>>>(
                 yDev, lin.svh, yDev);
         const cudaError_t e = cudaGetLastError();
         if (e != cudaSuccess) {
