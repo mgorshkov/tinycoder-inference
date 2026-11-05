@@ -70,6 +70,23 @@ namespace tinycoder::detail {
         return (layer + 1) % interval != 0;
     }
 
+    /// @brief Key/query head read by gated-delta-net value head `hv`.
+    ///
+    /// `cfg.gdnVHeadsTiled` selects the on-disk V-head layout: llama.cpp's GGUF
+    /// converter permutes the V side into tiled order (`hv % nKHeads`), while
+    /// HF / exllamav3 / Prism weights are grouped
+    /// (`hv / (nVHeads / nKHeads)`, i.e. `repeat_interleave`).  Both the CPU and
+    /// the CUDA GDN paths must route through this so the answer is decided in
+    /// one place.  See ModelConfig.hpp.
+    inline uint32_t gdnKeyHeadForValueHead(const ModelConfig &cfg, uint32_t hv) {
+        const uint32_t nK = cfg.ssmGroupCount;
+        const uint32_t nV = cfg.ssmTimeStepRank;
+        if (nK == 0u) return 0u;
+        if (cfg.gdnVHeadsTiled) return hv % nK;
+        const uint32_t ng = nV / nK;
+        return ng > 0u ? hv / ng : hv;
+    }
+
 
     // ---------------------------------------------------------------------
     // Temporary prefill profiler (P2 investigation). Gated by TINYCODER_PROFILE

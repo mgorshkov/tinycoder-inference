@@ -637,8 +637,14 @@ namespace tinycoder {
             return it != reverseVocab_.end() ? it->second : -1;
         };
         const char *specials[] = {
-                "<|endoftext|>", "<|im_start|>", "<|im_end|>", "<|fim_prefix|>",
-                "<|fim_middle|>", "<|fim_suffix|>", "<|repo_name|>", "<|file_sep|>",
+                "<|endoftext|>",
+                "<|im_start|>",
+                "<|im_end|>",
+                "<|fim_prefix|>",
+                "<|fim_middle|>",
+                "<|fim_suffix|>",
+                "<|repo_name|>",
+                "<|file_sep|>",
         };
         for (const char *sp: specials) {
             const int32_t id = findId(sp);

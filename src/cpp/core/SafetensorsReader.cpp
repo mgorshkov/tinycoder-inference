@@ -170,14 +170,30 @@ namespace tinycoder {
                         }
                         char e = *p++;
                         switch (e) {
-                            case '"': out.push_back('"'); break;
-                            case '\\': out.push_back('\\'); break;
-                            case '/': out.push_back('/'); break;
-                            case 'b': out.push_back('\b'); break;
-                            case 'f': out.push_back('\f'); break;
-                            case 'n': out.push_back('\n'); break;
-                            case 'r': out.push_back('\r'); break;
-                            case 't': out.push_back('\t'); break;
+                            case '"':
+                                out.push_back('"');
+                                break;
+                            case '\\':
+                                out.push_back('\\');
+                                break;
+                            case '/':
+                                out.push_back('/');
+                                break;
+                            case 'b':
+                                out.push_back('\b');
+                                break;
+                            case 'f':
+                                out.push_back('\f');
+                                break;
+                            case 'n':
+                                out.push_back('\n');
+                                break;
+                            case 'r':
+                                out.push_back('\r');
+                                break;
+                            case 't':
+                                out.push_back('\t');
+                                break;
                             case 'u': {
                                 if (end - p < 4) {
                                     return fail("truncated \\u escape");
@@ -338,43 +354,75 @@ namespace tinycoder {
 
     uint32_t SafetensorsReader::dtypeSize(DType dt) {
         switch (dt) {
-            case DType::F64: return 8;
-            case DType::F32: return 4;
-            case DType::F16: return 2;
-            case DType::BF16: return 2;
-            case DType::I64: return 8;
-            case DType::I32: return 4;
-            case DType::I16: return 2;
-            case DType::I8: return 1;
-            case DType::U8: return 1;
-            case DType::BOOL: return 1;
-            case DType::U16: return 2;
-            case DType::U32: return 4;
-            case DType::U64: return 8;
-            case DType::F8_E4M3: return 1;
-            case DType::F8_E5M2: return 1;
-            default: return 0;
+            case DType::F64:
+                return 8;
+            case DType::F32:
+                return 4;
+            case DType::F16:
+                return 2;
+            case DType::BF16:
+                return 2;
+            case DType::I64:
+                return 8;
+            case DType::I32:
+                return 4;
+            case DType::I16:
+                return 2;
+            case DType::I8:
+                return 1;
+            case DType::U8:
+                return 1;
+            case DType::BOOL:
+                return 1;
+            case DType::U16:
+                return 2;
+            case DType::U32:
+                return 4;
+            case DType::U64:
+                return 8;
+            case DType::F8_E4M3:
+                return 1;
+            case DType::F8_E5M2:
+                return 1;
+            default:
+                return 0;
         }
     }
 
     const char *SafetensorsReader::dtypeName(DType dt) {
         switch (dt) {
-            case DType::F64: return "F64";
-            case DType::F32: return "F32";
-            case DType::F16: return "F16";
-            case DType::BF16: return "BF16";
-            case DType::I64: return "I64";
-            case DType::I32: return "I32";
-            case DType::I16: return "I16";
-            case DType::I8: return "I8";
-            case DType::U8: return "U8";
-            case DType::BOOL: return "BOOL";
-            case DType::U16: return "U16";
-            case DType::U32: return "U32";
-            case DType::U64: return "U64";
-            case DType::F8_E4M3: return "F8_E4M3";
-            case DType::F8_E5M2: return "F8_E5M2";
-            default: return "Unknown";
+            case DType::F64:
+                return "F64";
+            case DType::F32:
+                return "F32";
+            case DType::F16:
+                return "F16";
+            case DType::BF16:
+                return "BF16";
+            case DType::I64:
+                return "I64";
+            case DType::I32:
+                return "I32";
+            case DType::I16:
+                return "I16";
+            case DType::I8:
+                return "I8";
+            case DType::U8:
+                return "U8";
+            case DType::BOOL:
+                return "BOOL";
+            case DType::U16:
+                return "U16";
+            case DType::U32:
+                return "U32";
+            case DType::U64:
+                return "U64";
+            case DType::F8_E4M3:
+                return "F8_E4M3";
+            case DType::F8_E5M2:
+                return "F8_E5M2";
+            default:
+                return "Unknown";
         }
     }
 

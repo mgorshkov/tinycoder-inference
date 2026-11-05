@@ -1,4 +1,28 @@
 /*
+ ⚡ TinyCoder AI
+
+ Copyright (c) 2026 Mikhail Gorshkov (mikhail.gorshkov@gmail.com)
+
+ Permission is hereby granted, free of charge, to any person obtaining a copy
+ of this software and associated documentation files (the "Software"), to deal
+ in the Software without restriction, including without limitation the rights
+ to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ copies of the Software, and to permit persons to whom the Software is
+ furnished to do so, subject to the following conditions:
+
+ The above copyright notice and this permission notice shall be included in all
+ copies or substantial portions of the Software.
+
+ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+ SOFTWARE.
+*/
+
+/*
  * TinyCoder CUDA GPU offload engine -- forward & graph
  *
  * Part of the CUDA offload engine split out of the former GPUCompute.cu.  The
@@ -8,25 +32,668 @@
 
 #ifdef USE_CUDA
 
-#include "GPUComputeInternal.hpp"
 #include "EXL3Kernels.hpp"
+#include "GPUComputeInternal.hpp"
 
+#include <cublasLt.h>
 #include <cublas_v2.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <map>
 #include <mutex>
 #include <string>
+#include <type_traits>
+#include <utility>
 #include <vector>
 
 namespace tinycoder::gpu {
+    namespace {
+        // ---- Trunk phase timing (TINYCODER_TRUNK_PROF) ----------------------
+        // layerGpuMs conflates attention, the GDN/SSM recurrent block and the
+        // projection GEMMs, so nothing can be attributed to any of them.  These
+        // events bracket the GDN block; synced once per layer, no-op unless the
+        // env var is set.
+        cudaEvent_t gGdnEv0 = nullptr;
+        cudaEvent_t gGdnEv1 = nullptr;
+        double gGdnMsTotal = 0.0;
+    }// namespace
 
     // ===== qwen35moe hybrid, dense forward(), CUDA-graph decode, lifecycle =====
+    bool GPUModel::gemmF32Cublas(const DeviceMatrix &m, const float *x,
+                                 float *y, uint32_t seqLen, std::string &errMsg) {
+        if (m.q == nullptr || m.rows == 0 || m.cols == 0 || seqLen == 0)
+            return false;
+        cublasSetStream(g_cublas, g_stream);
+        const float alpha = 1.0f, beta = 0.0f;
+        cublasStatus_t st = cublasSgemm(
+                g_cublas, CUBLAS_OP_T, CUBLAS_OP_N, static_cast<int>(m.rows),
+                static_cast<int>(seqLen), static_cast<int>(m.cols), &alpha,
+                static_cast<const float *>(m.q), static_cast<int>(m.cols), x,
+                static_cast<int>(m.cols), &beta, y, static_cast<int>(m.rows));
+        if (st != CUBLAS_STATUS_SUCCESS) {
+            errMsg = "cublasSgemm F32 prefill failed";
+            return false;
+        }
+        return true;
+    }
+
+    bool GPUModel::gemmQ8Cublas(const DeviceMatrix &m, const float *x,
+                                float *y, uint32_t seqLen, std::string &errMsg) {
+        if (m.q == nullptr || m.rows == 0 || m.cols == 0 || seqLen == 0)
+            return false;
+        const size_t xBytes = static_cast<size_t>(seqLen) * m.cols * sizeof(__half);
+        if (cublasX16_ == nullptr || cublasX16Bytes_ < xBytes) {
+            if (cublasX16_) cudaFree(cublasX16_);
+            cublasX16_ = nullptr;
+            cublasX16Bytes_ = 0;
+            if (cudaMalloc(&cublasX16_, xBytes) != cudaSuccess) return false;
+            cublasX16Bytes_ = xBytes;
+        }
+        kF32ToF16<<<(seqLen * m.cols + 511u) / 512u, 256, 0, g_stream>>>(
+                x, reinterpret_cast<__half2 *>(cublasX16_),
+                static_cast<int>((seqLen * m.cols) / 2u));
+        void *wF = nullptr;
+        if (!dequantMatrixF16(m, &wF, errMsg)) return false;
+        float alpha = 1.0f, beta = 0.0f;
+        cublasStatus_t st = cublasGemmEx(
+                g_cublas, CUBLAS_OP_T, CUBLAS_OP_N,
+                static_cast<int>(m.rows), static_cast<int>(seqLen),
+                static_cast<int>(m.cols), &alpha, wF, CUDA_R_16F,
+                static_cast<int>(m.cols), cublasX16_, CUDA_R_16F,
+                static_cast<int>(m.cols), &beta, y, CUDA_R_32F,
+                static_cast<int>(m.rows), CUDA_R_32F,
+                CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+        if (st != CUBLAS_STATUS_SUCCESS) {
+            errMsg = "cublasGemmEx Q8 prefill failed";
+            return false;
+        }
+        return true;
+    }
+
+    bool GPUModel::gemmExl3Batch(const DeviceMatrix &m, const float *x,
+                                 float *y, uint32_t seqLen,
+                                 std::string &errMsg, const float *siluMul) {
+        // EXPERIMENTAL, DEFAULT OFF.  This path measured 339 tok/s on the 27B
+        // (58x the per-token GEMV) but its output does not match the validated
+        // fused-GEMV reference (max abs diff ~50 on a mean magnitude of ~2), so
+        // it is NOT enabled: a fast-but-wrong projection would corrupt every
+        // token.  The decode/GEMM plumbing is kept behind this flag for
+        // whoever picks the algebra back up.
+        // Default ON since 2026-11-12: 600.6 tok/s vs 5.8 for the per-token GEMV on
+        // the 27B (pp512), logits matching the fused path to 0.001.  Fail-safe: any
+        // launch error disables the path for the rest of the process and falls back
+        // to the validated GEMV, so a bad geometry costs speed, never correctness.
+        static bool exl3BatchOn = [] {
+            const char *e = std::getenv("TINYCODER_EXL3_BATCH");
+            return e == nullptr || e[0] != '0';
+        }();
+        if (!exl3BatchOn) return false;
+        uint32_t k = 0, n = 0;
+        if (m.q == nullptr || seqLen == 0 || m.rows == 0)
+            return false;
+        if (!exl3gpu::linearGeometry(m.q, k, n)) return false;
+        if (n != m.rows || (n & 127u) != 0 || (k & 127u) != 0) return false;
+        const uint64_t wBytes = static_cast<uint64_t>(k) * n * 2u;
+        if (exl3F16_ == nullptr || exl3F16Bytes_ < wBytes) {
+            if (exl3F16_) cudaFree(exl3F16_);
+            exl3F16_ = nullptr;
+            exl3F16Bytes_ = 0;
+            if (cudaMalloc(&exl3F16_, static_cast<size_t>(wBytes)) != cudaSuccess)
+                return false;
+            exl3F16Bytes_ = wBytes;
+        }
+        // RAW is the DEFAULT: profile showed 96% of the batch path is materialisation,
+        // and RAW moves both Hadamards off the weights (5.3 GB) onto the activations
+        // (seq x k and seq x n), removing two full read+write passes over [k][n].
+        // Verified correct: logits match the fused path to 0.001 (16.667089 vs
+        // 16.665943, same top-1 id).  TINYCODER_EXL3_RAW=0 restores the materialised
+        // variant, which is kept as the correctness oracle.
+        static const bool exl3Raw = [] {
+            const char *e = std::getenv("TINYCODER_EXL3_RAW");
+            return e == nullptr || e[0] != '0';
+        }();
+        // Profiling (item 1): how much of the batch path is materialisation?
+        static double tMat = 0, tGemm = 0;
+        static uint64_t nMat = 0;
+        static const bool prof = std::getenv("TINYCODER_EXL3_PROF") != nullptr;
+        cudaEvent_t ev0 = nullptr, ev1 = nullptr, ev2 = nullptr;
+        if (prof) {
+            cudaEventCreate(&ev0);
+            cudaEventCreate(&ev1);
+            cudaEventCreate(&ev2);
+            cudaEventRecord(ev0, g_stream);
+        }
+        // Fused decode+WMMA: the trellis feeds the MMA directly, so nothing is
+        // materialised and no cuBLAS GEMM is issued.  The input Hadamard stays on
+        // the activations and the output Hadamard runs on y afterwards.
+        static const bool exl3Fused = [] {
+            const char *e = std::getenv("TINYCODER_EXL3_FUSED");
+            return e != nullptr && e[0] != '0';
+        }();
+        if (exl3Fused && exl3Raw && (k & 127u) == 0 && (n & 127u) == 0) {
+            // The fused-MMA route has its own activation handling; a fused
+            // silu request must fall back rather than be silently ignored.
+            if (siluMul != nullptr) return false;
+            const float *su = nullptr, *sv = nullptr;
+            exl3gpu::linearSides(m.q, su, sv);
+            const size_t xb = static_cast<size_t>(seqLen) * k * sizeof(__half);
+            if (cublasX16_ == nullptr || cublasX16Bytes_ < xb) {
+                if (cublasX16_) cudaFree(cublasX16_);
+                cublasX16_ = nullptr;
+                cublasX16Bytes_ = 0;
+                if (cudaMalloc(&cublasX16_, xb) != cudaSuccess) return false;
+                cublasX16Bytes_ = xb;
+            }
+            kExl3FwhtToF16<4><<<dim3(((k >> 7) + 3u) / 4u, seqLen), 128, 0, g_stream>>>(
+                    x, reinterpret_cast<__half *>(cublasX16_), su, k);
+            if (!exl3gpu::gemmFusedRawLaunch(m.q, cublasX16_, y, seqLen, g_stream, errMsg))
+                return false;
+            kExl3FwhtF32<4><<<dim3(((n >> 7) + 3u) / 4u, seqLen), 128, 0, g_stream>>>(
+                    y, sv, n);
+            return true;
+        }
+        // ---- Four-phase attribution (TINYCODER_EXL3_PHASE=1) --------------
+        // Five CUDA events per projection, never synchronised on the measuring
+        // path: the sum is taken once at exit.  The older TINYCODER_EXL3_PROF
+        // syncs inside every projection (and records its second event after
+        // the input Hadamard), so it (a) stalls the pipeline and (b) cannot
+        // attribute the output transform at all.  This one can.
+        struct Exl3PhaseProf {
+            std::vector<cudaEvent_t> ev;
+            uint64_t skip = 0, next = 0;
+            bool on = false;
+            ~Exl3PhaseProf() {
+                if (!on || ev.size() < 5) return;
+                cudaDeviceSynchronize();
+                double t[4] = {0, 0, 0, 0};
+                uint64_t n = 0;
+                for (size_t i = 0; i + 5 <= ev.size(); i += 5) {
+                    if (i / 5 < skip) continue;
+                    for (int p = 0; p < 4; ++p) {
+                        float d = 0.0f;
+                        if (cudaEventElapsedTime(&d, ev[i + p], ev[i + p + 1]) !=
+                            cudaSuccess)
+                            d = 0.0f;
+                        t[p] += d;
+                    }
+                    ++n;
+                }
+                if (n == 0) return;
+                const double tot = t[0] + t[1] + t[2] + t[3];
+                std::fprintf(
+                        stderr,
+                        "[exl3phase] %llu projections | materialise %.1f ms (%.1f%%) | "
+                        "wht_to_f16 %.1f ms (%.1f%%) | cublas %.1f ms (%.1f%%) | "
+                        "wht_f32 %.1f ms (%.1f%%) | sum %.1f ms | per proj %.3f ms\n",
+                        (unsigned long long) n, t[0], 100.0 * t[0] / (tot + 1e-9), t[1],
+                        100.0 * t[1] / (tot + 1e-9), t[2], 100.0 * t[2] / (tot + 1e-9),
+                        t[3], 100.0 * t[3] / (tot + 1e-9), tot, tot / (double) n);
+            }
+            // Returns 5 events for this call (ring, grown in blocks of 512).
+            cudaEvent_t *acquire() {
+                if (next + 5 > ev.size()) {
+                    for (int i = 0; i < 512; ++i) {
+                        cudaEvent_t e = nullptr;
+                        cudaEventCreate(&e);
+                        ev.push_back(e);
+                    }
+                }
+                cudaEvent_t *p = &ev[next];
+                next += 5;
+                return p;
+            }
+        };
+        static Exl3PhaseProf phaseProf = [] {
+            Exl3PhaseProf p;
+            const char *e = std::getenv("TINYCODER_EXL3_PHASE");
+            p.on = e != nullptr && e[0] != '0';
+            if (const char *s = std::getenv("TINYCODER_EXL3_PHASE_SKIP"))
+                p.skip = std::strtoull(s, nullptr, 10);
+            return p;
+        }();
+        cudaEvent_t *phaseEv = phaseProf.on ? phaseProf.acquire() : nullptr;
+        auto phaseTick = [&](int p) {
+            if (phaseEv) cudaEventRecord(phaseEv[p], g_stream);
+        };
+        phaseTick(0);
+        // A/B switch for the two Hadamard transport implementations: the
+        // legacy shared-memory kernel (bit-identical reference) or the warp
+        // shuffle one.  Measurement only.
+        // Bit 0 = legacy input transform (Hk), bit 1 = legacy output
+        // transform (Hn), bit 2 = legacy path forced serial (no overlap
+        // stream).  A/B only; 0 is the shipped configuration.
+        static const int whtLegacy = [] {
+            const char *e = std::getenv("TINYCODER_WHT_LEGACY");
+            return e ? std::atoi(e) : 0;
+        }();
+
+        // ---- Pipelined weight decode -------------------------------------
+        // Decoding and the cuBLAS GEMM both ran on g_stream, so prefill paid
+        // mat + gemm.  Decoding on a second stream lets the NEXT matrix's decode
+        // overlap the PREVIOUS matrix's GEMM (one-call lookahead), making the
+        // cost max(mat, gemm) instead of the sum.  Double-buffered so the GEMM
+        // never reads a buffer being rewritten.
+        static cudaStream_t sMat = nullptr;
+        static cudaEvent_t eMat = nullptr;
+        static void *matBuf[2] = {nullptr, nullptr};
+        static size_t matBufBytes[2] = {0, 0};
+        static int matCur = 0;
+        static cudaEvent_t eUse[2] = {nullptr, nullptr};
+        static bool bufUsed[2] = {false, false};
+        if (sMat == nullptr) {
+            if (cudaStreamCreateWithFlags(&sMat, cudaStreamNonBlocking) != cudaSuccess)
+                return false;
+            if (cudaEventCreateWithFlags(&eMat, cudaEventDisableTiming) != cudaSuccess)
+                return false;
+            for (int i = 0; i < 2; ++i)
+                if (cudaEventCreateWithFlags(&eUse[i], cudaEventDisableTiming) !=
+                    cudaSuccess)
+                    return false;
+        }
+        void *wBuf = static_cast<void *>(exl3F16_);
+        int pipeBuf = -1;
+        const float *suh = nullptr, *svh = nullptr;
+        if (exl3Raw) {
+            // Raw trellis decode (no weight-side Hadamard) + activation-side
+            // Hadamard: W^T x = Dsv Hn What^T Hk Dsu x.
+            // Default OFF: measured 643.3 -> 649.3 pp512, i.e. inside noise.  The
+            // decode writes 5.3 GB of fp16 per forward and the GEMM reads the same
+            // 5.3 GB, so both are DRAM-bound and overlapping them cannot beat the
+            // bandwidth ceiling.  Kept (correct: logits 16.667089) for a future
+            // fused kernel that removes the fp16 round trip entirely.
+            static const bool pipeOn = [] {
+                const char *e = std::getenv("TINYCODER_EXL3_PIPE");
+                return e != nullptr && e[0] != '0';
+            }();
+            if (pipeOn && exl3gpu::rawFastPath(m.q)) {
+                const int b = matCur;
+                if (matBuf[b] == nullptr || matBufBytes[b] < wBytes) {
+                    if (matBuf[b]) cudaFree(matBuf[b]);
+                    matBuf[b] = nullptr;
+                    matBufBytes[b] = 0;
+                    if (cudaMalloc(&matBuf[b], static_cast<size_t>(wBytes)) != cudaSuccess)
+                        return false;
+                    matBufBytes[b] = wBytes;
+                }
+                // The decode must not overwrite a buffer that a GEMM two calls
+                // back may still be reading: wait on that buffer's own event,
+                // not on g_stream (which would serialise the pipeline away).
+                if (bufUsed[b]) cudaStreamWaitEvent(sMat, eUse[b], 0);
+                if (!exl3gpu::materializeRawF16(m.q, matBuf[b], sMat, errMsg))
+                    return false;
+                cudaEventRecord(eMat, sMat);
+                cudaStreamWaitEvent(g_stream, eMat, 0);
+                wBuf = matBuf[b];
+                bufUsed[b] = true;
+                pipeBuf = b;
+                matCur ^= 1;
+            } else if (!exl3gpu::materializeRawF16(m.q, exl3F16_, g_stream, errMsg)) {
+                return false;
+            }
+            (void) exl3gpu::linearSides(m.q, suh, svh);
+        } else {
+            if (!exl3gpu::materializeF16(m.q, exl3F16_, g_stream, errMsg))
+                return false;
+        }
+        phaseTick(1);// materialise (trellis -> fp16 weight) complete
+        const size_t xBytes = static_cast<size_t>(seqLen) * k * sizeof(__half);
+        if (cublasX16_ == nullptr || cublasX16Bytes_ < xBytes) {
+            if (cublasX16_) cudaFree(cublasX16_);
+            cublasX16_ = nullptr;
+            cublasX16Bytes_ = 0;
+            if (cudaMalloc(&cublasX16_, xBytes) != cudaSuccess) return false;
+            cublasX16Bytes_ = xBytes;
+        }
+        // The input Hadamard reads x and writes cublasX16_; it does not touch
+        // the weight being decoded, so it can run CONCURRENTLY with the
+        // (bandwidth-bound) materialisation on its own stream.  Serial they
+        // cost 45 ms + 114 ms per prefill; overlapped the pair is one 67 GB
+        // streaming pass, i.e. ~114 ms.  The transform must not overwrite
+        // cublasX16_ while the PREVIOUS projection's GEMM still reads it, hence
+        // the evXFree handshake below (recorded after each GEMM).  TINYCODER_
+        // EXL3_XOVL=0 restores the serial launch.
+        static const bool xOvl = [] {
+            const char *e = std::getenv("TINYCODER_EXL3_XOVL");
+            return e == nullptr || e[0] != '0';
+        }();
+        static cudaStream_t sWht = nullptr;
+        static cudaEvent_t evIn = nullptr, evXReady = nullptr;
+        if (xOvl && sWht == nullptr) {
+            if (cudaStreamCreateWithFlags(&sWht, cudaStreamNonBlocking) != cudaSuccess)
+                sWht = nullptr;
+            else if (cudaEventCreateWithFlags(&evIn, cudaEventDisableTiming) !=
+                             cudaSuccess ||
+                     cudaEventCreateWithFlags(&evXReady, cudaEventDisableTiming) !=
+                             cudaSuccess) {
+                cudaStreamDestroy(sWht);
+                sWht = nullptr;
+            }
+        }
+        // A fused-activation request is honoured only by the non-legacy RAW
+        // input Hadamard below; anything else declines here, before the
+        // transform reads x, so the caller's fallback (plain kSiluMul + a
+        // fresh projection) is always correct.
+        if (siluMul != nullptr && (!exl3Raw || (whtLegacy & 1) != 0)) return false;
+        if (exl3Raw) {
+            if ((k & 127u) != 0) return false;
+            const dim3 wg(((k >> 7) + 3u) / 4u, seqLen);
+            if (xOvl && sWht != nullptr) {
+                // evIn captures EVERYTHING enqueued on g_stream so far -- in
+                // particular the kernel that produced x and the previous
+                // projection's GEMM still reading cublasX16_.  Waiting on it
+                // (rather than on a "GEMM done" event alone) is what makes the
+                // transform safe: x is written by the norm/attention that ran
+                // after the previous projection returned.  The transform then
+                // overlaps only the materialisation, which was enqueued before
+                // this point and does not touch either buffer.
+                cudaEventRecord(evIn, g_stream);
+                cudaStreamWaitEvent(sWht, evIn, 0);
+                if (whtLegacy & 1)
+                    kExl3FwhtToF16Legacy<<<dim3(k / 128u, seqLen), 128, 0, sWht>>>(
+                            x, reinterpret_cast<__half *>(cublasX16_), suh, k);
+                else
+                    kExl3FwhtToF16<4><<<wg, 128, 0, sWht>>>(
+                            x, reinterpret_cast<__half *>(cublasX16_), suh, k,
+                            siluMul);
+                cudaEventRecord(evXReady, sWht);
+                cudaStreamWaitEvent(g_stream, evXReady, 0);
+            } else if (whtLegacy & 1) {
+                kExl3FwhtToF16Legacy<<<dim3(k / 128u, seqLen), 128, 0, g_stream>>>(
+                        x, reinterpret_cast<__half *>(cublasX16_), suh, k);
+            } else {
+                kExl3FwhtToF16<4><<<wg, 128, 0, g_stream>>>(
+                        x, reinterpret_cast<__half *>(cublasX16_), suh, k,
+                        siluMul);
+            }
+        } else {
+            kF32ToF16<<<(seqLen * k + 511u) / 512u, 256, 0, g_stream>>>(
+                    x, reinterpret_cast<__half2 *>(cublasX16_),
+                    static_cast<int>((static_cast<size_t>(seqLen) * k) / 2u));
+        }
+        if (prof) cudaEventRecord(ev1, g_stream);
+        phaseTick(2);// input Hadamard / cast to fp16 complete
+        float alpha = 1.0f, beta = 0.0f;
+        // raw: exl3F16_ is [k][n] row-major == column-major (n x k), lda = n,
+        // so OP_N applies it directly as What^T.  Transposed: [n][k] row-major
+        // is the classic OP_T form used by gemmQ8Cublas.
+        // BOTH variants hand cuBLAS a [k][n] row-major buffer, which is an
+        // (n x k) column-major operand with lda = n consumed via OP_N.
+        static const int opSel = [] {
+            const char *e = std::getenv("TINYCODER_EXL3_OP");
+            return e ? std::atoi(e) : 0;
+        }();
+        const cublasOperation_t opA = opSel == 1 ? CUBLAS_OP_T : CUBLAS_OP_N;
+        const int lda = static_cast<int>(opSel == 1 ? k : n);
+        // GEMM is 74% of the batch path, so the cuBLAS configuration is the only
+        // tweak-sized lever left.  Selected mode also decides the accumulate type.
+        static const int gemmMode = [] {
+            const char *e = std::getenv("TINYCODER_EXL3_GEMM");
+            return e ? std::atoi(e) : 0;
+        }();
+        const cublasGemmAlgo_t algo = gemmMode == 1 ? CUBLAS_GEMM_DEFAULT
+                                                    : CUBLAS_GEMM_DEFAULT_TENSOR_OP;
+        // fp16 ACCUMULATE IS DEAD ON THIS CARD, not slow: with CUDA 12.4 on
+        // sm_75, cublasGemmEx/cublasHgemm with computeType 16F return
+        // CUBLAS_STATUS_SUCCESS and launch NO KERNEL AT ALL (verified with
+        // nvprof: zero GPU activities; tools/exl3_gemm_acc_probe.cu reproduces
+        // it).  That is also what the "mode 2 hung for 10 minutes" note in the
+        // ledger really was: y was never written, the fail-safe disabled the
+        // batch path and every token fell back to the per-token GEMV.  Mode 2
+        // therefore maps to the fp32-accumulate path.
+        const cudaDataType_t accType = CUDA_R_32F;
+        // --- cublasLt with a per-shape autotune ---------------------------
+        // cublasGemmEx picks turing_s1688gemm_fp16_256x128 for EVERY shape.
+        // On the 27B's shapes that tile quantises badly (n=5120 with seq=512
+        // is 80 blocks on 108 SMs = 0.74 waves) and it measured 1.25x slower
+        // than cublasLt's tile-20/stages-0 candidate for ffn_down, 1.03-1.08x
+        // slower elsewhere (sustained runs, tools/exl3_gemm_lt_probe.cu).
+        // Candidates are timed ONCE per (k,n,seqLen) on the real buffers and
+        // cached: ~6 shapes x 6 candidates x 2 iterations of the cold first
+        // prefill, ~200 ms, never on a measured run.
+        // ON by default since the logits gate was re-baselined (2026-11-14).
+        // A different cuBLAS kernel sums k in a different order, so the top-1
+        // LOGIT moves by ~1e-3 absolute (5e-5 relative) on the 27B.  That is an
+        // accumulation-order artefact, not a modelling change: the top-1 id
+        // (198) and the whole top-5 ordering are identical, and it is the id
+        // and the ordering that gate this path, not the logit value.  Measured
+        // 423.2 vs 438.8 ms of GEMM per 512-token prefill (per-projection
+        // attribution, TINYCODER_EXL3_PHASE=1), i.e. ~16 ms of prefill,
+        // 685.2 -> 701.4 pp512.
+        //   TINYCODER_EXL3_LT=0  -> the old exact-order cublasGemmEx path (the
+        //   bit-exact 19.308743 oracle, and the escape hatch if a future
+        //   numeric question needs the pre-rebaseline ordering).
+        static const bool ltOn = [] {
+            const char *e = std::getenv("TINYCODER_EXL3_LT");
+            return e == nullptr || e[0] != '0';
+        }();
+        struct LtPlan {
+            uint32_t k = 0, n = 0, seq = 0;
+            cublasLtMatmulDesc_t op = nullptr;
+            cublasLtMatrixLayout_t A = nullptr, B = nullptr, C = nullptr;
+            cublasLtMatmulAlgo_t algo{};
+            bool ready = false;
+        };
+        static std::vector<LtPlan> ltPlans;
+        static cublasLtHandle_t ltH = nullptr;
+        static void *ltWs = nullptr;
+        static const size_t ltWsBytes = 64u << 20;
+        cublasStatus_t st = CUBLAS_STATUS_SUCCESS;
+        bool ltUsed = false;
+        if (ltOn && opSel == 0) {
+            if (ltH == nullptr) {
+                if (cublasLtCreate(&ltH) != CUBLAS_STATUS_SUCCESS) {
+                    ltH = nullptr;
+                } else if (cudaMalloc(&ltWs, ltWsBytes) != cudaSuccess) {
+                    cublasLtDestroy(ltH);
+                    ltH = nullptr;
+                }
+            }
+            if (ltH != nullptr) {
+                LtPlan *plan = nullptr;
+                for (auto &p: ltPlans)
+                    if (p.k == k && p.n == n && p.seq == seqLen) {
+                        plan = &p;
+                        break;
+                    }
+                if (plan == nullptr) {
+                    ltPlans.push_back(LtPlan{});
+                    plan = &ltPlans.back();
+                    plan->k = k;
+                    plan->n = n;
+                    plan->seq = seqLen;
+                }
+                if (plan->op == nullptr) {
+                    cublasOperation_t opN = CUBLAS_OP_N;
+                    if (cublasLtMatmulDescCreate(&plan->op, CUBLAS_COMPUTE_32F,
+                                                 CUDA_R_32F) == CUBLAS_STATUS_SUCCESS) {
+                        cublasLtMatmulDescSetAttribute(plan->op,
+                                                       CUBLASLT_MATMUL_DESC_TRANSA, &opN,
+                                                       sizeof(opN));
+                        cublasLtMatmulDescSetAttribute(plan->op,
+                                                       CUBLASLT_MATMUL_DESC_TRANSB, &opN,
+                                                       sizeof(opN));
+                        cublasLtMatrixLayoutCreate(&plan->A, CUDA_R_16F,
+                                                   static_cast<int>(n),
+                                                   static_cast<int>(k),
+                                                   static_cast<int>(n));
+                        cublasLtMatrixLayoutCreate(&plan->B, CUDA_R_16F,
+                                                   static_cast<int>(k),
+                                                   static_cast<int>(seqLen),
+                                                   static_cast<int>(k));
+                        cublasLtMatrixLayoutCreate(&plan->C, CUDA_R_32F,
+                                                   static_cast<int>(n),
+                                                   static_cast<int>(seqLen),
+                                                   static_cast<int>(n));
+                    }
+                }
+                if (plan->op != nullptr && plan->A != nullptr &&
+                    plan->B != nullptr && plan->C != nullptr) {
+                    if (!plan->ready) {
+                        cublasLtMatmulPreference_t pref = nullptr;
+                        cublasLtMatmulHeuristicResult_t hr[16];
+                        int got = 0;
+                        if (cublasLtMatmulPreferenceCreate(&pref) ==
+                            CUBLAS_STATUS_SUCCESS) {
+                            cublasLtMatmulPreferenceSetAttribute(
+                                    pref, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
+                                    &ltWsBytes, sizeof(ltWsBytes));
+                            cublasLtMatmulAlgoGetHeuristic(
+                                    ltH, plan->op, plan->A, plan->B, plan->C, plan->C,
+                                    pref, 16, hr, &got);
+                            cublasLtMatmulPreferenceDestroy(pref);
+                        }
+                        // Candidates are timed and the fastest is kept.  Note
+                        // what that costs: the heuristic can return a different
+                        // near-equal candidate in a different process (its
+                        // ranking depends on runtime state), and a different
+                        // candidate is a different k-accumulation order, so the
+                        // top-1 LOGIT is not reproducible run to run -- observed
+                        // 19.308840 / 19.309187 / 19.309734 on one binary with
+                        // id=198 and the same top-5 in every case.  Pinning by
+                        // (tile,stages) is NOT a fix: tile=20/stages=0 is
+                        // returned TWICE per shape here with identical
+                        // attributes and 35% apart in time (2.538 vs 3.426 ms on
+                        // k=17408 n=5120), so a first-match pin lands on the
+                        // slow duplicate.  Gate on the id and the ordering.
+                        static const bool ltDbg = [] {
+                            const char *e = std::getenv("TINYCODER_EXL3_LT_DBG");
+                            return e != nullptr && e[0] == '1';
+                        }();
+                        float bestMs = 1.0e30f;
+                        int bestI = -1;
+                        cudaEvent_t ta = nullptr, tb = nullptr;
+                        cudaEventCreate(&ta);
+                        cudaEventCreate(&tb);
+                        for (int i = 0; i < got; ++i) {
+                            if (hr[i].state != CUBLAS_STATUS_SUCCESS) continue;
+                            // two iterations; y is overwritten by the real GEMM
+                            cudaEventRecord(ta, g_stream);
+                            for (int r = 0; r < 2; ++r)
+                                cublasLtMatmul(ltH, plan->op, &alpha, wBuf, plan->A,
+                                               cublasX16_, plan->B, &beta, y, plan->C,
+                                               y, plan->C, &hr[i].algo, ltWs,
+                                               ltWsBytes, g_stream);
+                            cudaEventRecord(tb, g_stream);
+                            cudaEventSynchronize(tb);
+                            float ms = 0.0f;
+                            cudaEventElapsedTime(&ms, ta, tb);
+                            if (ms < bestMs) {
+                                bestMs = ms;
+                                bestI = i;
+                            }
+                        }
+                        cudaEventDestroy(ta);
+                        cudaEventDestroy(tb);
+                        if (bestI >= 0) {
+                            plan->algo = hr[bestI].algo;
+                            plan->ready = true;
+                            if (ltDbg) {
+                                uint32_t tile = 0xffffffffu, stages = 0xffffffffu;
+                                size_t wr = 0;
+                                cublasLtMatmulAlgoConfigGetAttribute(
+                                        &plan->algo, CUBLASLT_ALGO_CONFIG_TILE_ID,
+                                        &tile, sizeof(tile), &wr);
+                                cublasLtMatmulAlgoConfigGetAttribute(
+                                        &plan->algo, CUBLASLT_ALGO_CONFIG_STAGES_ID,
+                                        &stages, sizeof(stages), &wr);
+                                std::fprintf(stderr,
+                                             "[exl3lt] k=%u n=%u seq=%u -> tile=%u "
+                                             "stages=%u  %.3f ms  (%d candidates)\n",
+                                             k, n, seqLen, tile, stages, bestMs,
+                                             got);
+                            }
+                        }
+                    }
+                    if (plan->ready) {
+                        st = cublasLtMatmul(ltH, plan->op, &alpha, wBuf, plan->A,
+                                            cublasX16_, plan->B, &beta, y, plan->C, y,
+                                            plan->C, &plan->algo, ltWs, ltWsBytes,
+                                            g_stream);
+                        ltUsed = st == CUBLAS_STATUS_SUCCESS;
+                    }
+                }
+            }
+        }
+        if (!ltUsed) {
+            st = cublasGemmEx(
+                    g_cublas, opA, CUBLAS_OP_N, static_cast<int>(n),
+                    static_cast<int>(seqLen), static_cast<int>(k), &alpha, wBuf,
+                    CUDA_R_16F, lda, cublasX16_, CUDA_R_16F,
+                    static_cast<int>(k), &beta, y, CUDA_R_32F, static_cast<int>(n),
+                    accType, algo);
+        }
+        if (st != CUBLAS_STATUS_SUCCESS) {
+            exl3BatchOn = false;
+            errMsg = "cublasGemmEx EXL3 prefill failed";
+            return false;
+        }
+        // The GEMM is enqueued; release this buffer only when it completes.
+        if (pipeBuf >= 0) cudaEventRecord(eUse[pipeBuf], g_stream);
+        phaseTick(3);// cuBLAS GEMM enqueued (its time is measured by the events)
+        {
+            const cudaError_t ePost = cudaPeekAtLastError();
+            if (ePost != cudaSuccess) {
+                exl3BatchOn = false;
+                errMsg = std::string("EXL3 batch: ") + cudaGetErrorString(ePost);
+                return false;
+            }
+        }
+        static const bool exl3Dbg = [] {
+            const char *e = std::getenv("TINYCODER_EXL3_DBG");
+            return e != nullptr && e[0] == '1';
+        }();
+        if (exl3Dbg) {
+            cudaStreamSynchronize(g_stream);
+            float hx[4], hw[4], hy[4];
+            __half hwh[4];
+            cudaMemcpy(hx, x, sizeof(hx), cudaMemcpyDeviceToHost);
+            cudaMemcpy(hwh, wBuf, sizeof(hwh), cudaMemcpyDeviceToHost);
+            cudaMemcpy(hy, y, sizeof(hy), cudaMemcpyDeviceToHost);
+            for (int i = 0; i < 4; ++i) hw[i] = __half2float(hwh[i]);
+            std::fprintf(stderr, "[exl3dbg] k=%u n=%u seq=%u | x %g %g %g %g | W %g %g %g %g | y %g %g %g %g\n",
+                         k, n, seqLen, hx[0], hx[1], hx[2], hx[3],
+                         hw[0], hw[1], hw[2], hw[3], hy[0], hy[1], hy[2], hy[3]);
+        }
+        if (prof) {
+            cudaEventRecord(ev2, g_stream);
+            cudaEventSynchronize(ev2);
+            float m0 = 0, m1 = 0;
+            cudaEventElapsedTime(&m0, ev0, ev1);
+            cudaEventElapsedTime(&m1, ev1, ev2);
+            tMat += m0;
+            tGemm += m1;
+            ++nMat;
+            if ((nMat % 64u) == 0u) {
+                std::fprintf(stderr,
+                             "[exl3prof] %llu calls  materialise %.1f ms  gemm %.1f ms  "
+                             "-> %.0f%% materialise\n",
+                             (unsigned long long) nMat, tMat, tGemm,
+                             100.0 * tMat / (tMat + tGemm + 1e-9));
+            }
+            cudaEventDestroy(ev0);
+            cudaEventDestroy(ev1);
+            cudaEventDestroy(ev2);
+        }
+        // Output-side Hadamard: y = Dsv Hn y (in place, per token).
+        if (exl3Raw) {
+            if ((n & 127u) != 0) return false;
+            if (whtLegacy & 2)
+                kExl3FwhtF32Legacy<<<dim3(n / 128u, seqLen), 128, 0, g_stream>>>(y, svh, n);
+            else
+                kExl3FwhtF32<4><<<dim3(((n >> 7) + 3u) / 4u, seqLen), 128, 0, g_stream>>>(
+                        y, svh, n);
+        }
+        phaseTick(4);// output Hadamard complete
+        return true;
+    }
+
     bool GPUModel::forwardQwen35MoePrefix(const std::vector<int32_t> &tokens,
                                           bool computeAllLogits, float *logitsOut,
                                           std::string &errMsg) {
@@ -254,7 +921,7 @@ namespace tinycoder::gpu {
                 float e0[8];
                 cudaMemcpy(e0, s.hidden, 8 * sizeof(float), cudaMemcpyDeviceToHost);
                 double esum = 0.0;
-                for (int i = 0; i < 2048; ++i) {
+                for (uint32_t i = 0; i < H; ++i) {
                     float t;
                     cudaMemcpy(&t, s.hidden + i, sizeof(float),
                                cudaMemcpyDeviceToHost);
@@ -286,11 +953,57 @@ namespace tinycoder::gpu {
         // launchQGemv covers every type these projections use (K-quants via
         // kQGemv*, Q8_0 via kQGemvSmall32, F32 via kQ35F32Gemv), so no fp16
         // conversion path is needed at all.
+        // ---- Dense-trunk prefill: batched int8 GEMM for the WIDE projections
+        // ------------------------------------------------------------------
+        // The per-token GEMV loop below streams each layer's weight matrix once
+        // PER TOKEN.  For the wide Q4_K/Q6_K projections (attnQKV, attnGate,
+        // ssmOut, shared-expert gate/up/down — nRows >= 1024) one int8 GEMM for
+        // the whole batch reads them once per layer instead.  Narrow projections
+        // (ssmBetaQ / ssmAlphaQ, tens of rows) stay on the exact per-token
+        // GEMV: they were the pathological case when every shape was routed
+        // through int8Gemm (0.6 tok/s), because the GEMM tile grid degenerates
+        // for a handful of rows.  TINYCODER_TRUNK_GEMM=0 restores the exact
+        // path for batch == sequential == CPU parity.
+        static const bool trunkGemm = [] {
+            const char *e = std::getenv("TINYCODER_TRUNK_GEMM");
+            return e == nullptr || e[0] != '0';
+        }();
+        static const uint32_t trunkGemmMin = [] {
+            const char *e = std::getenv("TINYCODER_TRUNK_GEMM_MIN");
+            const long v = e ? std::strtol(e, nullptr, 10) : 0;
+            return static_cast<uint32_t>(v > 0 ? v : 256);
+        }();
         auto gemv = [&](const DeviceMatrix &m, const float *x, float *y,
                         uint32_t nRows, uint32_t nCols,
                         const char *what) -> bool {
             (void) what;
             if (m.q == nullptr || nRows == 0) return true;
+            // IQ quants (the 7B iq3_xxs checkpoint) also go through the
+            // batched int8 tensor-core GEMM: without them the dense path
+            // launches one GEMV per token per projection (512 x 7 x 28 =
+            // ~100k launches per prefill), which is why the IQ models trailed
+            // llama.cpp on prefill while the K-quants did not.
+            // nCols == H was too strict: it excluded exactly the projections
+            // whose INPUT width differs from the hidden size (ffnDown: cols =
+            // intermediate; attnO: cols = qLen), which then fell back to one
+            // GEMV launch per token.  int8Gemm only needs cols % 512 == 0.
+            if (trunkGemm && seqLen > 1 && nRows >= trunkGemmMin &&
+                (nCols & 511) == 0 &&
+                (m.type == kTypeQ4K || m.type == kTypeQ6K ||
+                 m.type == kTypeIQ2S || m.type == kTypeIQ3_XXS ||
+                 m.type == kTypeIQ2XS)) {
+                if (int8Gemm(static_cast<int>(m.type), m.q, x, y, seqLen,
+                             nRows, nCols, m.blocksPerRow,
+                             reinterpret_cast<void *>(g_stream))) {
+                    return true;
+                }
+            }
+            // EXL3 prefill: one trellis decode per matrix + an fp16 GEMM,
+            // instead of re-reading the trellis once per token.
+            if (seqLen > 1 && m.type == kTypeEXL3) {
+                std::string exl3BErr;
+                if (gemmExl3Batch(m, x, y, seqLen, exl3BErr)) return true;
+            }
             for (uint32_t st = 0; st < seqLen; ++st) {
                 launchQGemv(m.type, m.q, x + static_cast<size_t>(st) * nCols,
                             y + static_cast<size_t>(st) * nRows, nRows, nCols,
@@ -360,67 +1073,215 @@ namespace tinycoder::gpu {
                         q35GdnState_ + static_cast<size_t>(L) * nVHeads * headV * headV;
                 const float *convW = static_cast<const float *>(w.ssmConv1d.q);
                 const uint32_t convBlocks = (convChannels + 255) / 256;
-                for (uint32_t st = 0; st < seqLen; ++st) {
-                    const float *qkv = s.qkv + static_cast<size_t>(st) * qkvDim;
-                    kQ35ConvStep<<<convBlocks, 256, 0, g_stream>>>(
-                            convW, qkv, s.convIn, s.convOut, q35ConvState,
-                            convChannels, convK);
-                    // TINYCODER_DUMP_NORM=1: dump GPU L0 token-0 recurrent
-                    // intermediates (qkv, convOut post-silu) to bisect against
-                    // the CPU's [cpuqkv]/[cpuconv] (zero recurrent state at
-                    // st==0, so convOut = silu(conv(qkv)) is a pure function).
-                    const char *dnR = std::getenv("TINYCODER_DUMP_NORM");
-                    if (L == 0 && st == 0 && dnR != nullptr && dnR[0] != '\0' &&
-                        dnR[0] != '0') {
-                        cudaStreamSynchronize(g_stream);
-                        float q0[5], c0[5];
-                        cudaMemcpy(q0, s.qkv, 5 * sizeof(float),
-                                   cudaMemcpyDeviceToHost);
-                        cudaMemcpy(c0, s.convOut, 5 * sizeof(float),
-                                   cudaMemcpyDeviceToHost);
-                        std::fprintf(stderr,
-                                     "[gpuqkv] L0T0 qkv[0..4]={%.6f %.6f %.6f "
-                                     "%.6f %.6f}\n",
-                                     q0[0], q0[1], q0[2], q0[3], q0[4]);
-                        std::fprintf(stderr,
-                                     "[gpuconv] L0T0 convOut[0..4]={%.6f %.6f "
-                                     "%.6f %.6f %.6f}\n",
-                                     c0[0], c0[1], c0[2], c0[3], c0[4]);
-                    }
-                    kQ35L2NormRepeat<<<1, 128, 0, g_stream>>>(
-                            s.convOut, s.qN, s.kN, s.vN, headK, headV, nKHeads,
-                            nVHeads, keyDim, valueDim, 1,
-                            l2NormSmem() ? 1u : 0u);
-                    const float *betaRow = s.q35Beta + static_cast<size_t>(st) * nVHeads;
-                    const float *gateRow = s.q35GateV + static_cast<size_t>(st) * nVHeads;
-                    float *gdnRow = s.gdnOut + static_cast<size_t>(st) * valueDim;
-                    // TINYCODER_GDN_SEQ=1: restore the original sequential
-                    // per-head launch loop (48 grid(1) launches) for parity
-                    // bisection against the batched grid.x=nVHeads launch.
-                    const bool gdnSeq = (std::getenv("TINYCODER_GDN_SEQ") != nullptr);
-                    if (gdnSeq) {
-                        for (uint32_t hv = 0; hv < nVHeads; ++hv) {
-                            kQ35GdnStep<128><<<1, 128, 0, g_stream>>>(
-                                    s.qN + static_cast<size_t>(hv) * headK,
-                                    s.kN + static_cast<size_t>(hv) * headK,
-                                    s.vN + static_cast<size_t>(hv) * headV,
-                                    betaRow, gateRow,
-                                    q35GdnState + static_cast<size_t>(hv) * headV * headV,
-                                    gdnRow + static_cast<size_t>(hv) * headV, nVHeads,
-                                    hv, invSqrtV);
+                {
+                    static const bool tprof =
+                            std::getenv("TINYCODER_TRUNK_PROF") != nullptr;
+                    if (tprof) {
+                        if (gGdnEv0 == nullptr) {
+                            cudaEventCreateWithFlags(&gGdnEv0,
+                                                     cudaEventDisableTiming);
+                            cudaEventCreateWithFlags(&gGdnEv1,
+                                                     cudaEventDisableTiming);
                         }
-                    } else {
-                        kQ35GdnStepBatch<128><<<nVHeads, 128, 0, g_stream>>>(
-                                s.qN, s.kN, s.vN, betaRow, gateRow, q35GdnState,
-                                gdnRow, nVHeads, invSqrtV);
+                        cudaEventRecord(gGdnEv0, g_stream);
                     }
                 }
-                // Gated RMSNorm (per value-head) × silu(z) over the batch.
-                kQ35GatedRmsNorm<<<seqLen, 256, 256 * sizeof(float), g_stream>>>(
+                // Chunk-scan recurrence (default).  The earlier warp-tree GDN
+                // reduction drifted ~1e-6/token from the per-token kernel,
+                // which flipped the knife-edge qwen35moe expert router (GPU
+                // top-1 "2" vs CPU "<think>").  kQ35GdnScanExact reproduces
+                // the per-token fma order bit-for-bit, so prefill and decode
+                // now agree and the fast path is correct.
+                // TINYCODER_MOE_LEGACY_RECUR=1 restores the per-token loop.
+                const char *legacyEnv =
+                        std::getenv("TINYCODER_MOE_LEGACY_RECUR");
+                const bool legacyRecur =
+                        legacyEnv != nullptr && legacyEnv[0] != '\0' &&
+                        legacyEnv[0] != '0';
+                if (seqLen > 1 && !legacyRecur) {
+                    // Chunk scans (2026-11-04): three launches per layer for
+                    // the whole prompt instead of one conv + one L2-norm + one
+                    // GDN launch per token.  Same math/state order, bit-exact
+                    // with the per-token path up to fp32 reassociation in the
+                    // warp-reduced GDN dot.
+                    const char *convStepEnv =
+                            std::getenv("TINYCODER_MOE_CONV_STEP");
+                    const bool convStep = convStepEnv != nullptr &&
+                                          convStepEnv[0] != '\0' &&
+                                          convStepEnv[0] != '0';
+                    if (convStep) {
+                        for (uint32_t st = 0; st < seqLen; ++st) {
+                            kQ35ConvStep<<<convBlocks, 256, 0, g_stream>>>(
+                                    convW,
+                                    s.qkv + static_cast<size_t>(st) * convChannels,
+                                    s.convIn,
+                                    s.convOut + static_cast<size_t>(st) * convChannels,
+                                    q35ConvState, convChannels, convK);
+                        }
+                    } else {
+                        kQ35ConvScan<<<convBlocks, 256, 0, g_stream>>>(
+                                convW, s.qkv, s.convOut, q35ConvState,
+                                convChannels, convK, seqLen);
+                    }
+                    kQ35L2NormHeads<<<dim3(seqLen, nVHeads), 128, 0, g_stream>>>(
+                            s.convOut, s.qN, s.kN, s.vN, headK, headV, nKHeads,
+                            nVHeads, keyDim, valueDim, seqLen,
+                            geom_.gdnVHeadsTiled);
+                    const char *gdnStepEnv =
+                            std::getenv("TINYCODER_MOE_GDN_STEP");
+                    const bool gdnStep = gdnStepEnv != nullptr &&
+                                         gdnStepEnv[0] != '\0' &&
+                                         gdnStepEnv[0] != '0';
+                    if (gdnStep) {
+                        for (uint32_t st = 0; st < seqLen; ++st) {
+                            kQ35GdnStepBatch<128>
+                                    <<<nVHeads, 128, 0, g_stream>>>(
+                                            s.qN + static_cast<size_t>(st) * nVHeads * headK,
+                                            s.kN + static_cast<size_t>(st) * nVHeads * headK,
+                                            s.vN + static_cast<size_t>(st) * nVHeads * headV,
+                                            s.q35Beta + static_cast<size_t>(st) * nVHeads,
+                                            s.q35GateV + static_cast<size_t>(st) * nVHeads,
+                                            q35GdnState,
+                                            s.gdnOut + static_cast<size_t>(st) * valueDim,
+                                            nVHeads, invSqrtV);
+                        }
+                    } else {
+                        // Shared-memory, row-per-thread scan: its per-row dot
+                        // uses the SAME 4-accumulator order as the per-token
+                        // kernel (q35ColDot4), so prefill and decode are
+                        // bit-identical and the MoE router does not flip.
+                        constexpr uint32_t kGdnSmem =
+                                128u * 32u * sizeof(float);
+                        static const bool gdnSmemOk = [] {
+                            cudaError_t e = cudaFuncSetAttribute(
+                                    kQ35GdnScanSmem<128, 32>,
+                                    cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                    static_cast<int>(128u * 32u * sizeof(float)));
+                            if (e != cudaSuccess) (void) cudaGetLastError();
+                            return e == cudaSuccess;
+                        }();
+                        if (gdnSmemOk) {
+                            kQ35GdnScanSmem<128, 32><<<nVHeads * 4u, 32,
+                                                       kGdnSmem, g_stream>>>(
+                                    s.qN, s.kN, s.vN, s.q35Beta, s.q35GateV,
+                                    q35GdnState, s.gdnOut, nVHeads, valueDim,
+                                    seqLen, invSqrtV);
+                        } else {
+                            kQ35GdnScanExact<128>
+                                    <<<nVHeads * 32u, 128, 0, g_stream>>>(
+                                            s.qN, s.kN, s.vN, s.q35Beta,
+                                            s.q35GateV, q35GdnState, s.gdnOut,
+                                            nVHeads, valueDim, seqLen, invSqrtV);
+                        }
+                    }
+                } else {
+                    for (uint32_t st = 0; st < seqLen; ++st) {
+                        const float *qkv = s.qkv + static_cast<size_t>(st) * qkvDim;
+                        kQ35ConvStep<<<convBlocks, 256, 0, g_stream>>>(
+                                convW, qkv, s.convIn, s.convOut, q35ConvState,
+                                convChannels, convK);
+                        // TINYCODER_DUMP_NORM=1: dump GPU L0 token-0 recurrent
+                        // intermediates (qkv, convOut post-silu) to bisect against
+                        // the CPU's [cpuqkv]/[cpuconv] (zero recurrent state at
+                        // st==0, so convOut = silu(conv(qkv)) is a pure function).
+                        const char *dnR = std::getenv("TINYCODER_DUMP_NORM");
+                        if (L == 0 && st == 0 && dnR != nullptr && dnR[0] != '\0' &&
+                            dnR[0] != '0') {
+                            cudaStreamSynchronize(g_stream);
+                            float q0[5], c0[5];
+                            cudaMemcpy(q0, s.qkv, 5 * sizeof(float),
+                                       cudaMemcpyDeviceToHost);
+                            cudaMemcpy(c0, s.convOut, 5 * sizeof(float),
+                                       cudaMemcpyDeviceToHost);
+                            std::fprintf(stderr,
+                                         "[gpuqkv] L0T0 qkv[0..4]={%.6f %.6f %.6f "
+                                         "%.6f %.6f}\n",
+                                         q0[0], q0[1], q0[2], q0[3], q0[4]);
+                            std::fprintf(stderr,
+                                         "[gpuconv] L0T0 convOut[0..4]={%.6f %.6f "
+                                         "%.6f %.6f %.6f}\n",
+                                         c0[0], c0[1], c0[2], c0[3], c0[4]);
+                        }
+                        kQ35L2NormHeads<<<dim3(1, nVHeads), 128, 0, g_stream>>>(
+                                s.convOut, s.qN, s.kN, s.vN, headK, headV, nKHeads,
+                                nVHeads, keyDim, valueDim, 1,
+                                geom_.gdnVHeadsTiled);
+                        const float *betaRow = s.q35Beta + static_cast<size_t>(st) * nVHeads;
+                        const float *gateRow = s.q35GateV + static_cast<size_t>(st) * nVHeads;
+                        float *gdnRow = s.gdnOut + static_cast<size_t>(st) * valueDim;
+                        // Same warp-per-row kernel as the chunk prefill (one
+                        // token), so batch and sequential are identical.
+                        if (legacyRecur) {
+                            kQ35GdnStepBatch<128><<<nVHeads, 128, 0, g_stream>>>(
+                                    s.qN, s.kN, s.vN, betaRow, gateRow, q35GdnState,
+                                    gdnRow, nVHeads, invSqrtV);
+                        } else {
+                            kQ35GdnStepBatch<128><<<nVHeads, 128, 0, g_stream>>>(
+                                    s.qN, s.kN, s.vN, betaRow, gateRow, q35GdnState,
+                                    gdnRow, nVHeads, invSqrtV);
+                        }
+                    }
+                }
+                // TINYCODER_DUMP_RECUR=1: row-by-row recurrent intermediates at
+                {
+                    static const bool tprof =
+                            std::getenv("TINYCODER_TRUNK_PROF") != nullptr;
+                    if (tprof) {
+                        cudaEventRecord(gGdnEv1, g_stream);
+                        cudaEventSynchronize(gGdnEv1);
+                        float ms = 0.0f;
+                        cudaEventElapsedTime(&ms, gGdnEv0, gGdnEv1);
+                        gGdnMsTotal += ms;
+                        std::fprintf(stderr,
+                                     "[trunk] L=%u gdn=%.2fms seqLen=%u\n",
+                                     L, ms, seqLen);
+                    }
+                }
+                // L0 (convOut / qN / gdnOut) for chunk-scan vs per-token A/B.
+                if (L == 0 && std::getenv("TINYCODER_DUMP_RECUR") != nullptr) {
+                    static int dbg = 0;
+                    if (dbg < 1) {
+                        ++dbg;
+                        cudaStreamSynchronize(g_stream);
+                        const uint32_t rows = std::min(seqLen, 4u);
+                        for (uint32_t r = 0; r < rows; ++r) {
+                            float c0[3], q0[3], g0[3];
+                            cudaMemcpy(c0, s.convOut + static_cast<size_t>(r) * convChannels,
+                                       3 * sizeof(float), cudaMemcpyDeviceToHost);
+                            cudaMemcpy(q0, s.qN + static_cast<size_t>(r) * nVHeads * headK,
+                                       3 * sizeof(float), cudaMemcpyDeviceToHost);
+                            cudaMemcpy(g0, s.gdnOut + static_cast<size_t>(r) * valueDim,
+                                       3 * sizeof(float), cudaMemcpyDeviceToHost);
+                            std::fprintf(stderr,
+                                         "[recur] L0 row=%u conv={%.6f %.6f "
+                                         "%.6f} qN={%.6f %.6f %.6f} gdn={%.6f "
+                                         "%.6f %.6f}\n",
+                                         r, c0[0], c0[1], c0[2], q0[0], q0[1],
+                                         q0[2], g0[0], g0[1], g0[2]);
+                        }
+                    }
+                }
+                kQ35GatedRmsNormHeads<<<dim3(seqLen, nVHeads), 128, 0, g_stream>>>(
                         s.q35z, s.gdnOut, w.ssmNorm, headV, nVHeads, seqLen);
                 if (!gemv(w.ssmOut, s.gdnOut, s.attnProj, H, valueDim,
                           "ssmOut")) {
                     return false;
+                }
+                if (L == 0 && std::getenv("TINYCODER_DUMP_RECUR") != nullptr) {
+                    static int dbg2 = 0;
+                    if (dbg2 < 1) {
+                        ++dbg2;
+                        cudaStreamSynchronize(g_stream);
+                        const uint32_t rows = std::min(seqLen, 4u);
+                        for (uint32_t r = 0; r < rows; ++r) {
+                            float a0[3];
+                            cudaMemcpy(a0, s.attnProj + static_cast<size_t>(r) * H,
+                                       3 * sizeof(float), cudaMemcpyDeviceToHost);
+                            std::fprintf(stderr,
+                                         "[attnproj] L0 row=%u {%.6f %.6f %.6f}\n",
+                                         r, a0[0], a0[1], a0[2]);
+                        }
+                    }
                 }
                 // TINYCODER_DUMP_NORM=1: dump GPU L0 token-0 gdnOut (post
                 // gated-RMSNorm × silu(z)) and attnProj (post ssmOut) to bisect
@@ -435,6 +1296,21 @@ namespace tinycoder::gpu {
                                cudaMemcpyDeviceToHost);
                     cudaMemcpy(p0, s.attnProj, 5 * sizeof(float),
                                cudaMemcpyDeviceToHost);
+                    if (seqLen > 1) {
+                        const size_t last =
+                                static_cast<size_t>(seqLen - 1) * valueDim;
+                        float gl[5], pl[5];
+                        cudaMemcpy(gl, s.gdnOut + last, 5 * sizeof(float),
+                                   cudaMemcpyDeviceToHost);
+                        cudaMemcpy(pl, s.attnProj + static_cast<size_t>(seqLen - 1) * H,
+                                   5 * sizeof(float), cudaMemcpyDeviceToHost);
+                        std::fprintf(stderr,
+                                     "[gpulast] L0 gdnOut[last]={%.6f %.6f "
+                                     "%.6f %.6f %.6f} attnProj[last]={%.6f "
+                                     "%.6f %.6f %.6f %.6f}\n",
+                                     gl[0], gl[1], gl[2], gl[3], gl[4], pl[0],
+                                     pl[1], pl[2], pl[3], pl[4]);
+                    }
                     std::fprintf(stderr,
                                  "[gpuout] L0 gdnOut[0..4]={%.6f %.6f %.6f "
                                  "%.6f %.6f} attnProj[0..4]={%.6f %.6f %.6f "
@@ -450,34 +1326,68 @@ namespace tinycoder::gpu {
                     return false;
                 }
                 // Per-head Q RMSNorm (Q slice) + K RMSNorm.
-                kQ35HeadRmsNorm2<<<seqLen * nHeads, 128, 128 * sizeof(float),
-                                   g_stream>>>(s.q35QGate, s.q, w.attnQNorm, hd,
-                                               2 * hd, seqLen * nHeads);
-                kQ35HeadRmsNorm<<<seqLen * nKV, 128, 128 * sizeof(float),
-                                  g_stream>>>(s.k, s.k, w.attnKNorm, hd,
-                                              seqLen * nKV);
-                // MRoPE on Q and K.
-                kQ35MRoPE<<<dim3(seqLen, nHeads), 32, 0, g_stream>>>(
-                        s.q, seqLen, nHeads, hd, nDims, pos, mropeCos_, mropeSin_);
-                kQ35MRoPE<<<dim3(seqLen, nKV), 32, 0, g_stream>>>(
-                        s.k, seqLen, nKV, hd, nDims, pos, mropeCos_, mropeSin_);
+                // Fused q/k RMSNorm + partial MRoPE (one kernel each).
+                kQ35QNormRoPE<<<dim3(seqLen, nHeads), 128,
+                                128 * sizeof(float), g_stream>>>(
+                        s.q35QGate, s.q, w.attnQNorm, hd, nDims, nHeads, seqLen,
+                        pos, nullptr, mropeCos_, mropeSin_);
+                kQ35KNormRoPE<<<dim3(seqLen, nKV), 128, 128 * sizeof(float),
+                                g_stream>>>(s.k, w.attnKNorm, hd, nDims, nKV,
+                                            seqLen, pos, nullptr, mropeCos_,
+                                            mropeSin_);
                 // Store K/V into the layer's KV cache.
                 // Full-attention layer; the KV cache is slotted by
                 // floor(L/interval) (recurrent layers get no slot) — see
                 // kvLayerOffset().  qwen35 stores fp32 KV (kvHalf_ is dense-only).
                 float *kvK = reinterpret_cast<float *>(
-                                     static_cast<uint8_t *>(kvK_) + kvLayerOffset(L));
+                        static_cast<uint8_t *>(kvK_) + kvLayerOffset(L));
                 float *kvV = reinterpret_cast<float *>(
-                                     static_cast<uint8_t *>(kvV_) + kvLayerOffset(L));
+                        static_cast<uint8_t *>(kvV_) + kvLayerOffset(L));
                 kQ35StoreKV<<<seqLen, 256, 0, g_stream>>>(s.k, s.v, kvK, kvV,
-                                                          seqLen, nKV, hd, pos);
+                                                          seqLen, nKV, hd, pos, nullptr);
                 // Flash attention (warp per (token, q-head), HD=256).
                 const float invSqrtA = 1.0f / std::sqrt(static_cast<float>(hd));
                 dim3 blk(32, 4);
-                kQ35WarpAttention<256><<<dim3(seqLen, (nHeads + 3) / 4), blk, 0,
-                                         g_stream>>>(s.q, kvK, kvV, s.attnOut,
-                                                     seqLen, nHeads, nKV, pos,
-                                                     invSqrtA);
+                const char *asEnv = std::getenv("TINYCODER_ATTN_SPLIT");
+                const bool splitAttn =
+                        seqLen == 1 && attnPartialAcc_ != nullptr &&
+                        attnChunks_ > 1 &&
+                        (asEnv == nullptr || asEnv[0] == '\0' || asEnv[0] != '0');
+                if (splitAttn) {
+                    kWarpAttentionSplit<256, float, 1>
+                            <<<dim3(1, attnChunks_, nHeads), dim3(32, 1), 0,
+                               g_stream>>>(s.q, kvK, kvV, attnPartialAcc_,
+                                           attnPartialM_, attnPartialL_, 1,
+                                           nHeads, nKV, pos, attnChunks_,
+                                           attnChunk_, invSqrtA);
+                    kAttnCombinePartial<256>
+                            <<<dim3(1, nHeads), 32, 0, g_stream>>>(
+                                    attnPartialAcc_, attnPartialM_,
+                                    attnPartialL_, s.attnOut, 1, nHeads,
+                                    attnChunks_);
+                } else {
+                    // TINYCODER_ATTN_MMA=1: block owns all heads of one
+                    // token, K/V row staged once in shared memory.  Bit-
+                    // identical math per head, 8x less global K/V traffic.
+                    static const bool attnShared = [] {
+                        const char *e = std::getenv("TINYCODER_ATTN_MMA");
+                        return e != nullptr && e[0] != '0';
+                    }();
+                    if (attnShared && seqLen > 1) {
+                        constexpr uint32_t kW = 8;
+                        const uint32_t smem = 2 * 256 * sizeof(float);
+                        kQ35PrefillAttnSharedKV<256, kW>
+                                <<<dim3(seqLen, (nHeads + kW - 1) / kW),
+                                   dim3(32, kW), smem, g_stream>>>(
+                                        s.q, kvK, kvV, s.attnOut, seqLen, nHeads,
+                                        nKV, pos, nullptr, invSqrtA);
+                    } else {
+                        kQ35WarpAttention<256><<<dim3(seqLen, (nHeads + 3) / 4), blk,
+                                                 0, g_stream>>>(
+                                s.q, kvK, kvV, s.attnOut, seqLen, nHeads, nKV, pos,
+                                nullptr, invSqrtA);
+                    }
+                }
                 // attnOut *= sigmoid(gate).
                 kQ35SigmoidGate<<<seqLen, 256, 0, g_stream>>>(
                         s.attnOut, s.q35QGate, seqLen, nHeads, hd);
@@ -501,7 +1411,7 @@ namespace tinycoder::gpu {
                     cudaMemcpy(h0, s.hidden, 8 * sizeof(float),
                                cudaMemcpyDeviceToHost);
                     double hsum = 0.0;
-                    for (int i = 0; i < 2048; ++i) {
+                    for (uint32_t i = 0; i < H; ++i) {
                         float t;
                         cudaMemcpy(&t, s.hidden + i, sizeof(float),
                                    cudaMemcpyDeviceToHost);
@@ -638,18 +1548,35 @@ namespace tinycoder::gpu {
                         return false;
                     }
                 }
-                // 3) Blocking sync: this layer's norm D2H is complete and the
-                //    step-2 shared-expert kernels (reading s.norm) have
-                //    finished.  The CPU callback now sees the exact norm.
+                // 3) Wait ONLY for this layer's norm D2H, not for the
+                //    shared-expert kernels queued behind it (2026-11-04): the
+                //    callback just needs the norm, so an event on the copy
+                //    lets the GPU run the shared expert while the CPU routes
+                //    -- the two used to serialize, costing ~7 ms/token.
                 if (moeTr) {
+                    static cudaEvent_t normEv = nullptr;
+                    if (normEv == nullptr) {
+                        cudaEventCreateWithFlags(&normEv,
+                                                 cudaEventDisableTiming);
+                    }
+                    cudaEventRecord(normEv, g_stream);
                     auto tSync0 = std::chrono::steady_clock::now();
-                    cudaStreamSynchronize(g_stream);
+                    cudaEventSynchronize(normEv);
                     syncWaitMs += std::chrono::duration<double, std::milli>(
                                           std::chrono::steady_clock::now() -
                                           tSync0)
                                           .count();
                 } else {
-                    cudaStreamSynchronize(g_stream);
+                    // Wait ONLY for the norm D2H (an event on the copy), never
+                    // for the whole stream: a full synchronise also waits for
+                    // the shared-expert kernels queued above, which defeats the
+                    // intended shexp/router overlap and idles the GPU for the
+                    // entire ~7 ms/token CPU router.
+                    static cudaEvent_t normEv2 = nullptr;
+                    if (normEv2 == nullptr)
+                        cudaEventCreateWithFlags(&normEv2, cudaEventDisableTiming);
+                    cudaEventRecord(normEv2, g_stream);
+                    cudaEventSynchronize(normEv2);
                 }
                 // TINYCODER_DUMP_NORM=1: verify the D2H mirror the CPU router
                 // is about to read equals a FRESH device read of s.norm at the
@@ -727,7 +1654,82 @@ namespace tinycoder::gpu {
                 //    routed experts (fallback), dispatched inside the callback
                 //    on expertCacheBuilt().  While it runs, the GPU is idle (no
                 //    L+1 work is enqueued yet), so nothing races device state.
-                if (moeTr) {
+                // GPU router (TINYCODER_GPU_ROUTER=1): the same selection as
+                // computeQwen35MoERouterOnly, executed on the device.  Removes
+                // the 295 ms/512-token (7.2 ms/layer) CPU routing cost that the
+                // shared expert cannot hide.
+                // Default ON: measured on the 35B, pp512 180.0 -> 199.3
+                // (+10.7%) and tg128 22.74 -> 23.25 (+2.2%).  Prefill and
+                // decode run the SAME kernels, so batch and sequential
+                // selection stay identical to each other; only the accumulation
+                // order differs from the CPU reference (TINYCODER_GPU_ROUTER=0
+                // restores the exact CPU router).
+                static const bool gpuRouter = [] {
+                    const char *e = std::getenv("TINYCODER_GPU_ROUTER");
+                    return e == nullptr || e[0] != '0';
+                }();
+                bool routerDone = false;
+                if (gpuRouter && moeCpuFn_ != nullptr && expertCacheBuilt_ &&
+                    !residentOn && w.ffnGateInpMoe.q != nullptr &&
+                    w.ffnGateInpMoe.type == kTypeF32 && expertCount_ > 0 &&
+                    expertCount_ <= 256 && expertUsed_ > 0) {
+                    const size_t nEl =
+                            static_cast<size_t>(seqLen) * expertUsed_;
+                    const uint64_t need =
+                            static_cast<uint64_t>(nEl) *
+                                    (sizeof(int32_t) + sizeof(float)) +
+                            static_cast<uint64_t>(seqLen) * expertCount_ *
+                                    sizeof(float);
+                    if (moeRouterDev_ == nullptr ||
+                        moeRouterDevBytes_ < need) {
+                        if (moeRouterDev_) cudaFree(moeRouterDev_);
+                        moeRouterDev_ = nullptr;
+                        moeRouterDevBytes_ = 0;
+                        if (cudaMalloc(&moeRouterDev_,
+                                       static_cast<size_t>(need)) ==
+                            cudaSuccess) {
+                            moeRouterDevBytes_ = need;
+                        }
+                    }
+                    if (moeRouterDev_ != nullptr) {
+                        int32_t *idxD = static_cast<int32_t *>(moeRouterDev_);
+                        float *wgtD = reinterpret_cast<float *>(idxD + nEl);
+                        float *logitD = wgtD + nEl;
+                        const uint32_t nLog =
+                                seqLen * static_cast<uint32_t>(expertCount_);
+                        kQ35MoeRouterLogits<<<(nLog + 7) / 8, 256, 0,
+                                              g_stream>>>(
+                                s.norm,
+                                static_cast<const float *>(w.ffnGateInpMoe.q),
+                                logitD, H, expertCount_, nLog);
+                        kQ35MoeRouterSelect<<<seqLen, 32,
+                                              expertCount_ * sizeof(float),
+                                              g_stream>>>(
+                                logitD, idxD, wgtD, expertCount_,
+                                expertUsed_);
+                        moeRouterIdxHost_.resize(nEl);
+                        moeRouterWgtHost_.resize(nEl);
+                        cudaMemcpyAsync(moeRouterIdxHost_.data(), idxD,
+                                        nEl * sizeof(int32_t),
+                                        cudaMemcpyDeviceToHost, g_stream);
+                        cudaMemcpyAsync(moeRouterWgtHost_.data(), wgtD,
+                                        nEl * sizeof(float),
+                                        cudaMemcpyDeviceToHost, g_stream);
+                        // Wait for the two table copies only -- a full stream
+                        // synchronise also drains the shared-expert kernels and
+                        // costs ~4 ms/token at decode.
+                        static cudaEvent_t routerEv = nullptr;
+                        if (routerEv == nullptr)
+                            cudaEventCreateWithFlags(&routerEv,
+                                                     cudaEventDisableTiming);
+                        cudaEventRecord(routerEv, g_stream);
+                        cudaEventSynchronize(routerEv);
+                        routerDone = true;
+                    }
+                }
+                if (routerDone) {
+                    // routing tables already in the host mirrors
+                } else if (moeTr) {
                     auto tRouter0 = std::chrono::steady_clock::now();
                     const bool rOk = moeCpuFn_(L, moeNormHost_[buf].data(),
                                                moeFfnOutHost_[buf].data(),
@@ -818,7 +1820,35 @@ namespace tinycoder::gpu {
                     // expert + residual are added below (shared steps 2/6).
                     goto moeAddShared;
                 } else if (expertCacheBuilt_ && !forceMoeFallback) {
+                    // PREFILL (2026-11-09): use the full-layer direct-mapped
+                    // arena instead of the 2-way cache.  A 512-token prefill
+                    // touches ~all experts of the layer, which the 64-slot
+                    // 2-way cache cannot hold -> ~2.7x re-reads (51.2 GB for a
+                    // 20.2 GB model).  The arena holds every expert of ONE
+                    // layer and is invalidated per layer, so each expert is
+                    // filled exactly once and the traffic equals the distinct
+                    // expert bytes.
+                    // TINYCODER_ARENA_OFF=1 forces the 2-way cache path even
+                    // for prefill (A/B and parity bisection tool).
+                    static const bool arenaEnabled =
+                            std::getenv("TINYCODER_ARENA_OFF") == nullptr;
+                    const bool useArena = seqLen > 1 && arenaEnabled;
+                    if (useArena) beginExpertArenaEpoch();
                     auto cacheStat = [&](uint32_t ee) {
+                        if (useArena) {
+                            const bool aHit =
+                                    useArena &&
+                                    ee < expertArenaStamp_.size() &&
+                                    expertArenaStamp_[ee] == expertArenaEpoch_;
+                            if (aHit) {
+                                ++cacheHits;
+                            } else {
+                                ++cacheMisses;
+                                cacheMissBytes +=
+                                        2 * layGateSliceB(L) + layDownSliceB(L);
+                            }
+                            return;
+                        }
                         const uint32_t cset = expertCacheSet(ee);
                         const bool hit =
                                 (expertCacheTag_[L][cset][0] == static_cast<int32_t>(ee)) ||
@@ -881,7 +1911,252 @@ namespace tinycoder::gpu {
                             (std::getenv("TINYCODER_MOE_SLOW") == nullptr);
                     // Q8_0-expert decode fast path (batched Q8_0xQ8K kernels):
                     // entered only when THIS layer's gate/up experts are Q8_0.
-                    if (seqLen == 1 && gTypeL == kTypeQ8_0 && moeFastPath) {
+                    // ---- GROUPED PREFILL (2026-11-10) --------------------
+                    // The generic prefill ran THREE GEMV launches per
+                    // (token, rank): 512 tokens x 8 ranks x 41 layers ~= 500k
+                    // launches per prompt, and with the layer arena now hiding
+                    // PCIe that launch cost was the whole prefill (measured:
+                    // DMA-free run 92.2 pp512 vs 91.2 with DMA).  Here the
+                    // (token, rank) pairs of the entire layer are flattened into
+                    // ONE batch axis: gate+up in a single launch, then SwiGLU,
+                    // down-input quantize, down in a second launch, and one
+                    // accumulation kernel over tokens.
+                    // The grouped int8-MMA pipeline rounds the expert
+                    // projections through the Q8_1 tensor-core path instead of
+                    // the bit-exact fp32 GEMV, so TINYCODER_MOE_EXACT=1 keeps
+                    // the exact per-pair path (CPU/batch parity) at ~2/3 the
+                    // prefill speed.
+                    static const bool moeExact =
+                            std::getenv("TINYCODER_MOE_EXACT") != nullptr;
+                    const bool groupedPrefill =
+                            useArena && !moeExact &&
+                            ((gTypeL == kTypeQ4K || gTypeL == kTypeQ6K) &&
+                             (dTypeL == kTypeQ4K || dTypeL == kTypeQ6K));
+                    if (groupedPrefill) {
+                        const uint32_t pairs = seqLen * expertUsed;
+                        const uint64_t needGU =
+                                static_cast<uint64_t>(pairs) * expertFF_ *
+                                sizeof(float);
+                        const uint64_t needDownP =
+                                static_cast<uint64_t>(pairs) * H * sizeof(float);
+                        const uint64_t needDownQ =
+                                static_cast<uint64_t>(pairs) * dBlocks *
+                                kQ8K_STRIDE;
+                        const uint64_t needX8 =
+                                static_cast<uint64_t>(seqLen) * gBlocks *
+                                kQ8K_STRIDE;
+                        const uint64_t needWq = static_cast<uint64_t>(pairs) * 3 *
+                                                sizeof(const uint8_t *);
+                        auto grow = [&](void **buf, uint64_t &cap,
+                                        uint64_t need, std::string &err) -> bool {
+                            if (*buf != nullptr && cap >= need) return true;
+                            if (*buf) cudaFree(*buf);
+                            *buf = nullptr;
+                            cap = 0;
+                            cudaError_t eR = cudaMalloc(buf,
+                                                        static_cast<size_t>(need));
+                            if (eR != cudaSuccess) {
+                                err = std::string("cudaMalloc(prefill moe): ") +
+                                      cudaGetErrorString(eR);
+                                return false;
+                            }
+                            cap = need;
+                            return true;
+                        };
+                        std::string ge;
+                        if (!grow(reinterpret_cast<void **>(&moePreGateUp_),
+                                  moePreGateUpBytes_, needGU, ge) ||
+                            !grow(reinterpret_cast<void **>(&moePreGateUp2_),
+                                  moePreGateUp2Bytes_, needGU, ge) ||
+                            !grow(reinterpret_cast<void **>(&moePreDown_),
+                                  moePreDownBytes_, needDownP, ge) ||
+                            !grow(reinterpret_cast<void **>(&moePreDownQ8_),
+                                  moePreDownQ8Bytes_, needDownQ, ge) ||
+                            !grow(reinterpret_cast<void **>(&moePreX8_),
+                                  moePreX8Bytes_, needX8, ge) ||
+                            !grow(reinterpret_cast<void **>(&moePreWq_),
+                                  moePreWqBytes_, needWq, ge) ||
+                            !grow(reinterpret_cast<void **>(&moePreGu_),
+                                  moePreGuBytes_, needGU, ge) ||
+                            !grow(reinterpret_cast<void **>(&moePreXg_),
+                                  moePreXgBytes_,
+                                  needDownP + static_cast<uint64_t>(16) * H *
+                                                      sizeof(float),
+                                  ge) ||
+                            !grow(reinterpret_cast<void **>(&moePreTok_),
+                                  moePreTokBytes_,
+                                  static_cast<uint64_t>(pairs) * sizeof(int32_t),
+                                  ge) ||
+                            !grow(reinterpret_cast<void **>(&moePreRanked_),
+                                  moePreRankedBytes_,
+                                  static_cast<uint64_t>(pairs) * sizeof(int32_t),
+                                  ge) ||
+                            !grow(reinterpret_cast<void **>(&moePreStart_),
+                                  moePreStartBytes_,
+                                  static_cast<uint64_t>(expertCount_ + 1) *
+                                          sizeof(int32_t),
+                                  ge)) {
+                            errMsg = "qwen35moe grouped prefill: " + ge;
+                            return false;
+                        }
+                        if (moePreEv_ == nullptr)
+                            cudaEventCreateWithFlags(&moePreEv_,
+                                                     cudaEventDisableTiming);
+                        // ---- Order the (token, rank) pairs by expert ------
+                        // int8Gemm takes an M-slab, so an expert's pairs must
+                        // be CONTIGUOUS.  Sorted order also makes the weight
+                        // table per-expert monotone (the arena slot of expert e
+                        // is reused for all of its tokens instead of being
+                        // re-read per pair).
+                        static thread_local std::vector<uint32_t> cnt;
+                        static thread_local std::vector<uint32_t> start;
+                        static thread_local std::vector<int32_t> order;
+                        static thread_local std::vector<const uint8_t *> wqS;
+                        cnt.assign(expertCount_, 0);
+                        for (uint32_t q = 0; q < pairs; ++q) {
+                            const int32_t eq = moeRouterIdxHost_.data()[q];
+                            if (eq < 0 || eq >= static_cast<int32_t>(expertCount_)) {
+                                errMsg = "qwen35moe grouped prefill: bad expert id";
+                                return false;
+                            }
+                            ++cnt[static_cast<uint32_t>(eq)];
+                        }
+                        start.assign(expertCount_ + 1, 0);
+                        for (uint32_t e = 0; e < expertCount_; ++e)
+                            start[e + 1] = start[e] + cnt[e];
+                        order.assign(pairs, 0);
+                        {
+                            std::vector<uint32_t> fill(expertCount_, 0);
+                            for (uint32_t q = 0; q < pairs; ++q) {
+                                const uint32_t eq = static_cast<uint32_t>(
+                                        moeRouterIdxHost_.data()[q]);
+                                order[start[eq] + fill[eq]++] =
+                                        static_cast<int32_t>(q);
+                            }
+                        }
+                        static thread_local std::vector<int32_t> tokIdx;
+                        static thread_local std::vector<int32_t> rankedIdx;
+                        tokIdx.assign(pairs, 0);
+                        rankedIdx.assign(pairs, 0);
+                        wqS.clear();
+                        wqS.reserve(pairs * 3);
+                        std::string cErrG;
+                        for (uint32_t pp = 0; pp < pairs; ++pp) {
+                            const int32_t q = order[pp];
+                            const uint32_t sTok =
+                                    static_cast<uint32_t>(q) / expertUsed;
+                            const uint32_t rnk =
+                                    static_cast<uint32_t>(q) % expertUsed;
+                            tokIdx[pp] = static_cast<int32_t>(sTok);
+                            rankedIdx[pp] = static_cast<int32_t>(sTok * expertUsed +
+                                                                 rnk);
+                            const uint32_t eq = static_cast<uint32_t>(
+                                    moeRouterIdxHost_.data()[q]);
+                            const uint8_t *downQ = nullptr;
+                            const uint8_t *base = ensureExpertArenaCached(
+                                    L, eq, cErrG, &downQ);
+                            if (base == nullptr) {
+                                errMsg = "qwen35moe grouped prefill: " + cErrG;
+                                return false;
+                            }
+                            wqS.push_back(base);
+                            wqS.push_back(
+                                    base + static_cast<uint64_t>(expertFF_) *
+                                                   layGateRowBytes(L));
+                            wqS.push_back(downQ);
+                        }
+                        cudaMemcpyAsync(moePreWq_, wqS.data(), needWq,
+                                        cudaMemcpyHostToDevice, g_stream);
+                        cudaMemcpyAsync(moePreTok_, tokIdx.data(),
+                                        static_cast<size_t>(pairs) *
+                                                sizeof(int32_t),
+                                        cudaMemcpyHostToDevice, g_stream);
+                        cudaMemcpyAsync(moePreRanked_, rankedIdx.data(),
+                                        static_cast<size_t>(pairs) *
+                                                sizeof(int32_t),
+                                        cudaMemcpyHostToDevice, g_stream);
+                        // No global fill fence: each expert's gate/up GEMM
+                        // waits only on ITS OWN fill event below, so the DMA
+                        // of later experts overlaps the computation of
+                        // earlier ones (the fills were enqueued in sorted
+                        // order, i.e. the consumption order).
+                        const uint8_t *const *wqTable =
+                                reinterpret_cast<const uint8_t *const *>(
+                                        moePreWq_);
+                        // One gather launch covers the whole layer.
+                        kMoeGatherRows<<<dim3((H + 255) / 256, pairs), 256, 0,
+                                         g_stream>>>(s.norm, moePreTok_,
+                                                     moePreXg_, H);
+                        // ---- Per-expert int8 tensor-core GEMM -------------
+                        // The expert's `cnt` activation rows are contiguous in
+                        // moePreXg_, so gate+up is ONE int8Gemm over a
+                        // 2*expertFF-row matrix (the arena slot stores gate and
+                        // up back to back) instead of 2 GEMV launches per pair.
+                        const uint32_t nPad = 16;
+                        const uint32_t combinedRows = 2u * expertFF_;
+                        for (uint32_t e = 0; e < expertCount_; ++e) {
+                            const uint32_t n = cnt[e];
+                            if (n == 0) continue;
+                            const uint32_t n8 = n < nPad ? nPad : n;
+                            const uint64_t eBase = start[e];
+                            const uint8_t *gSlice =
+                                    wqS[static_cast<size_t>(eBase) * 3];
+                            waitExpertArenaFill(e);
+                            if (!int8Gemm(
+                                        static_cast<int>(gTypeL), gSlice,
+                                        moePreXg_ + eBase * H, moePreGu_, n8,
+                                        combinedRows, H, H / 256,
+                                        reinterpret_cast<void *>(g_stream))) {
+                                errMsg = "qwen35moe grouped prefill: gate/up "
+                                         "int8Gemm unsupported";
+                                return false;
+                            }
+                            kMoeSwiGLUToPacked<<<
+                                    dim3((expertFF_ + 255) / 256, n8), 256, 0,
+                                    g_stream>>>(moePreGu_,
+                                                moePreGateUp_ + eBase * expertFF_,
+                                                expertFF_);
+                        }
+                        const uint64_t downStrideB =
+                                static_cast<uint64_t>(dBlocks) * kQ8K_STRIDE;
+                        kQuantizeQ8K_Batch<<<dim3(dBlocks, pairs), 256, 0,
+                                             g_stream>>>(moePreGateUp_,
+                                                         moePreDownQ8_, expertFF_,
+                                                         pairs, downStrideB);
+                        // Token-reuse down GEMV: one block per (expert,
+                        // row tile), looping the expert's whole token group so
+                        // its down weights are decoded ONCE per layer instead
+                        // of once per routed token.
+                        cudaMemcpyAsync(moePreStart_, start.data(),
+                                        static_cast<size_t>(expertCount_ + 1) *
+                                                sizeof(int32_t),
+                                        cudaMemcpyHostToDevice, g_stream);
+                        const dim3 dnGrid((H + 7) / 8, expertCount_);
+                        if (dTypeL == kTypeQ4K)
+                            kQGemvKxQ8K_DownExpert<kTypeQ4K, 4><<<
+                                    dnGrid, dim3(32, 8), 0, g_stream>>>(
+                                    wqTable, moePreDownQ8_, moePreRanked_,
+                                    moePreStart_, moePreDown_, H, dBlocks,
+                                    layDownRowBytes(L),
+                                    static_cast<uint32_t>(downStrideB), H);
+                        else
+                            kQGemvKxQ8K_DownExpert<kTypeQ6K, 4><<<
+                                    dnGrid, dim3(32, 8), 0, g_stream>>>(
+                                    wqTable, moePreDownQ8_, moePreRanked_,
+                                    moePreStart_, moePreDown_, H, dBlocks,
+                                    layDownRowBytes(L),
+                                    static_cast<uint32_t>(downStrideB), H);
+                        kQ35MoeAccumScaledBatchT<<<seqLen, 256, 0, g_stream>>>(
+                                s.moeWgt, expertUsed, moePreDown_,
+                                s.moeExpertOut, H);
+                        for (uint32_t q = 0; q < pairs; ++q) {
+                            const uint32_t cset =
+                                    expertCacheSet(static_cast<uint32_t>(
+                                            moeRouterIdxHost_.data()[q]));
+                            (void) cset;
+                            ++cacheHits;
+                        }
+                    } else if (seqLen == 1 && gTypeL == kTypeQ8_0 && moeFastPath) {
                         const uint64_t needN =
                                 static_cast<uint64_t>(gBlocks) *
                                 kQ8_0x32_STRIDE;
@@ -1077,7 +2352,7 @@ namespace tinycoder::gpu {
                                 cacheBase = gBase;
                                 downQ = gBase + 2 * layGateSliceB(L);
                                 moeMisses.push_back(
-                                        {ue, gBase, victim});
+                                        {ue, cacheBase, victim});
                                 moeMissStage.push_back(
                                         (expertStageFlag_++) %
                                         kExpertStageBufs);
@@ -1229,6 +2504,29 @@ namespace tinycoder::gpu {
                         }
                     } else
                     moePerRank: {
+                        // ---- Batched decode (2026-11-10) -------------------
+                        // Decode is host-launch bound: ~2300 launches/token
+                        // cost more than the 2.4 ms of GPU work they queue.
+                        // For seqLen == 1 the per-rank down GEMVs and the
+                        // per-rank accumulation are replaced by ONE batched
+                        // down GEMV (all ranks, one per-rank weight table)
+                        // plus ONE batched accumulation.  The gate/up GEMVs
+                        // stay per rank (fused dual) but now write into
+                        // per-rank slabs so the down stage can consume them
+                        // as one 8-row activation matrix.
+                        const bool decBatch =
+                                seqLen == 1 && expertCacheBuilt_ &&
+                                (gTypeL == kTypeQ4K || gTypeL == kTypeQ6K) &&
+                                (dTypeL == kTypeQ4K || dTypeL == kTypeQ6K) &&
+                                // OPT-IN ONLY: measured 11.45 tg128 vs 20.32
+                                // for the per-rank path, so the batched
+                                // variant is not a win as written (the
+                                // per-rank kernel grid is already wide enough;
+                                // the extra per-rank slabs cost more than the
+                                // saved launches).  Kept for further work.
+                                std::getenv("TINYCODER_DECODE_BATCH") != nullptr;
+                        std::vector<const uint8_t *> decDown;
+                        if (decBatch) decDown.reserve(expertUsed);
                         for (uint32_t r = 0; r < expertUsed; ++r) {
                             const int32_t *row = moeRouterIdxHost_.data() + r;
                             // Same-expert fast path: the whole batch selected the
@@ -1247,7 +2545,11 @@ namespace tinycoder::gpu {
                                 std::string cErr;
                                 const uint8_t *downQ = nullptr;
                                 const uint8_t *cacheBase =
-                                        ensureExpertCached(L, e, cErr, &downQ);
+                                        useArena ? ensureExpertArenaCached(
+                                                           L, e, cErr, &downQ)
+                                                 : ensureExpertCached(
+                                                           L, e, cErr, &downQ);
+                                if (useArena) waitExpertArenaFill(e);
                                 if (cacheBase == nullptr) {
                                     errMsg = "qwen35moe expert cache miss: " + cErr;
                                     return false;
@@ -1353,19 +2655,55 @@ namespace tinycoder::gpu {
                                                     gd[0], gd[1], gd[2], gd[3]);
                                         }
                                     }
-                                } else if (!gemv(gExps, s.norm, s.moeGateUp, expertFF,
-                                                 H, "ffnGateExps") ||
-                                           !gemv(uExps, s.norm, s.moeGateUp2,
-                                                 expertFF, H, "ffnUpExps")) {
-                                    return false;
                                 } else {
-                                    kSiluMul<<<(seqLen * expertFF + 255) / 256, 256,
-                                               0, g_stream>>>(
-                                            s.moeGateUp, s.moeGateUp2,
-                                            seqLen * expertFF);
-                                    if (!gemv(dExps, s.moeGateUp, s.moeDown, H,
-                                              expertFF, "ffnDownExpsMoe")) {
-                                        return false;
+                                    // Decode is HOST-LAUNCH bound (measured:
+                                    // 22.4 ms of a 38.6 ms MoE block at
+                                    // seqLen=1 is host enqueue for ~2300
+                                    // launches per token, with only 2.4 ms of
+                                    // GPU work).  Fuse gate+up into ONE
+                                    // launch: a single Q8_1 activation
+                                    // quantize feeds both dots and the SwiGLU
+                                    // is applied in the same kernel, cutting
+                                    // three launches per rank.
+                                    float *guRow = s.moeGateUp;
+                                    float *upRow2 = s.moeGateUp2;
+                                    if (decBatch) {
+                                        guRow = moePreGateUp_ +
+                                                static_cast<size_t>(r) * expertFF;
+                                        upRow2 = moePreGateUp2_ +
+                                                 static_cast<size_t>(r) * expertFF;
+                                    }
+                                    bool guFused = false;
+                                    if (seqLen == 1 && gTypeL == kTypeQ4K) {
+                                        guFused = int8GemvDualQ4K(
+                                                gExps.q, uExps.q, s.norm, guRow,
+                                                upRow2, expertFF, H,
+                                                reinterpret_cast<void *>(
+                                                        g_stream));
+                                    }
+                                    if (!guFused) {
+                                        if (!gemv(gExps, s.norm, guRow,
+                                                  expertFF, H, "ffnGateExps") ||
+                                            !gemv(uExps, s.norm, upRow2,
+                                                  expertFF, H, "ffnUpExps")) {
+                                            return false;
+                                        }
+                                        if (!decBatch) {
+                                            kSiluMul<<<(seqLen * expertFF + 255) /
+                                                               256,
+                                                       256, 0, g_stream>>>(
+                                                    guRow, upRow2,
+                                                    seqLen * expertFF);
+                                        }
+                                    }
+                                    if (!decBatch) {
+                                        if (!gemv(dExps, s.moeGateUp, s.moeDown,
+                                                  H, expertFF,
+                                                  "ffnDownExpsMoe")) {
+                                            return false;
+                                        }
+                                    } else {
+                                        decDown.push_back(static_cast<const uint8_t *>(dExps.q));
                                     }
                                 }
                                 // wgt[s*expertUsed + r] via base+offset (kernel
@@ -1385,7 +2723,11 @@ namespace tinycoder::gpu {
                                     std::string cErr;
                                     const uint8_t *downQ = nullptr;
                                     const uint8_t *cacheBase =
-                                            ensureExpertCached(L, ue, cErr, &downQ);
+                                            useArena ? ensureExpertArenaCached(
+                                                               L, ue, cErr, &downQ)
+                                                     : ensureExpertCached(
+                                                               L, ue, cErr, &downQ);
+                                    if (useArena) waitExpertArenaFill(ue);
                                     if (cacheBase == nullptr) {
                                         errMsg = "qwen35moe expert cache miss: " +
                                                  cErr;
@@ -1427,6 +2769,117 @@ namespace tinycoder::gpu {
                                     kAddScaled1<<<1, 256, 0, g_stream>>>(
                                             g, downRow, outRow, H);
                                 }
+                            }
+                            if (decBatch && !decDown.empty()) {
+                                std::string geS;
+                                auto growD = [](void **buf, uint64_t &cap,
+                                                uint64_t need,
+                                                std::string &err) -> bool {
+                                    if (*buf != nullptr && cap >= need)
+                                        return true;
+                                    if (*buf) cudaFree(*buf);
+                                    *buf = nullptr;
+                                    cap = 0;
+                                    cudaError_t eR =
+                                            cudaMalloc(buf, static_cast<size_t>(need));
+                                    if (eR != cudaSuccess) {
+                                        err = cudaGetErrorString(eR);
+                                        return false;
+                                    }
+                                    cap = need;
+                                    return true;
+                                };
+                                const uint64_t nRf =
+                                        static_cast<uint64_t>(decDown.size()) *
+                                        expertFF * sizeof(float);
+                                if (!growD(reinterpret_cast<void **>(
+                                                   &moePreGateUp_),
+                                           moePreGateUpBytes_, nRf, geS) ||
+                                    !growD(reinterpret_cast<void **>(
+                                                   &moePreGateUp2_),
+                                           moePreGateUp2Bytes_, nRf, geS)) {
+                                    errMsg = "grow(decode gateUp): " + geS;
+                                    return false;
+                                }
+                                // rank r's SwiGLU slab is [r*ff, (r+1)*ff)
+                                if (!growD(reinterpret_cast<void **>(
+                                                   &moePreDownQ8_),
+                                           moePreDownQ8Bytes_,
+                                           static_cast<uint64_t>(decDown.size()) *
+                                                   dBlocks * kQ8K_STRIDE,
+                                           geS)) {
+                                    errMsg = "grow(moePreDownQ8): " + geS;
+                                    return false;
+                                }
+                                if (!growD(reinterpret_cast<void **>(
+                                                   &moePreDown_),
+                                           moePreDownBytes_,
+                                           static_cast<uint64_t>(decDown.size()) *
+                                                   H * sizeof(float),
+                                           geS)) {
+                                    errMsg = "grow(moePreDown): " + geS;
+                                    return false;
+                                }
+                                if (!growD(reinterpret_cast<void **>(&moePreWq_),
+                                           moePreWqBytes_,
+                                           static_cast<uint64_t>(decDown.size()) *
+                                                   3 * sizeof(const uint8_t *),
+                                           geS)) {
+                                    errMsg = "grow(moePreWq): " + geS;
+                                    return false;
+                                }
+                                // SwiGLU over all rank slabs: one launch.
+                                const uint32_t nR =
+                                        static_cast<uint32_t>(decDown.size());
+                                kSiluMul<<<(nR * expertFF + 255) / 256, 256, 0,
+                                           g_stream>>>(moePreGateUp_,
+                                                       moePreGateUp2_,
+                                                       nR * expertFF);
+                                kQuantizeQ8K_Batch<<<dim3(dBlocks, nR), 256, 0,
+                                                     g_stream>>>(
+                                        moePreGateUp_, moePreDownQ8_, expertFF,
+                                        nR,
+                                        static_cast<uint64_t>(dBlocks) *
+                                                kQ8K_STRIDE);
+                                std::vector<const uint8_t *> wqT(3 * nR);
+                                for (uint32_t r = 0; r < nR; ++r) {
+                                    wqT[r * 3 + 2] = decDown[r];
+                                    wqT[r * 3 + 0] = decDown[r];
+                                    wqT[r * 3 + 1] = decDown[r];
+                                }
+                                cudaMemcpyAsync(moePreWq_, wqT.data(),
+                                                static_cast<size_t>(3 * nR) *
+                                                        sizeof(const uint8_t *),
+                                                cudaMemcpyHostToDevice, g_stream);
+                                const uint8_t *const *wqTable =
+                                        reinterpret_cast<const uint8_t *const *>(
+                                                moePreWq_);
+                                if (dTypeL == kTypeQ4K)
+                                    kQGemvKxQ8K_BatchDownR<kTypeQ4K><<<
+                                            dim3((H + 7) / 8, nR), dim3(32, 8), 0,
+                                            g_stream>>>(
+                                            wqTable, moePreDownQ8_, moePreDown_,
+                                            nullptr, H, dBlocks,
+                                            layDownRowBytes(L),
+                                            static_cast<uint32_t>(dBlocks) *
+                                                    kQ8K_STRIDE,
+                                            H);
+                                else
+                                    kQGemvKxQ8K_BatchDownR<kTypeQ6K><<<
+                                            dim3((H + 7) / 8, nR), dim3(32, 8), 0,
+                                            g_stream>>>(
+                                            wqTable, moePreDownQ8_, moePreDown_,
+                                            nullptr, H, dBlocks,
+                                            layDownRowBytes(L),
+                                            static_cast<uint32_t>(dBlocks) *
+                                                    kQ8K_STRIDE,
+                                            H);
+                                // One batched weighted accumulation for all
+                                // ranks (seqLen == 1: single token row).
+                                kQ35MoeAccumScaledBatchT<<<seqLen, 256, 0,
+                                                           g_stream>>>(
+                                        s.moeWgt, nR, moePreDown_,
+                                        s.moeExpertOut, H);
                             }
                         }// end per-rank loop (generic prefill / slow path)
                     }
@@ -2037,7 +3490,44 @@ namespace tinycoder::gpu {
         // on the stream and read once after the loop-completion sync, so the
         // reported ms are the true kernel times.
         const bool stageTrace = std::getenv("TINYCODER_STAGE_TRACE") != nullptr;
-        const bool traceStages = (g_verbose || stageTrace) && seqLen == 1;
+        // Measurement knob only (see kGraphPadNoop): empty chained nodes per
+        // layer, to price a graph node in microseconds.
+        const int nodePad = [] {
+            const char *e = std::getenv("TINYCODER_NODE_PAD");
+            return e != nullptr ? std::atoi(e) : 0;
+        }();
+        // ---- fused (residual +) RMSNorm + Q8_1 decode path ----------------
+        // One launch replaces the residual add and/or RMSNorm PLUS the
+        // per-GEMV activation quantize that every int8Gemv issues, and the
+        // Q/K/V and gate/up GEMVs then read those Q8_1 blocks directly:
+        // 21 -> 15 graph nodes per layer.  The bytes are identical (same
+        // partition, same reduction tree, same Q8_1 math -- see
+        // kResidualNormQ81), so the token stream is unchanged; what is
+        // removed is launches.
+        //
+        // Gated to the shapes the kernel's thread mapping covers
+        // (blockDim 1024, 1024 <= width <= 2048) and away from the Q2_K
+        // fused-QKV path, which has its own 40-byte Q8_1 producer and would
+        // lose that fold.  TINYCODER_FUSE_NORM_Q81=0 restores the separate
+        // launches.
+        static const bool fuseNormQ81 = [] {
+            const char *e = std::getenv("TINYCODER_FUSE_NORM_Q81");
+            return e == nullptr || e[0] == '\0' || e[0] != '0';
+        }();
+        const bool q2kQkvFold =
+                (nGpu > 0) && (layers_[0].attnQ.type == kTypeQ2K) &&
+                (layers_[0].attnK.type == kTypeQ2K) &&
+                (layers_[0].attnV.type == kTypeQ4K);
+        const bool normQ81Path =
+                fuseNormQ81 && seqLen == 1 && (geom_.architecture == 0) &&
+                H >= 1024u && H <= 2048u && (H & 31u) == 0u && !q2kQkvFold &&
+                q8k_ != nullptr &&
+                q8kBytes_ >= static_cast<uint64_t>(H / 32u) * 36u;
+        // The down projection's residual is absorbed by the following layer's
+        // norm; the last GPU layer keeps it inline (nothing follows it before
+        // the final norm).
+        const bool deferDownResid = normQ81Path;
+        const bool traceStages = (g_verbose || stageTrace) && seqLen <= 512 && seqLen >= 1;
         // During graph capture the body must not call ANY host-side CUDA API
         // (cudaEventRecord/cudaStreamSynchronize would be captured or fail);
         // the capture run suppresses the g_verbose event timeline.
@@ -2095,7 +3585,18 @@ namespace tinycoder::gpu {
             // separate-float path; q8k_ is sized by the combine fold guard
             // below (1920 B for this model's 1536-wide rows).
             bool rms1Q81Fold = false;
-            if (seqLen == 1 && qkvDp4a() && fuseQ81Prod() && H == 1536) {
+            if (normQ81Path) {
+                // Residual (the previous layer's ffn_down output, still
+                // un-added by design) + RMSNorm + Q8_1 in ONE launch.  The
+                // Q/K/V GEMVs below then read these Q8_1 blocks instead of
+                // each quantizing the normed row for itself.
+                const float *pendingResid =
+                        (L > 0 && deferDownResid) ? s.ffnOut : nullptr;
+                kResidualNormQ81<<<seqLen, 1024, 1024 * sizeof(float),
+                                   g_stream>>>(
+                        s.hidden, pendingResid, s.norm, w.rmsNormAttn, q8k_, H,
+                        seqLen, 1e-6f);
+            } else if (seqLen == 1 && qkvDp4a() && fuseQ81Prod() && H == 1536) {
                 const uint64_t needQ =
                         static_cast<uint64_t>(H / 32u) * kQ8_1_STRIDE;
                 if (q8k_ != nullptr && q8kBytes_ >= needQ) {
@@ -2106,7 +3607,7 @@ namespace tinycoder::gpu {
                     rms1Q81Fold = true;
                 }
             }
-            if (!rms1Q81Fold) {
+            if (!rms1Q81Fold && !normQ81Path) {
                 kRMSNormRow<<<seqLen, 1024, 1024 * sizeof(float), g_stream>>>(
                         s.hidden, s.norm, w.rmsNormAttn, H, seqLen, 1e-6f);
             }
@@ -2133,6 +3634,7 @@ namespace tinycoder::gpu {
                 const char *fqkvE = std::getenv("TINYCODER_FUSE_QKV");
                 const bool fuseQKV = fuseQK && w.attnV.type == kTypeQ4K &&
                                      (fqkvE == nullptr || fqkvE[0] != '0');
+                bool vLaunched = fuseQKV;
                 if (fuseQKV) {
                     const uint32_t nQBlocks =
                             (qRows + w.attnV.rows + 7) / 8;
@@ -2158,14 +3660,39 @@ namespace tinycoder::gpu {
                             w.attnK.rowBytes, w.attnQ.blocksPerRow,
                             w.attnK.blocksPerRow);
                 } else {
-                    launchQGemv(w.attnQ.type, w.attnQ.q, s.norm, s.q,
-                                w.attnQ.rows, w.attnQ.cols, w.attnQ.rowBytes,
-                                w.attnQ.blocksPerRow, q8k_, q8kBytes_);
-                    launchQGemv(w.attnK.type, w.attnK.q, s.norm, s.k,
-                                w.attnK.rows, w.attnK.cols, w.attnK.rowBytes,
-                                w.attnK.blocksPerRow, q8k_, q8kBytes_);
+                    // Q/K/V all read the SAME activation row, so when the norm
+                    // already emitted its Q8_1 blocks (normQ81Path) each GEMV
+                    // runs straight off them: three launches instead of six.
+                    // Per-GEMV fallback keeps every other matrix/shape on
+                    // launchQGemv.
+                    bool qkvQ81 = false;
+                    if (normQ81Path) {
+                        const bool qo = launchQGemvQ81(
+                                w.attnQ.type, w.attnQ.q, q8k_, s.q, w.attnQ.rows,
+                                w.attnQ.cols);
+                        const bool ko = launchQGemvQ81(
+                                w.attnK.type, w.attnK.q, q8k_, s.k, w.attnK.rows,
+                                w.attnK.cols);
+                        const bool vo = launchQGemvQ81(
+                                w.attnV.type, w.attnV.q, q8k_, s.v, w.attnV.rows,
+                                w.attnV.cols);
+                        qkvQ81 = qo && ko && vo;
+                    }
+                    if (!qkvQ81) {
+                        launchQGemv(w.attnQ.type, w.attnQ.q, s.norm, s.q,
+                                    w.attnQ.rows, w.attnQ.cols, w.attnQ.rowBytes,
+                                    w.attnQ.blocksPerRow, q8k_, q8kBytes_);
+                        launchQGemv(w.attnK.type, w.attnK.q, s.norm, s.k,
+                                    w.attnK.rows, w.attnK.cols, w.attnK.rowBytes,
+                                    w.attnK.blocksPerRow, q8k_, q8kBytes_);
+                        launchQGemv(w.attnV.type, w.attnV.q, s.norm, s.v,
+                                    w.attnV.rows, w.attnV.cols,
+                                    w.attnV.rowBytes, w.attnV.blocksPerRow, q8k_,
+                                    q8kBytes_);
+                    }
+                    vLaunched = true;
                 }
-                if (!biasesFolded) {
+                if (!biasesFolded && !vLaunched) {
                     launchQGemv(w.attnV.type, w.attnV.q, s.norm, s.v,
                                 w.attnV.rows, w.attnV.cols, w.attnV.rowBytes,
                                 w.attnV.blocksPerRow, q8k_, q8kBytes_);
@@ -2228,19 +3755,11 @@ namespace tinycoder::gpu {
             // Biases (Qwen2): bias is ONE row (qLen/kvLen floats) broadcast
             // across every token — kAddBias, never kAddResidual (which would
             // index the bias array up to seqLen*biasLen and overread it).
-            if (!biasesFolded) {
-                if (w.attnQBias) {
-                    kAddBias<<<seqLen, 256, 0, g_stream>>>(
-                            s.q, w.attnQBias, seqLen, qLen);
-                }
-                if (w.attnKBias) {
-                    kAddBias<<<seqLen, 256, 0, g_stream>>>(
-                            s.k, w.attnKBias, seqLen, kvLen);
-                }
-                if (w.attnVBias) {
-                    kAddBias<<<seqLen, 256, 0, g_stream>>>(
-                            s.v, w.attnVBias, seqLen, kvLen);
-                }
+            if (!biasesFolded &&
+                (w.attnQBias || w.attnKBias || w.attnVBias)) {
+                kAddBias3<<<seqLen, 256, 0, g_stream>>>(
+                        s.q, w.attnQBias, s.k, w.attnKBias, s.v, w.attnVBias,
+                        seqLen, qLen, kvLen);
             }
             if (traceStages && !graphCaptureActive_) {
                 cudaEventRecord(evQKV[L], g_stream);
@@ -2252,10 +3771,20 @@ namespace tinycoder::gpu {
             // value as an argument (capture forbids freeze-framing host
             // values that change every token).  The store + attention kernels
             // are templated on the cache element type (fp16 via TINYCODER_KV16).
-            if (graphCaptureActive_) {
+            // TINYCODER_FUSE_ROPE_KV=0 restores the separate RoPE(Q) and
+            // store-K/V launches.  Fused: one kernel rotates Q AND stores
+            // K(rotated)/V, deleting one graph node per layer (28 on this
+            // model, ~0.83 us each).  Decode-only: gated to seqLen == 1 so
+            // the prefill path is byte-for-byte the code it was.  Both halves
+            // are the same per-element math on disjoint buffers, so the
+            // result is bit-identical (no reduction is reordered).
+            const char *rkE = std::getenv("TINYCODER_FUSE_ROPE_KV");
+            const bool fuseRopeKV =
+                    (seqLen == 1) && (rkE == nullptr || rkE[0] == '\0' || rkE[0] != '0');
+            if (!fuseRopeKV && graphCaptureActive_) {
                 kRoPEQPos<<<seqLen, 128, 0, g_stream>>>(
                         s.q, ropeCos_, ropeSin_, seqLen, nHeads, hd, graphPos_);
-            } else {
+            } else if (!fuseRopeKV) {
                 kRoPEQ<<<seqLen, 128, 0, g_stream>>>(s.q, ropeCos_, ropeSin_, seqLen,
                                                      nHeads, hd, pos);
             }
@@ -2265,6 +3794,35 @@ namespace tinycoder::gpu {
             // nHeads warps (no redundant warps).
             float invSqrt = 1.0f / std::sqrt(static_cast<float>(hd));
             dim3 blk(32, 4);
+            // ---- Materialised prefill attention (cuBLAS fp16 QK^T / PV) ----
+            // The warp-per-token kernel does the two attention GEMMs on the FMA
+            // pipe at ~1.8 TFLOPS; the tensor cores do them at 35-54.  This
+            // path converts Q/K/V to fp16, computes the scores with a cuBLAS
+            // GEMM per q-head, softmaxes them with kAttnSoftmaxCausal, and
+            // multiplies by V with a second GEMM.
+            //
+            // Guards, all of them necessary:
+            //   architecture 0 / HD 128  -- the shape family this was measured
+            //     on (7B and 1.5B qwen2); qwen35 keeps its own kernel
+            //   seqLen in [2, attnGemmCap] -- the score matrix is seqLen^2 PER
+            //     HEAD, so the buffers are only allocated up to the cap
+            //   pos == 0 -- the fp16 K/V twin is built from the rows just
+            //     stored ([0, seqLen)); a continued prefill would need the whole
+            //     history converted, so it keeps the warp kernel
+            //   !kvHalf_ -- this path's conversion assumes the fp32 cache
+            // TINYCODER_PREFILL_ATTN_GEMM=0 restores the warp kernel.
+            static const bool attnGemmEnv = [] {
+                const char *e = std::getenv("TINYCODER_PREFILL_ATTN_GEMM");
+                return e == nullptr || e[0] == '\0' || e[0] != '0';
+            }();
+            const bool attnGemmPath =
+                    attnGemmEnv && (geom_.architecture == 0) && (hd == 128) &&
+                    seqLen > 1 && pos == 0 && !kvHalf_ &&
+                    !graphCaptureActive_ && scratch_.attnScores != nullptr &&
+                    scratch_.attnP16 != nullptr && scratch_.attnQ16 != nullptr &&
+                    scratch_.attnKV16 != nullptr &&
+                    seqLen <= scratch_.attnGemmCap && (nKV > 0) &&
+                    (nHeads % nKV == 0);
             // Split-KV decode attention: batch==1 dense decode only.  The
             // one-warp-per-head kernel leaves 56/68 SMs idle and costs a hard
             // O(cachePos) wall; the split kernel tiles the KV range so every SM
@@ -2306,13 +3864,25 @@ namespace tinycoder::gpu {
         KVT *kK = static_cast<KVT *>(kvK);                                    \
         KVT *kV = static_cast<KVT *>(kvV);                                    \
         if (graphCaptureActive_) {                                            \
-            kStoreKVRopePos<KVT><<<seqLen, 256, 0, g_stream>>>(               \
-                    s.k, s.v, kK, kV, seqLen, nKV, hd, graphPos_, ropeCos_,   \
-                    ropeSin_);                                                \
+            if (fuseRopeKV) {                                                 \
+                kRoPEQStoreKVPos<KVT><<<seqLen, 256, 0, g_stream>>>(          \
+                        s.q, s.k, s.v, kK, kV, seqLen, nHeads, nKV, hd,       \
+                        graphPos_, ropeCos_, ropeSin_);                       \
+            } else {                                                          \
+                kStoreKVRopePos<KVT><<<seqLen, 256, 0, g_stream>>>(           \
+                        s.k, s.v, kK, kV, seqLen, nKV, hd, graphPos_,         \
+                        ropeCos_, ropeSin_);                                  \
+            }                                                                 \
         } else {                                                              \
-            kStoreKVRope<KVT><<<seqLen, 256, 0, g_stream>>>(                  \
-                    s.k, s.v, kK, kV, seqLen, nKV, hd, pos, pos, ropeCos_,    \
-                    ropeSin_);                                                \
+            if (fuseRopeKV) {                                                 \
+                kRoPEQStoreKV<KVT><<<seqLen, 256, 0, g_stream>>>(             \
+                        s.q, s.k, s.v, kK, kV, seqLen, nHeads, nKV, hd, pos,  \
+                        pos, ropeCos_, ropeSin_);                             \
+            } else {                                                          \
+                kStoreKVRope<KVT><<<seqLen, 256, 0, g_stream>>>(              \
+                        s.k, s.v, kK, kV, seqLen, nKV, hd, pos, pos,          \
+                        ropeCos_, ropeSin_);                                  \
+            }                                                                 \
         }                                                                     \
         if (splitAttn) {                                                      \
             launchDecodeAttentionSplit(                                       \
@@ -2322,10 +3892,10 @@ namespace tinycoder::gpu {
                     invSqrt, kvHalf_, combineQ81);                            \
         } else if (graphCaptureActive_) {                                     \
             if (hd == 128)                                                    \
-                kWarpAttentionPos<128, KVT><<<dim3(seqLen, (nHeads + 3) / 4), \
-                                              blk, 0, g_stream>>>(            \
-                        s.q, kK, kV, s.attnOut, seqLen, nHeads, nKV,          \
-                        graphPos_, invSqrt);                                  \
+                kWarpAttention<128, KVT><<<dim3(seqLen, (nHeads + 3) / 4),    \
+                                           blk, 0, g_stream>>>(               \
+                        s.q, kK, kV, s.attnOut, seqLen, nHeads, nKV, pos,     \
+                        invSqrt);                                             \
             else if (hd == 64)                                                \
                 kWarpAttentionPos<64, KVT><<<dim3(seqLen, (nHeads + 3) / 4),  \
                                              blk, 0, g_stream>>>(             \
@@ -2354,7 +3924,97 @@ namespace tinycoder::gpu {
                         invSqrt);                                             \
         }                                                                     \
     } while (0)
-            if (kvHalf_) TC_KV_RUN(__half);
+            if (attnGemmPath) {
+                // RoPE(Q) + store K/V into the fp32 cache -- the same kernels
+                // TC_KV_RUN runs before its attention launch.
+                {
+                    float *kF = static_cast<float *>(kvK);
+                    float *vF = static_cast<float *>(kvV);
+                    if (fuseRopeKV) {
+                        kRoPEQStoreKV<float><<<seqLen, 256, 0, g_stream>>>(
+                                s.q, s.k, s.v, kF, vF, seqLen, nHeads, nKV, hd,
+                                pos, pos, ropeCos_, ropeSin_);
+                    } else {
+                        kStoreKVRope<float><<<seqLen, 256, 0, g_stream>>>(
+                                s.k, s.v, kF, vF, seqLen, nKV, hd, pos, pos,
+                                ropeCos_, ropeSin_);
+                    }
+                    // fp16 twins of Q and of the KV rows just stored.
+                    // Block count follows kF32ToF16's other callers: one
+                    // 256-thread block per 512 ELEMENTS, i.e. one pair per
+                    // thread (blocks = elements/512, not pairs/512).
+                    const uint32_t qElems = seqLen * qLen;
+                    kF32ToF16<<<(qElems + 511u) / 512u, 256, 0, g_stream>>>(
+                            s.q,
+                            reinterpret_cast<__half2 *>(scratch_.attnQ16),
+                            qElems / 2u);
+                    const uint32_t nRows = pos + seqLen;// pos==0: rows [0,seqLen)
+                    const uint32_t kvElems = nRows * kvLen;
+                    __half *k16 = reinterpret_cast<__half *>(scratch_.attnKV16);
+                    __half *v16 = k16 + static_cast<uint64_t>(scratch_.attnGemmCap) * kvLen;
+                    kF32ToF16<<<(kvElems + 511u) / 512u, 256, 0, g_stream>>>(
+                            kF, reinterpret_cast<__half2 *>(k16), kvElems / 2u);
+                    kF32ToF16<<<(kvElems + 511u) / 512u, 256, 0, g_stream>>>(
+                            vF, reinterpret_cast<__half2 *>(v16), kvElems / 2u);
+                }
+                // scores[h][t][k] = scale * (K_h . Q_h^T), computed as a
+                // strided-batched GEMM per KV-head group: A = K_h (same for
+                // every head of the group -> stride 0), B = Q_h.
+                const uint32_t gw = nHeads / nKV;
+                const uint32_t s2 = seqLen * seqLen;
+                __half *q16 = reinterpret_cast<__half *>(scratch_.attnQ16);
+                __half *k16 = reinterpret_cast<__half *>(scratch_.attnKV16);
+                __half *v16 = k16 + static_cast<uint64_t>(scratch_.attnGemmCap) * kvLen;
+                cublasSetStream(g_cublas, g_stream);
+                const float geAlpha = 1.0f, geBeta = 0.0f;
+                for (uint32_t h0 = 0; h0 < nHeads; ++h0) {
+                    const uint32_t g = h0 / gw;
+                    cublasStatus_t st = cublasGemmStridedBatchedEx(
+                            g_cublas, CUBLAS_OP_T, CUBLAS_OP_N,
+                            static_cast<int>(seqLen), static_cast<int>(seqLen),
+                            static_cast<int>(hd), &geAlpha,
+                            k16 + static_cast<uint64_t>(g) * hd, CUDA_R_16F,
+                            static_cast<int>(kvLen), 0LL,
+                            q16 + static_cast<uint64_t>(h0) * hd, CUDA_R_16F,
+                            static_cast<int>(qLen), static_cast<long long>(hd),
+                            &geBeta,
+                            scratch_.attnScores + static_cast<uint64_t>(h0) * s2,
+                            CUDA_R_32F, static_cast<int>(seqLen),
+                            static_cast<long long>(s2), 1,
+                            CUDA_R_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+                    if (st != CUBLAS_STATUS_SUCCESS) {
+                        errMsg = "attn prefill QK^T gemm failed";
+                        return false;
+                    }
+                }
+                kAttnSoftmaxCausal<<<dim3(seqLen, nHeads), 128, 0, g_stream>>>(
+                        scratch_.attnScores,
+                        reinterpret_cast<__half *>(scratch_.attnP16), seqLen,
+                        s2, pos, invSqrt);
+                // out[h][t][d] = sum_k P[h][t][k] V_h[k][d]: A = V_h
+                // (stride 0 again), B = P_h, C = attnOut with the head stride.
+                for (uint32_t h0 = 0; h0 < nHeads; ++h0) {
+                    const uint32_t g = h0 / gw;
+                    cublasStatus_t st = cublasGemmStridedBatchedEx(
+                            g_cublas, CUBLAS_OP_N, CUBLAS_OP_N,
+                            static_cast<int>(hd), static_cast<int>(seqLen),
+                            static_cast<int>(seqLen), &geAlpha,
+                            v16 + static_cast<uint64_t>(g) * hd, CUDA_R_16F,
+                            static_cast<int>(kvLen), 0LL,
+                            reinterpret_cast<__half *>(scratch_.attnP16) +
+                                    static_cast<uint64_t>(h0) * s2,
+                            CUDA_R_16F, static_cast<int>(seqLen),
+                            static_cast<long long>(s2), &geBeta,
+                            s.attnOut + static_cast<uint64_t>(h0) * hd,
+                            CUDA_R_32F, static_cast<int>(qLen),
+                            static_cast<long long>(hd), 1,
+                            CUDA_R_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+                    if (st != CUBLAS_STATUS_SUCCESS) {
+                        errMsg = "attn prefill PV gemm failed";
+                        return false;
+                    }
+                }
+            } else if (kvHalf_) TC_KV_RUN(__half);
             else
                 TC_KV_RUN(float);
 #undef TC_KV_RUN
@@ -2383,7 +4043,7 @@ namespace tinycoder::gpu {
             bool attnOResidFused = false;
             if (seqLen == 1) {
                 const char *ar = std::getenv("TINYCODER_FUSE_ATTNO_RESID");
-                if (ar == nullptr || std::atoi(ar) != 0) {
+                if ((ar == nullptr || std::atoi(ar) != 0) && !normQ81Path) {
                     attnOResidFused = launchQGemvResid(
                             w.attnO.type, w.attnO.q, s.attnOut, s.attnProj,
                             s.hidden, w.attnO.rows, w.attnO.cols,
@@ -2396,32 +4056,56 @@ namespace tinycoder::gpu {
                                 w.attnO.blocksPerRow, q8k_, q8kBytes_);
                 }
             } else {
-                // attnOut is the fp32 attention result; make an fp16 twin for
-                // the fp16 tensor-core GEMM.
-                kF32ToF16<<<(seqLen * qLen + 511) / 512, 256, 0, g_stream>>>(
-                        s.attnOut, reinterpret_cast<__half2 *>(s.attnOutF16),
-                        (seqLen * qLen) / 2);
-                // CUDA_R_32F compute type -> alpha/beta must be float*.
-                float alpha = 1.0f, beta = 0.0f;
-                void *wF = nullptr;
-                if (!dequantMatrixF16(w.attnO, &wF, errMsg)) return false;
-                // attnProj[seqLen][rows] = attnOut[seqLen][cols] @ W[rows][cols]^T
-                // (see the Q/K/V gemmXWt comment: CUBLAS column-major requires
-                // W in the A slot, x in B, ldc=rows).
-                cublasStatus_t st = cublasGemmEx(
-                        g_cublas, CUBLAS_OP_T, CUBLAS_OP_N,
-                        static_cast<int>(w.attnO.rows), static_cast<int>(seqLen),
-                        static_cast<int>(w.attnO.cols), &alpha, wF, CUDA_R_16F,
-                        static_cast<int>(w.attnO.cols), s.attnOutF16, CUDA_R_16F,
-                        static_cast<int>(w.attnO.cols), &beta, s.attnProj, CUDA_R_32F,
-                        static_cast<int>(w.attnO.rows), CUDA_R_32F,
-                        CUBLAS_GEMM_DEFAULT_TENSOR_OP);
-                if (st != CUBLAS_STATUS_SUCCESS) {
-                    errMsg = "cublasGemmEx attnO failed";
-                    return false;
+                // int8 tensor-core route for attnO (3,584 x 3,584).
+                static const bool iqGemmO = [] {
+                    const char *e = std::getenv("TINYCODER_IQ_GEMM");
+                    return e == nullptr || e[0] != '0';
+                }();
+                // Per-shape path selection: int8GemmPreferred() answers false
+                // for the shapes where tools/int8_gemm_probe --compare measured
+                // the cuBLAS fp16 twin to be faster (see GemmDispatch.cu for the
+                // table).  Requires the twin: without it the fp16 route
+                // dequantizes this matrix on every call and int8 always wins.
+                const bool oFp16Faster =
+                        w.attnO.f16Twin != nullptr &&
+                        !int8GemmPreferred(static_cast<uint32_t>(w.attnO.type),
+                                           w.attnO.rows, w.attnO.cols);
+                if (iqGemmO && (qLen & 511) == 0 && !oFp16Faster &&
+                    int8Gemm(static_cast<int>(w.attnO.type), w.attnO.q,
+                             s.attnOut, s.attnProj, seqLen, w.attnO.rows,
+                             w.attnO.cols, w.attnO.blocksPerRow,
+                             reinterpret_cast<void *>(g_stream))) {
+                } else {
+                    // attnOut is the fp32 attention result; make an fp16 twin for
+                    // the fp16 tensor-core GEMM.
+                    kF32ToF16<<<(seqLen * qLen + 511) / 512, 256, 0, g_stream>>>(
+                            s.attnOut, reinterpret_cast<__half2 *>(s.attnOutF16),
+                            (seqLen * qLen) / 2);
+                    // CUDA_R_32F compute type -> alpha/beta must be float*.
+                    float alpha = 1.0f, beta = 0.0f;
+                    void *wF = nullptr;
+                    if (!dequantMatrixF16(w.attnO, &wF, errMsg)) return false;
+                    // attnProj[seqLen][rows] = attnOut[seqLen][cols] @ W[rows][cols]^T
+                    // (see the Q/K/V gemmXWt comment: CUBLAS column-major requires
+                    // W in the A slot, x in B, ldc=rows).
+                    cublasStatus_t st = cublasGemmEx(
+                            g_cublas, CUBLAS_OP_T, CUBLAS_OP_N,
+                            static_cast<int>(w.attnO.rows), static_cast<int>(seqLen),
+                            static_cast<int>(w.attnO.cols), &alpha, wF, CUDA_R_16F,
+                            static_cast<int>(w.attnO.cols), s.attnOutF16, CUDA_R_16F,
+                            static_cast<int>(w.attnO.cols), &beta, s.attnProj, CUDA_R_32F,
+                            static_cast<int>(w.attnO.rows), CUDA_R_32F,
+                            CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+                    if (st != CUBLAS_STATUS_SUCCESS) {
+                        errMsg = "cublasGemmEx attnO failed";
+                        return false;
+                    }
                 }
             }
-            if (!attnOResidFused) {
+            if (!attnOResidFused && !normQ81Path) {
+                // With normQ81Path the FFN norm below folds this residual
+                // (kResidualNormQ81 takes s.attnProj as its `add` operand), so
+                // adding it here as well would double it.
                 kAddResidual<<<(seqLen * H + 255) / 256, 256, 0, g_stream>>>(
                         s.hidden, s.attnProj, seqLen * H);
             }
@@ -2445,11 +4129,19 @@ namespace tinycoder::gpu {
                 // FFN RMSNorm -> s.norm (OUT-OF-PLACE, one block per row).
                 // Q8_1 fold (2026-10-10, plan section 9.26 lever 1): on the
                 // dense decode (seqLen==1, H==1536) the block also emits the
-                // Q8_1 activation blocks the GLU mmvq consumes, deleting the
+                // Q8_1 activation blocks the GLU GEMV consumes, deleting the
                 // 48-block kQuantizeQ8_1 launch (2.5 us/layer).  Bit-identical
                 // bytes (same math over the same float values).
                 bool rmsQ81Fold = false;
-                if (seqLen == 1 && fuseQ81Prod() && H == 1536) {
+                if (normQ81Path) {
+                    // residual (the attnO projection, still un-added) + RMSNorm
+                    // + Q8_1 in one launch; the fused gate/up GEMV below reads
+                    // those blocks instead of quantizing s.norm itself.
+                    kResidualNormQ81<<<seqLen, 1024, 1024 * sizeof(float),
+                                       g_stream>>>(
+                            s.hidden, s.attnProj, s.norm, w.rmsNormFFN, q8k_, H,
+                            seqLen, 1e-6f);
+                } else if (seqLen == 1 && fuseQ81Prod() && H == 1536) {
                     const uint64_t needG =
                             static_cast<uint64_t>(H / 32u) * kQ8_1_STRIDE;
                     if (q8k_ != nullptr && q8kBytes_ >= needG) {
@@ -2460,7 +4152,7 @@ namespace tinycoder::gpu {
                         rmsQ81Fold = true;
                     }
                 }
-                if (!rmsQ81Fold) {
+                if (!rmsQ81Fold && !normQ81Path) {
                     kRMSNormRow<<<seqLen, 1024, 1024 * sizeof(float),
                                   g_stream>>>(
                             s.hidden, s.norm, w.rmsNormFFN, H, seqLen, 1e-6f);
@@ -2542,51 +4234,123 @@ namespace tinycoder::gpu {
                         return false;
                     }
                 } else if (fuseGU) {
-                    launchQGemvFusedGU(w.ffnGate.type, w.ffnGate.q, w.ffnUp.q,
-                                       s.norm, s.gate, w.ffnGate.rows,
-                                       w.ffnGate.cols, w.ffnGate.rowBytes,
-                                       w.ffnGate.blocksPerRow, q8k_, q8kBytes_,
-                                       rmsQ81Fold ? q8k_ : nullptr);
+                    bool dualDone = false;
+                    if (normQ81Path) {
+                        // gate+up straight off the norm's Q8_1 blocks: one
+                        // launch for the pair, no activation quantize at all.
+                        dualDone = launchQGemvFusedGUQ81(
+                                w.ffnGate.type, w.ffnGate.q, w.ffnUp.q, q8k_,
+                                s.gate, s.up, w.ffnGate.rows, w.ffnGate.cols);
+                    }
+                    if (!dualDone && w.ffnGate.type == kTypeIQ3_XXS) {
+                        dualDone = int8GemvDualIQ3(
+                                w.ffnGate.q, w.ffnUp.q, s.norm, s.gate, s.up,
+                                w.ffnGate.rows, w.ffnGate.cols,
+                                reinterpret_cast<void *>(g_stream));
+                    } else if (!dualDone && w.ffnGate.type == kTypeIQ2XS) {
+                        dualDone = int8GemvDualIQ2XS(
+                                w.ffnGate.q, w.ffnUp.q, s.norm, s.gate, s.up,
+                                w.ffnGate.rows, w.ffnGate.cols,
+                                reinterpret_cast<void *>(g_stream));
+                    }
+                    if (!dualDone) {
+                        launchQGemvFusedGU(w.ffnGate.type, w.ffnGate.q,
+                                           w.ffnUp.q, s.norm, s.gate,
+                                           w.ffnGate.rows, w.ffnGate.cols,
+                                           w.ffnGate.rowBytes,
+                                           w.ffnGate.blocksPerRow, q8k_,
+                                           q8kBytes_,
+                                           rmsQ81Fold ? q8k_ : nullptr);
+                    }
                 } else if (seqLen == 1) {
-                    launchQGemv(w.ffnGate.type, w.ffnGate.q, s.norm, s.gate,
-                                w.ffnGate.rows, w.ffnGate.cols, w.ffnGate.rowBytes,
-                                w.ffnGate.blocksPerRow, q8k_, q8kBytes_);
-                    launchQGemv(w.ffnUp.type, w.ffnUp.q, s.norm, s.up, w.ffnUp.rows,
-                                w.ffnUp.cols, w.ffnUp.rowBytes, w.ffnUp.blocksPerRow,
-                                q8k_, q8kBytes_);
+                    bool guQ81 = false;
+                    if (normQ81Path) {
+                        const bool go = launchQGemvQ81(
+                                w.ffnGate.type, w.ffnGate.q, q8k_, s.gate,
+                                w.ffnGate.rows, w.ffnGate.cols);
+                        const bool uo = launchQGemvQ81(
+                                w.ffnUp.type, w.ffnUp.q, q8k_, s.up,
+                                w.ffnUp.rows, w.ffnUp.cols);
+                        guQ81 = go && uo;
+                    }
+                    if (!guQ81) {
+                        launchQGemv(w.ffnGate.type, w.ffnGate.q, s.norm, s.gate,
+                                    w.ffnGate.rows, w.ffnGate.cols,
+                                    w.ffnGate.rowBytes, w.ffnGate.blocksPerRow,
+                                    q8k_, q8kBytes_);
+                        launchQGemv(w.ffnUp.type, w.ffnUp.q, s.norm, s.up,
+                                    w.ffnUp.rows, w.ffnUp.cols,
+                                    w.ffnUp.rowBytes, w.ffnUp.blocksPerRow, q8k_,
+                                    q8kBytes_);
+                    }
                 } else {
-                    // hiddenF16 was converted before Q/K/V, but s.norm has since
-                    // been refreshed by the FFN RMSNorm, so rebuild the fp16 twin
-                    // from s.norm for the FFN GEMMs.
-                    kF32ToF16<<<(seqLen * H + 511) / 512, 256, 0, g_stream>>>(
-                            s.norm, reinterpret_cast<__half2 *>(s.hiddenF16),
-                            (seqLen * H) / 2);
-                    // CUDA_R_32F compute type -> alpha/beta must be float*.
-                    float alpha = 1.0f, beta = 0.0f;
-                    void *wF = nullptr;
-                    // gate/up[seqLen][rows] = norm[seqLen][cols] @ W[rows][cols]^T
-                    // (CUBLAS column-major: W in A, x in B, ldc=rows).
-                    if (!dequantMatrixF16(w.ffnGate, &wF, errMsg)) return false;
-                    cublasStatus_t st = cublasGemmEx(
-                            g_cublas, CUBLAS_OP_T, CUBLAS_OP_N,
-                            static_cast<int>(w.ffnGate.rows), static_cast<int>(seqLen),
-                            static_cast<int>(w.ffnGate.cols), &alpha, wF, CUDA_R_16F,
-                            static_cast<int>(w.ffnGate.cols), s.hiddenF16,
-                            CUDA_R_16F, static_cast<int>(w.ffnGate.cols), &beta,
-                            s.gate, CUDA_R_32F, static_cast<int>(w.ffnGate.rows),
-                            CUDA_R_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
-                    if (!dequantMatrixF16(w.ffnUp, &wF, errMsg)) return false;
-                    cublasStatus_t st2 = cublasGemmEx(
-                            g_cublas, CUBLAS_OP_T, CUBLAS_OP_N,
-                            static_cast<int>(w.ffnUp.rows), static_cast<int>(seqLen),
-                            static_cast<int>(w.ffnUp.cols), &alpha, wF, CUDA_R_16F,
-                            static_cast<int>(w.ffnUp.cols), s.hiddenF16,
-                            CUDA_R_16F, static_cast<int>(w.ffnUp.cols), &beta,
-                            s.up, CUDA_R_32F, static_cast<int>(w.ffnUp.rows),
-                            CUDA_R_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
-                    if (st != CUBLAS_STATUS_SUCCESS || st2 != CUBLAS_STATUS_SUCCESS) {
-                        errMsg = "cublasGemmEx gate/up failed";
-                        return false;
+                    // IQ/K-quant prefill through int8 tensor cores: the FFN
+                    // gate/up matrices are the largest in the model (18,944 x
+                    // 3584 here), i.e. ~148 full 128-row tiles, so unlike the
+                    // thin Q/K/V case this both amortises the tiles AND skips
+                    // the fp16 expansion of ~2/3 of the checkpoint's bytes.
+                    // TINYCODER_IQ_GEMM=0 restores the fp16 path.
+                    static const bool iqGemmF = [] {
+                        const char *e = std::getenv("TINYCODER_IQ_GEMM");
+                        return e == nullptr || e[0] != '0';
+                    }();
+                    // Size gate: int8 MMA only pays once the matrix has enough
+                    // 128-row tiles to amortise its activation quantisation.
+                    // Measured on this box: 1.5B (ffn rows 8,960) loses 6%,
+                    // 7B (18,944) gains 4%; the threshold is set between them.
+                    const bool guFp16Faster =
+                            w.ffnGate.f16Twin != nullptr &&
+                            !int8GemmPreferred(static_cast<uint32_t>(w.ffnGate.type),
+                                               w.ffnGate.rows, w.ffnGate.cols);
+                    bool gu8 = false;
+                    if (iqGemmF && (H & 511) == 0 &&
+                        w.ffnGate.rows >= 16384 && !guFp16Faster) {
+                        gu8 = int8Gemm(static_cast<int>(w.ffnGate.type),
+                                       w.ffnGate.q, s.norm, s.gate, seqLen,
+                                       w.ffnGate.rows, w.ffnGate.cols,
+                                       w.ffnGate.blocksPerRow,
+                                       reinterpret_cast<void *>(g_stream)) &&
+                              int8Gemm(static_cast<int>(w.ffnUp.type),
+                                       w.ffnUp.q, s.norm, s.up, seqLen,
+                                       w.ffnUp.rows, w.ffnUp.cols,
+                                       w.ffnUp.blocksPerRow,
+                                       reinterpret_cast<void *>(g_stream));
+                    }
+                    if (gu8) {
+                    } else {
+                        // hiddenF16 was converted before Q/K/V, but s.norm has since
+                        // been refreshed by the FFN RMSNorm, so rebuild the fp16 twin
+                        // from s.norm for the FFN GEMMs.
+                        kF32ToF16<<<(seqLen * H + 511) / 512, 256, 0, g_stream>>>(
+                                s.norm, reinterpret_cast<__half2 *>(s.hiddenF16),
+                                (seqLen * H) / 2);
+                        // CUDA_R_32F compute type -> alpha/beta must be float*.
+                        float alpha = 1.0f, beta = 0.0f;
+                        void *wF = nullptr;
+                        // gate/up[seqLen][rows] = norm[seqLen][cols] @ W[rows][cols]^T
+                        // (CUBLAS column-major: W in A, x in B, ldc=rows).
+                        if (!dequantMatrixF16(w.ffnGate, &wF, errMsg)) return false;
+                        cublasStatus_t st = cublasGemmEx(
+                                g_cublas, CUBLAS_OP_T, CUBLAS_OP_N,
+                                static_cast<int>(w.ffnGate.rows), static_cast<int>(seqLen),
+                                static_cast<int>(w.ffnGate.cols), &alpha, wF, CUDA_R_16F,
+                                static_cast<int>(w.ffnGate.cols), s.hiddenF16,
+                                CUDA_R_16F, static_cast<int>(w.ffnGate.cols), &beta,
+                                s.gate, CUDA_R_32F, static_cast<int>(w.ffnGate.rows),
+                                CUDA_R_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+                        if (!dequantMatrixF16(w.ffnUp, &wF, errMsg)) return false;
+                        cublasStatus_t st2 = cublasGemmEx(
+                                g_cublas, CUBLAS_OP_T, CUBLAS_OP_N,
+                                static_cast<int>(w.ffnUp.rows), static_cast<int>(seqLen),
+                                static_cast<int>(w.ffnUp.cols), &alpha, wF, CUDA_R_16F,
+                                static_cast<int>(w.ffnUp.cols), s.hiddenF16,
+                                CUDA_R_16F, static_cast<int>(w.ffnUp.cols), &beta,
+                                s.up, CUDA_R_32F, static_cast<int>(w.ffnUp.rows),
+                                CUDA_R_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+                        if (st != CUBLAS_STATUS_SUCCESS || st2 != CUBLAS_STATUS_SUCCESS) {
+                            errMsg = "cublasGemmEx gate/up failed";
+                            return false;
+                        }
                     }
                 }
                 // The fused gate+up+silu kernel already folded the product into
@@ -2605,9 +4369,22 @@ namespace tinycoder::gpu {
                 // delete the separate residual launch.  Decode-only, Q3_K
                 // (w.ffnDown.type), fp32 activation.  Falls back cleanly.
                 bool downResidFused = false;
-                if (seqLen == 1) {
+                bool downResidDeferred = false;
+                if (seqLen == 1 && deferDownResid && (L + 1u) < nGpu) {
+                    // Deferred residual: this GEMV only writes s.ffnOut, and the
+                    // NEXT layer's kResidualNormQ81 adds it into the residual
+                    // stream while it norms.  Same float add, one node fewer --
+                    // and it is why the attn norm above takes s.ffnOut as its
+                    // `add` operand.  The last layer cannot defer (nothing
+                    // consumes its ffnOut before the final norm), so it keeps
+                    // the fused-residual launch.
+                    launchQGemv(w.ffnDown.type, w.ffnDown.q, s.gate, s.ffnOut,
+                                w.ffnDown.rows, w.ffnDown.cols, w.ffnDown.rowBytes,
+                                w.ffnDown.blocksPerRow, q8k_, q8kBytes_);
+                    downResidDeferred = true;
+                } else if (seqLen == 1) {
                     // 2026-10-10: fused residual is now DEFAULT ON for the down
-                    // (mmvq epilogue fold, bit-exact); TINYCODER_FUSE_DOWN_RESID=0
+                    // (GEMV epilogue fold, bit-exact); TINYCODER_FUSE_DOWN_RESID=0
                     // restores launchQGemv + kAddResidual.
                     const char *dr = std::getenv("TINYCODER_FUSE_DOWN_RESID");
                     if ((dr == nullptr || std::atoi(dr) != 0) &&
@@ -2647,6 +4424,31 @@ namespace tinycoder::gpu {
                                     q8k_, q8kBytes_);
                     }
                 } else {
+                    // Same int8 tensor-core route for the down projection
+                    // (3,584 x 18,944): consumes the raw quantised bytes and
+                    // the fp32 silu product directly, so neither the fp16
+                    // weight expansion nor the gate fp16 twin is needed.
+                    static const bool iqGemmD = [] {
+                        const char *e = std::getenv("TINYCODER_IQ_GEMM");
+                        return e == nullptr || e[0] != '0';
+                    }();
+                    const bool dFp16Faster =
+                            w.ffnDown.f16Twin != nullptr &&
+                            !int8GemmPreferred(static_cast<uint32_t>(w.ffnDown.type),
+                                               w.ffnDown.rows, w.ffnDown.cols);
+                    if (iqGemmD && (I & 511) == 0 && w.ffnDown.cols >= 16384 &&
+                        !dFp16Faster &&
+                        int8Gemm(static_cast<int>(w.ffnDown.type), w.ffnDown.q,
+                                 s.gate, s.ffnOut, seqLen, w.ffnDown.rows,
+                                 w.ffnDown.cols, w.ffnDown.blocksPerRow,
+                                 reinterpret_cast<void *>(g_stream))) {
+                        if (!downResidFused) {
+                            kAddResidual<<<(seqLen * H + 255) / 256, 256, 0,
+                                           g_stream>>>(s.hidden, s.ffnOut,
+                                                       seqLen * H);
+                        }
+                        return true;
+                    }
                     // gate holds silu(gate)*up in fp32; fp16 twin for the GEMM.
                     kF32ToF16<<<(seqLen * I + 511) / 512, 256, 0, g_stream>>>(
                             s.gate, reinterpret_cast<__half2 *>(s.gateF16),
@@ -2670,7 +4472,7 @@ namespace tinycoder::gpu {
                         return false;
                     }
                 }
-                if (!downResidFused) {
+                if (!downResidFused && !downResidDeferred) {
                     kAddResidual<<<(seqLen * H + 255) / 256, 256, 0, g_stream>>>(
                             s.hidden, s.ffnOut, seqLen * H);
                 }
@@ -2721,6 +4523,13 @@ namespace tinycoder::gpu {
             }
             if (traceStages && !graphCaptureActive_) {
                 cudaEventRecord(evFFN[L], g_stream);
+            }
+            // TINYCODER_NODE_PAD=N: N empty nodes per layer, chained on the
+            // same stream (stream capture makes every recorded node depend on
+            // the previous one), so tg(N)-tg(0) is pure per-node replay cost.
+            if (nodePad > 0) {
+                for (int pad = 0; pad < nodePad; ++pad)
+                    kGraphPadNoop<<<1, 32, 0, g_stream>>>();
             }
         }
         // Host layer-loop sync: during capture the stream is being recorded
@@ -2819,12 +4628,33 @@ namespace tinycoder::gpu {
 
         // ---- Full offload: final RMSNorm + LM head ----
         TIMING_TAG("layer loop done");
+        // TINYCODER_FUSE_HEAD_NORM_Q81=1 (default OFF -- measured below the
+        // noise floor, see the ledger): the final RMSNorm also emits the
+        // 36-byte block_q8_1 activation row the LM-head GEMV consumes, so ONE
+        // launch replaces (kRMSNormRow + the Q8_1 quantize inside
+        // launchQGemv/int8Gemv).  Decode-only, H in the kResidualNormQ81
+        // window; s.hidden keeps its normed values (same in-place write as
+        // before) so every other consumer is unaffected.
+        const char *hnE = std::getenv("TINYCODER_FUSE_HEAD_NORM_Q81");
+        bool headNormQ81 = (hnE != nullptr && std::atoi(hnE) != 0) &&
+                           seqLen == 1 && (H & 31u) == 0u && H >= 1024u &&
+                           H <= 2048u && q8k_ != nullptr &&
+                           q8kBytes_ >= static_cast<uint64_t>(H / 32u) * 36u;
         // Final RMSNorm -> place the result INTO s.hidden (the residual stream
         // is no longer needed once the last layer's residual add has run).
         // One block per row.
         if (finalNorm_) {
-            kRMSNormRow<<<seqLen, 1024, 1024 * sizeof(float), g_stream>>>(
-                    s.hidden, s.hidden, finalNorm_, H, seqLen, 1e-6f);
+            if (headNormQ81) {
+                kResidualNormQ81<<<seqLen, 1024, 1024 * sizeof(float),
+                                   g_stream>>>(s.hidden, nullptr, s.hidden,
+                                               finalNorm_, q8k_, H, seqLen,
+                                               1e-6f);
+            } else {
+                kRMSNormRow<<<seqLen, 1024, 1024 * sizeof(float), g_stream>>>(
+                        s.hidden, s.hidden, finalNorm_, H, seqLen, 1e-6f);
+            }
+        } else {
+            headNormQ81 = false;
         }
 
         // LM head: quantized GEMV. Tied head -> token-embedding matrix
@@ -2847,9 +4677,18 @@ namespace tinycoder::gpu {
             }
         } else {
             uint32_t si = seqLen - 1;
-            launchQGemv(lmType, lmQ, s.hidden + si * H, s.logits,
-                        geom_.vocabSize, H, lmRowBytes, blocksPerRow, q8k_,
-                        q8kBytes_);
+            // The norm above already wrote the Q8_1 blocks: run the SAME
+            // gemv/Q6K kernel int8Gemv would run, skipping its activation
+            // quantize.  Falls through to the normal launch when the type or
+            // shape is not covered (q8k_ is then re-quantized there, from the
+            // already-normed s.hidden).
+            if (!(headNormQ81 &&
+                  launchQGemvQ81(lmType, lmQ, q8k_, s.logits,
+                                 geom_.vocabSize, H))) {
+                launchQGemv(lmType, lmQ, s.hidden + si * H, s.logits,
+                            geom_.vocabSize, H, lmRowBytes, blocksPerRow, q8k_,
+                            q8kBytes_);
+            }
         }
         // Stage-trace midpoint: GEMV vs D2H split of the lmhead stage.
         if (traceStages && !graphCaptureActive_ && evLmMid != nullptr) {
@@ -3050,7 +4889,15 @@ namespace tinycoder::gpu {
         const void *lmQ = lmHeadQ_ != nullptr ? lmHeadQ_ : embedQ_;
         // Warm the q8k_ buffer to its widest layout (Q8_K int path would
         // allocate blocksPerRow*kQ8K_STRIDE); the Q6_K launch reuses it.
-        const uint64_t need = static_cast<uint64_t>(lmBlocks) * kQ8K_STRIDE;
+        // Also sized for the IQ3_XXS four-rows-per-block GEMV, which reads a
+        // 36-byte-block Q8_1 row of its INPUT activation: ffn_down's input is
+        // intermediateSize wide (8,960 -> 10,080 B), far wider than the Q8_K
+        // row above, and launchQGemv only takes that path when the row fits.
+        const uint32_t widestAct =
+                geom_.intermediateSize > lmCols ? geom_.intermediateSize : lmCols;
+        uint64_t need = static_cast<uint64_t>(lmBlocks) * kQ8K_STRIDE;
+        const uint64_t iq3Row = static_cast<uint64_t>(widestAct / 32u) * 36u;
+        if (iq3Row > need) need = iq3Row;
         if (scratch == nullptr || scratchBytes < need) {
             if (scratch) cudaFree(scratch);
             scratch = nullptr;
@@ -3071,6 +4918,74 @@ namespace tinycoder::gpu {
     bool GPUModel::instantiateGraph() {
         if (graphExec_ != nullptr) return true;
         if (graph_ == nullptr) return false;
+        // TINYCODER_GRAPH_NODES=1 dumps the captured decode graph's node
+        // census (count + per-kernel multiplicity).  This is the measurement
+        // that decides whether cutting launches is worth anything: a node
+        // costs ~2-3 us of launch+tail regardless of how much work it does.
+        if (const char *dumpNodes = std::getenv("TINYCODER_GRAPH_NODES")) {
+            if (dumpNodes[0] == '1') {
+                size_t n = 0;
+                cudaGraphGetNodes(static_cast<cudaGraph_t>(graph_), nullptr,
+                                  &n);
+                std::vector<cudaGraphNode_t> nodes(n);
+                if (n != 0) {
+                    cudaGraphGetNodes(static_cast<cudaGraph_t>(graph_),
+                                      nodes.data(), &n);
+                }
+                std::fprintf(stderr, "[graph] total nodes = %zu\n", n);
+                // Multiplicity per kernel name; sorted descending so the
+                // biggest contributors print first.
+                std::map<std::string, int> hist;
+                for (size_t i = 0; i < n; ++i) {
+                    cudaGraphNodeType t;
+                    if (cudaGraphNodeGetType(nodes[i], &t) != cudaSuccess) {
+                        continue;
+                    }
+                    if (t != cudaGraphNodeTypeKernel) {
+                        hist[std::string("(") +
+                             (t == cudaGraphNodeTypeMemcpy ? "memcpy" : t == cudaGraphNodeTypeMemset ? "memset"
+                                                                : t == cudaGraphNodeTypeHost         ? "host"
+                                                                                                     : "other") +
+                             ")"]++;
+                        continue;
+                    }
+                    cudaKernelNodeParams p{};
+                    void *fn = nullptr;
+                    if (cudaGraphKernelNodeGetParams(nodes[i], &p) !=
+                                cudaSuccess ||
+                        p.func == nullptr) {
+                        hist["<unknown>"]++;
+                        continue;
+                    }
+                    fn = reinterpret_cast<void *>(p.func);
+                    // CUDA 12.4 has no cudaFuncAttributes::name; key the
+                    // histogram on the function pointer, which is stable for
+                    // the lifetime of the module and still separates kernels.
+                    // The grid/block/shared triple is appended because the
+                    // pointer alone does not say WHICH launch site produced
+                    // the node, and identifying the launch site is the whole
+                    // point of the census.
+                    char key[96];
+                    std::snprintf(key, sizeof(key),
+                                  "@%p g(%u,%u,%u) b(%u,%u,%u) sm%u", fn,
+                                  p.gridDim.x, p.gridDim.y, p.gridDim.z,
+                                  p.blockDim.x, p.blockDim.y, p.blockDim.z,
+                                  p.sharedMemBytes);
+                    hist[key]++;
+                }
+                std::vector<std::pair<std::string, int>> v(hist.begin(),
+                                                           hist.end());
+                std::sort(v.begin(), v.end(),
+                          [](const auto &a, const auto &b) {
+                              return a.second != b.second ? a.second > b.second
+                                                          : a.first < b.first;
+                          });
+                for (const auto &kv: v) {
+                    std::fprintf(stderr, "[graph] %5d x %s\n", kv.second,
+                                 kv.first.c_str());
+                }
+            }
+        }
         cudaGraphExec_t rawExec = nullptr;
         cudaError_t e = cudaGraphInstantiate(&rawExec,
                                              static_cast<cudaGraph_t>(graph_),
@@ -3268,6 +5183,15 @@ namespace tinycoder::gpu {
                             static_cast<size_t>(q35GdnBytes), g_stream);
         }
         kvPos_ = 0;
+        // The f32 cache is now zero, so the decode-only int8 pool must be
+        // rebuilt on the next decode for EVERY slot.  Without this reset a new
+        // session inherited the previous one's int8 rows: rows the new prefill
+        // wrote to the f32 cache were never converted, and the decode attended
+        // the old conversation's tokens instead of the prompt (the
+        // "answers the previous question" symptom).  The pool itself needs no
+        // memset: the rebuild covers exactly rows [0, pos) and the decode
+        // token writes its own row.
+        std::fill(kv8Rows_.begin(), kv8Rows_.end(), 0u);
         cudaStreamSynchronize(g_stream);
     }
 
@@ -3341,17 +5265,29 @@ namespace tinycoder::gpu {
             layers_ = nullptr;
         }
         // Native EXL3 buffers are owned by the fused module; release (and
-        // unregister) them before the generic frees.
+        // unregister) them before the generic frees.  `ownsBuffers` is false
+        // for a linear that aliases another owner's device memory, where
+        // releaseFusedLinear() must only unregister.
         for (auto &o: exl3Owned_) {
             exl3gpu::Exl3FusedLinear fl;
             fl.trellis = o.trellis;
             fl.suh = static_cast<const float *>(o.suh);
             fl.svh = static_cast<const float *>(o.svh);
+            fl.ownsBuffers = o.ownsBuffers;
             exl3gpu::releaseFusedLinear(fl);
         }
         exl3Owned_.clear();
         cudaFree(kvK_);
         cudaFree(kvV_);
+        if (kvK8_) cudaFree(kvK8_);
+        if (kvV8_) cudaFree(kvV8_);
+        if (kvK8Scale_) cudaFree(kvK8Scale_);
+        if (kvV8Scale_) cudaFree(kvV8Scale_);
+        // The int8 pool is gone, so its per-slot row counts are meaningless.
+        // upload() re-assigns them on a re-upload; clearing here keeps the
+        // invariant local to the buffer's lifetime instead of resting on the
+        // call order.
+        kv8Rows_.clear();
         cudaFree(finalNorm_);
         cudaFree(embedQ_);
         if (lmHeadType_ != GGML_TYPE_EXL3) {
@@ -3446,6 +5382,12 @@ namespace tinycoder::gpu {
                 expertCacheTag_[L][s2][0] = -1;
                 expertCacheTag_[L][s2][1] = -1;
                 expertCacheLru_[L][s2] = 0;
+            }
+            if (L == 0 && expertArena_) {
+                cudaFree(expertArena_);
+                expertArena_ = nullptr;
+                expertArenaBytes_ = 0;
+                expertArenaStamp_.clear();
             }
         }
         expertCacheLayerBytes_ = 0;

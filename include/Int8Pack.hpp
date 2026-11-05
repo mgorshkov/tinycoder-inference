@@ -444,9 +444,9 @@ namespace tinycoder {
         const uint8_t *blk =
                 src + (static_cast<size_t>(n) * blocksPerRow + (k / BLOCK_SIZE)) *
                               Q4K_SRC_BLOCK_BYTES;
-        const uint32_t c = k % BLOCK_SIZE;   // 0..255
-        const uint32_t i = c / GROUP_SIZE;   // sub-block 0..7
-        const uint32_t j = c % GROUP_SIZE;   // 0..31
+        const uint32_t c = k % BLOCK_SIZE;// 0..255
+        const uint32_t i = c / GROUP_SIZE;// sub-block 0..7
+        const uint32_t j = c % GROUP_SIZE;// 0..31
         const uint8_t *qsv = blk + 16;
         const uint8_t qb = qsv[32u * (i >> 1u) + j];
         return ((i & 1u) == 0u) ? (qb & 0xFu) : (qb >> 4);
@@ -458,7 +458,7 @@ namespace tinycoder {
         dscOut = 0.0f;
         dmnOut = 0.0f;
         if (n >= rows) return;
-        const uint32_t c = k16tile * MMA_K;   // a k16 tile stays inside a 32-group
+        const uint32_t c = k16tile * MMA_K;// a k16 tile stays inside a 32-group
         const uint8_t *blk =
                 src + (static_cast<size_t>(n) * blocksPerRow + (c / BLOCK_SIZE)) *
                               Q4K_SRC_BLOCK_BYTES;

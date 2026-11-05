@@ -112,6 +112,22 @@ namespace tinycoder {
         void setAffinityEnabled(bool enable) { affinityEnabled_ = enable; }
         bool affinityEnabled() const { return affinityEnabled_; }
 
+        /// @brief Pin the pool to the CPUs of one NUMA node (2026-11-04).
+        ///
+        /// The CUDA device on the reference 2-socket box sits on node 0; the
+        /// CPU-expert hybrid streams the routed weights over PCIe while the
+        /// workers read them from host RAM, so keeping both the worker CPUs
+        /// and the process memory policy on that node removes the cross-socket
+        /// hop (distance 21 on this topology).  A negative node disables it.
+        /// Must be called before initialize(); `initialize()` also auto-detects
+        /// the GPU node when TINYCODER_NUMA is unset/"auto".
+        void setNumaNode(int node) { numaNode_ = node; }
+        int numaNode() const { return numaNode_; }
+
+        /// @brief NUMA node of the first NVIDIA display/3D controller, or -1
+        ///        when there is no GPU / sysfs is unavailable.
+        static int detectGpuNumaNode();
+
         void parallelFor(uint32_t start, uint32_t end,
                          const std::function<void(uint32_t)> &func);
 
@@ -215,6 +231,11 @@ namespace tinycoder {
         size_t numThreads_ = 1;
         bool initialized_ = false;
         bool affinityEnabled_ = false;
+        int numaNode_ = -1;
+        // Resolved CPU ids of numaNode_ (empty -> use the flat CPU list).
+        std::vector<int> numaCpus_;
+        void resolveNumaCpus();
+        void bindMemoryPolicy();
         std::vector<std::thread> workers_;
 
         std::mutex mutex_;

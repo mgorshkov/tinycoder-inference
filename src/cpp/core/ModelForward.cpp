@@ -84,7 +84,34 @@ namespace tinycoder {
                                                                          ? tokens.size()
                                                                          : size_t(1),
                                                                  config_.vocabSize});
-            if (gpuForward(tokens, computeAllLogits, logits.data(), &err)) {
+            // Chunked prefill (2026-11-10): the activation/expert scratch
+            // scales with seqLen, so a long prompt used to OOM at upload
+            // (measured: pp768 failed at ffnDownExpsMoe on an 11 GB card,
+            // leaving a half-freed device state whose cascade surfaced as a
+            // bogus "int8Gemm unsupported").  Feeding the engine at most
+            // kPrefillChunk tokens at a time keeps the working set inside the
+            // existing buffers; the KV cache carries the prefix, so each
+            // chunk resumes exactly where the previous one stopped.  Only the
+            // last chunk needs to produce logits, hence the
+            // !computeAllLogits guard (with computeAllLogits the caller wants
+            // one row per input token, which chunking cannot satisfy).
+            constexpr size_t kPrefillChunk = 512;
+            bool gpuOk = false;
+            if (!computeAllLogits && tokens.size() > kPrefillChunk) {
+                gpuOk = true;
+                for (size_t off = 0; off < tokens.size(); off += kPrefillChunk) {
+                    const size_t n = std::min(kPrefillChunk, tokens.size() - off);
+                    std::vector<int32_t> part(tokens.begin() + off,
+                                              tokens.begin() + off + n);
+                    if (!gpuForward(part, false, logits.data(), &err)) {
+                        gpuOk = false;
+                        break;
+                    }
+                }
+            } else {
+                gpuOk = gpuForward(tokens, computeAllLogits, logits.data(), &err);
+            }
+            if (gpuOk) {
                 // The GPU produced the logits (qwen2, or qwen35 with the full
                 // model on device): return them directly.
                 bool gpuDone = true;
@@ -134,6 +161,14 @@ namespace tinycoder {
                 // shared tail.
                 gpuSessionActive_ = true;
             } else {
+                if (std::getenv("TINYCODER_NO_CPU_FALLBACK") != nullptr) {
+                    // Diagnostic: stop at the first GPU failure instead of
+                    // grinding through a multi-minute CPU prefill, so a fault
+                    // can be localised with compute-sanitizer.
+                    std::fprintf(stderr, "[gpu] NO CPU FALLBACK: %s\n",
+                                 err.c_str());
+                    std::abort();
+                }
                 if (!err.empty()) {
                     std::fprintf(stderr, "[gpu] forward fallback to CPU: %s\n", err.c_str());
                 } else {

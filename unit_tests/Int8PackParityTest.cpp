@@ -23,7 +23,7 @@ SOFTWARE.
 */
 
 /**
- * TinyCoder int8 pack parity harness (step 1 of the mma.s8 MMQ project).
+ * TinyCoder int8 pack parity harness (step 1 of the mma.s8 INT8 project).
  *
  * Verifies the Int8Pack conversion of GGML IQ3_XXS blocks into the
  * signed-int8 + per-group-scale form (and the mma.s8.m16n8k16 B-fragment

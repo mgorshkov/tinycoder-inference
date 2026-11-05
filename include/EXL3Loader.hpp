@@ -34,7 +34,7 @@
 
 namespace tinycoder {
 
-    /// @brief EXL3 (ExLlamaV3) checkpoint loader.
+    /// @brief EXL3 (EXL3) checkpoint loader.
     ///
     /// EXL3 checkpoints are Hugging Face directories: a `config.json`, one or
     /// more `*.safetensors` shards, and (usually) a `tokenizer.json`. The linear
@@ -87,6 +87,10 @@ namespace tinycoder {
 
         /// @brief Native packed-trellis metadata for a materialized GGML-named
         /// linear (nullptr for plain/F16 tensors or unsupported bitrates).
+        bool isLazyLinear(const std::string &ggmlName) const {
+            return lazy_.find(ggmlName) != lazy_.end();
+        }
+
         const Exl3LinearInfo *nativeLinear(const std::string &ggmlName) const {
             auto it = native_.find(ggmlName);
             return it == native_.end() ? nullptr : &it->second;
@@ -96,7 +100,7 @@ namespace tinycoder {
         // Resolved source for one logical (HF) linear: either an EXL3 trellis or
         // a plain safetensors weight.
         struct Src {
-            std::string base; // HF base name (e.g. "model.layers.0.self_attn.q_proj")
+            std::string base;// HF base name (e.g. "model.layers.0.self_attn.q_proj")
             bool exl3 = false;
             bool valid = false;
         };
@@ -120,6 +124,14 @@ namespace tinycoder {
                           std::vector<uint8_t> &outBytes, std::vector<float> *recon = nullptr);
 
         // Materializers. `expectedOut`/`expectedIn` are the engine's [rows, cols].
+        struct LazyLinear {
+            std::vector<std::string> hf;
+            uint32_t out = 0;
+            uint32_t in = 0;
+            bool forceF32 = false;
+        };
+        void materializeLazy(const std::string &name);
+
         bool emitLinear(const std::string &ggmlName,
                         const std::vector<std::string> &hfCandidates,
                         uint32_t expectedOut, uint32_t expectedIn, bool forceF32 = false);
@@ -175,6 +187,8 @@ namespace tinycoder {
         bool loaded_ = false;
 
         std::unordered_map<std::string, Exl3LinearInfo> native_;
+        std::unordered_map<std::string, LazyLinear> lazy_;
+        bool lazyF16_ = false;
         std::vector<std::unique_ptr<std::vector<float>>> nativeSigns_;
 
         // Config-derived dims used by the tensor builders.
@@ -183,17 +197,17 @@ namespace tinycoder {
         uint32_t nHeads_ = 0;
         uint32_t nKvHeads_ = 0;
         uint32_t headDim_ = 0;
-        uint32_t inter_ = 0;             // dense FFN intermediate
+        uint32_t inter_ = 0;// dense FFN intermediate
         uint32_t vocab_ = 0;
         uint32_t nExperts_ = 0;
         uint32_t nExpertsUsed_ = 0;
         uint32_t expertInter_ = 0;
         uint32_t nSharedExperts_ = 0;
         uint32_t sharedInter_ = 0;
-        uint32_t convChannels_ = 0;      // qwen35 linear-attention conv width
-        uint32_t ssmInner_ = 0;          // qwen35 value dimension (dInner)
-        uint32_t nVHeads_ = 0;           // qwen35 value heads
-        float normEps_ = 1e-6f;          // config.json rms_norm_eps
+        uint32_t convChannels_ = 0;// qwen35 linear-attention conv width
+        uint32_t ssmInner_ = 0;    // qwen35 value dimension (dInner)
+        uint32_t nVHeads_ = 0;     // qwen35 value heads
+        float normEps_ = 1e-6f;    // config.json rms_norm_eps
         uint32_t fullAttentionInterval_ = 4;
         uint32_t nextnPredictLayers_ = 0;
 

@@ -1318,7 +1318,7 @@ namespace tinycoder {
     };
 
     // IQ2_XS grid table (512 entries).
-    // Byte-identical copy of ggml's iq2xs_grid in ggml-common.h:
+    // Byte-identical copy of the GGUF iq2xs_grid definition:
     // each uint64_t stores 8 dequantized byte values (0x08=8, 0x19=25,
     // 0x2b=43); low byte = grid[0], high byte = grid[7].
     const uint64_t GGMLDequantize::iq2xs_grid[512] = {
@@ -1837,7 +1837,7 @@ namespace tinycoder {
     };
 
     // IQ2_XXS grid table (256 entries).
-    // Byte-identical copy of ggml's iq2xxs_grid in ggml-common.h:
+    // Byte-identical copy of the GGUF iq2xxs_grid definition:
     // each uint64_t stores 8 dequantized byte values (0x08=8, 0x19=25,
     // 0x2b=43); low byte = grid[0], high byte = grid[7].
     const uint64_t GGMLDequantize::iq2xxs_grid[256] = {

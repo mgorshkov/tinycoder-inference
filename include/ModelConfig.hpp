@@ -118,6 +118,23 @@ namespace tinycoder {
         uint32_t attentionValueLength = 0;               // 0 = derived from headDim
         uint32_t ropeDimensionSections[4] = {0, 0, 0, 0};// MRoPE sections (t,h,w,e)
 
+        // ---- Gated-delta-net q/k -> value-head pairing order ----
+        // The gated delta net has nKHeads (ssmGroupCount) key/query heads and
+        // nVHeads (ssmTimeStepRank) value heads, nVHeads a multiple of nKHeads;
+        // every value head reads one key head.  Two on-disk layouts disagree
+        // about WHICH:
+        //   grouped (HF / exllamav3 / Prism): value head hv reads key head
+        //     hv / (nVHeads / nKHeads)   -- `repeat_interleave`.
+        //   tiled (llama.cpp GGUF converter — `_reorder_v_heads` in
+        //     conversion/qwen.py): the converter permutes every V-side tensor
+        //     (v, z, alpha, beta, A_log, dt_bias, out_proj rows) into tiled
+        //     order so a plain broadcast suffices, and value head hv then reads
+        //     key head hv % nKHeads.
+        // Picking the wrong one pairs 30 of 32 heads with the wrong value head
+        // on Ornith-1.5-9B (measured: layer-0 branch output 23 % low, logits 2x
+        // flat, generation becomes token salad inside <think>).
+        bool gdnVHeadsTiled = false;
+
         // ---- Prism Hadamard-fold (Ternary-Bonsai-2-27B PQ2_0) ----
         // When prismFold is set, the model's linear weights were stored folded
         // with a per-input-dimension normalized Walsh-Hadamard rotation (plus an

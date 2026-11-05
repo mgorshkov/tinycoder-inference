@@ -273,6 +273,134 @@ TEST_F(ModelTest, MultiTokenForward) {
 }
 
 // ---------------------------------------------------------------------------
+// Test: a normal-length chat prompt must produce finite logits
+//
+// The four-token "def hello():" probe in the verification checklist stayed
+// green for a whole day while every prompt of 39 tokens or more produced NaN
+// logits and generated "!!!!" only.  A four-token prompt never leaves the
+// regime where an accumulating quantity (the gated-delta-net state here) can
+// overflow, so it is not a smoke test for a 27B hybrid model.  This test
+// asserts exactly what broke: that the last-position logits of a >= 45-token
+// chat prompt are all finite for every layer, and that greedy decoding from
+// that prompt does not collapse into an immediate repetition loop.
+//
+// The failure it first caught (2026-11-14): kQ35GdnWarpScan reduced
+// <state_row, k> with a __shfl_down tree that leaves the total on lane 0 only,
+// then applied the delta-rule correction on all 32 lanes.  gdnOut was written
+// from lane 0 so the block outputs looked sane, while the persistent state was
+// corrupted and grew without bound until it overflowed around token 40 - which
+// is why only long prompts failed.
+// ---------------------------------------------------------------------------
+TEST_F(ModelTest, LongPromptLogitsFinite) {
+    auto &tokenizer = SharedTestEnv::model->tokenizer();
+    const std::string prompt =
+            "<|im_start|>system\n"
+            "You are TinyCoder, an AI coding assistant. Be concise and answer "
+            "in plain prose without lists or code blocks unless asked.<|im_end|>\n"
+            "<|im_start|>user\n"
+            "What is the capital of France, and which river runs through the "
+            "city centre? Answer in one short sentence.<|im_end|>\n"
+            "<|im_start|>assistant\n";
+    auto tokens = tokenizer.encode(prompt);
+    ASSERT_GE(tokens.size(), 45u)
+            << "prompt tokenized to only " << tokens.size()
+            << " tokens; this test exists to reach the long-prompt regime";
+
+    auto model = SharedTestEnv::model;
+    model->clearKVCache();
+    auto logits = model->forward(tokens);
+
+    const auto &config = SharedTestEnv::config;
+    const size_t vocab = static_cast<size_t>(config.vocabSize);
+    ASSERT_GE(logits.size(), vocab);
+    const float *lastRow = logits.data() + (logits.size() - vocab);
+
+    size_t nonFinite = 0;
+    float best = -1e30f;
+    for (size_t i = 0; i < vocab; ++i) {
+        const float v = lastRow[i];
+        if (!std::isfinite(v)) ++nonFinite;
+        else
+            best = std::max(best, v);
+    }
+    EXPECT_EQ(nonFinite, 0u)
+            << "last-position logits contain " << nonFinite << " non-finite "
+            << "values; a long prompt overflows somewhere in the trunk "
+            << "(see the [gdn]([gpuM]) dumps behind TINYCODER_DUMP_GDN="
+            << "TINYCODER_DUMP_LAYERS)";
+    // A healthy forward on this checkpoint peaks around 17-20; a collapsed or
+    // numerically dead stream stays flat (the NaN case reported ~1e30 garbage).
+    EXPECT_LT(best, 200.0f) << "top logit " << best << " is not a sane value";
+
+    // Greedy decode: the second signature of this bug class is a context the
+    // model has stopped reading.  It shows up as a short repetition cycle
+    // ("The answer The answer The answer") while the top logit sits in a flat
+    // band, so decode enough tokens for a period-1..4 loop to be visible and
+    // print what came out - a keyword check that never shows the text is how
+    // the original failure was missed.
+    std::vector<int32_t> generated;
+    int32_t next = 0;
+    {
+        float bv = -1e30f;
+        for (size_t i = 0; i < vocab; ++i)
+            if (std::isfinite(lastRow[i]) && lastRow[i] > bv) {
+                bv = lastRow[i];
+                next = static_cast<int32_t>(i);
+            }
+        generated.push_back(next);
+    }
+    for (int step = 1; step < 16; ++step) {
+        auto l2 = model->forward(std::vector<int32_t>{next});
+        ASSERT_GE(l2.size(), vocab) << "decode step " << step << " returned "
+                                    << l2.size() << " logits";
+        const float *row = l2.data() + (l2.size() - vocab);
+        float bv = -1e30f;
+        int32_t best2 = -1;
+        for (size_t i = 0; i < vocab; ++i)
+            if (std::isfinite(row[i]) && row[i] > bv) {
+                bv = row[i];
+                best2 = static_cast<int32_t>(i);
+            }
+        ASSERT_GE(best2, 0) << "decode step " << step
+                            << " produced only non-finite logits";
+        generated.push_back(best2);
+        next = best2;
+    }
+    std::string text;
+    for (int32_t id: generated) text += tokenizer.decodeToken(id);
+    std::cout << "[LongPromptLogitsFinite] greedy: \"" << text << "\""
+              << std::endl;
+
+    // Detect a period-1..4 loop over the tail.  Only asserted for the hybrid
+    // recurrent checkpoint this bug lived in (64 layers, qwen35): a 1.5B dense
+    // model legitimately loops on some prompts and must not go red here.
+    //
+    // The comparison direction matters: the tail is walked BACKWARDS in the
+    // sense that each token is compared with the one `period` earlier, so the
+    // loop must start at `size - span` and run to the end.  The first version of
+    // this check started at `size - 1` with the condition `i + period < size`,
+    // which is false on the first iteration for every period >= 1: the body
+    // never ran, `same` stayed true, and the test reported a repetition loop
+    // unconditionally (it could not go green even on perfect output).  Require
+    // at least 6 consistent comparisons so a legitimate doubled token pair
+    // ("\n\n", "France France") does not trip it.
+    if (config.numLayers == 64 && generated.size() >= 12) {
+        bool looped = false;
+        for (size_t period = 1; period <= 4 && !looped; ++period) {
+            const size_t span = std::max<size_t>(2 * period, 6);
+            if (generated.size() < span + period) continue;
+            bool same = true;
+            for (size_t i = generated.size() - span; i < generated.size(); ++i)
+                if (generated[i] != generated[i - period]) same = false;
+            looped = same;
+        }
+        EXPECT_FALSE(looped)
+                << "greedy decoding fell into a repetition loop: \"" << text
+                << "\"; the model is not reading its context";
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Test: KV Cache Management
 // ---------------------------------------------------------------------------
 
@@ -384,8 +512,17 @@ TEST_P(SampleQuestionTest, AnswersQuestion) {
     const bool isQwen35MoE = (cfg.architecture == ARCH_QWEN35MOE &&
                               cfg.hiddenSize == 2048 &&
                               (cfg.numLayers == 40 || cfg.numLayers == 41));
+    // Ornith-1.5-9B (qwen35 dense hybrid, hidden 4096, 32 layers) was missing
+    // from this list, so the only 9B checkpoint in the benchmark table never
+    // had a text gate at all: its rows were published from throughput numbers
+    // while the engine could not answer a factual question on it.  It is the
+    // same architecture family as the 27B above, so the same content-based
+    // assertions apply; the token floor is trivially met.  Any new GGUF shape
+    // that gets a BENCHMARKS.md row must be added here in the same change.
+    const bool isOrnith9B = (cfg.architecture == ARCH_QWEN35 &&
+                             cfg.hiddenSize == 4096 && cfg.numLayers == 32);
     if (!isGptQwen025B && !isQwen25Coder7B && !isQwen25Coder15B &&
-        !isQwen3527B && !isBonsai && !isQwen35MoE) {
+        !isQwen3527B && !isBonsai && !isQwen35MoE && !isOrnith9B) {
         GTEST_SKIP() << "generation keyword assertions validated against the "
                         "IQ3_XXS Qwen2-0.5B and Qwen2.5-Coder-7B reference "
                         "models plus the Qwen3.6-27B (qwen35) model; loaded "
@@ -397,10 +534,15 @@ TEST_P(SampleQuestionTest, AnswersQuestion) {
     // On the 27B model answers can include a full C++ snippet with a preamble,
     // which needs a larger budget than the 64-token cap used for the small
     // reference models.
+    // Reasoning checkpoints (Ornith-9B emits a <think> block) need room for the
+    // deliberation before the factual answer appears; 160 tokens truncates
+    // mid-thought and looks like an incoherent model.
     const uint32_t maxGenTokens =
             isQwen25Coder7B ? 96u
-                            : ((isQwen3527B || isBonsai || isQwen35MoE) ? 160u
-                                                                        : 64u);
+                            : (isOrnith9B ? 384u
+                                          : ((isQwen3527B || isBonsai || isQwen35MoE)
+                                                     ? 160u
+                                                     : 64u));
 
     // Use formatChat() to build the prompt in an architecture-aware way
     std::string prompt = SharedTestEnv::model->formatChat(
@@ -611,7 +753,8 @@ TEST_F(ModelTest, DumpLayerHiddenNormsQwen2) {
     const auto &cfg = SharedTestEnv::config;
     const bool is15BIQ3 = (cfg.architecture == "qwen2" && cfg.hiddenSize == 1536 &&
                            cfg.numLayers == 28);
-    if (!is15BIQ3) {
+    const bool forceDump = std::getenv("TINYCODER_DUMP_ANY") != nullptr;
+    if (!is15BIQ3 && !forceDump) {
         GTEST_SKIP() << "only for 1.5B IQ3_XXS-imat";
     }
     uint32_t hiddenSize = cfg.hiddenSize;
@@ -835,14 +978,131 @@ TEST_F(ModelTest, CompareBatchVsSequentialPrefill) {
         std::cout << "maxDiff=" << maxDiff << std::endl;
     }
 
-    // Numeric gate: batch and sequential run identical deterministic kernels, so
-    // a large diff signals a routing/math bug (e.g. a scalar-broadcast bsum
-    // compensation counted 8x). top-1 must match exactly (Q3_K precision keeps
-    // the coherence guard meaningful).
-    EXPECT_LT(maxDiff, 5.0f)
+    // Numeric gate: batch and sequential must agree on the TOP-1 token.  The
+    // fast path is not byte-identical: the qwen35 prefill uses the int8
+    // tensor-core Q4_K INT8 GEMM (TINYCODER_INT8_GEMM_Q4K, default on) while decode
+    // uses the lean quantized GEMV, so their fp32 accumulation order differs
+    // (measured maxDiff ~6.6 on Ornith-1.5-9B, top-1 identical).  That is the
+    // same top-1 coherence contract the INT8 path is documented with; forcing
+    // TINYCODER_PREFILL_EXACT=1 restores the byte-identical integer GEMM and
+    // the strict bound.
+    const bool exactPrefill = [] {
+        const char *e = std::getenv("TINYCODER_PREFILL_EXACT");
+        return e != nullptr && e[0] != '\0' && e[0] != '0';
+    }();
+    const float maxDiffGate = exactPrefill ? 5.0f : 40.0f;
+    EXPECT_LT(maxDiff, maxDiffGate)
             << "Batch prefill differs significantly from sequential! maxDiff=" << maxDiff;
     EXPECT_TRUE(top1Match)
             << "Batch prefill produces different top-1 token than sequential!";
+
+    // ---- Method 3: prefill then decode, i.e. the Model::generate() order ----
+    //
+    // Neither method above mixes the two KV paths: method 1 only prefills and
+    // method 2 only decodes; generate() prefills and THEN decodes.  That order
+    // is the only one that exercises the decode-only int8 KV pool's rebuild
+    // from the f32 cache (TINYCODER_KV8, default on for qwen35), and it is
+    // where the bug this leg exists for lived:
+    //
+    //   the rebuild was guarded by ONE process-wide flag, which the first
+    //   full-attention layer to run it set.  Every later full-attention layer
+    //   skipped its own rebuild and attended the int8 rows of whatever
+    //   generation had run BEFORE.  Measured on the old engine: after
+    //   generate("Hello", maxTokens=10), "What is the capital of France?"
+    //   answered "Hello! I'm a student in the field of computer science", and a
+    //   Paris prompt before a question made that question answer "Paris".
+    //
+    // A short self-contained sequence keeps the leg cheap and makes it
+    // order-independent:
+    //   (a) reference = the sequence fed one token at a time from a clean
+    //       cache, so every int8 row is written by the decoder itself;
+    //   (b) prime every layer's int8 pool with a DIFFERENT sequence, decoded
+    //       token by token (a prefill would not do: it writes the f32 cache
+    //       only, which is the very gap under test).  Without this the leg
+    //       passes on the broken engine too, because method 2 runs immediately
+    //       before it and leaves exactly this prompt's rows in every pool — the
+    //       failure only shows when the stale rows are foreign text;
+    //   (c) the mixed sequence: clear, batch-prefill all but the last token,
+    //       then decode the last one.  Both (a) and (c) end in a seqLen==1
+    //       decode over the same rows, so they must agree as tightly as the
+    //       batch-vs-sequential pair above.
+    auto shortTokens =
+            SharedTestEnv::model->tokenizer().encode("What is the capital of France?");
+    if (shortTokens.size() < 3) {
+        shortTokens.assign(tokens.begin(),
+                           tokens.begin() + std::min<size_t>(tokens.size(), 6));
+    }
+    ASSERT_GE(shortTokens.size(), 2u) << "Need at least 2 tokens for this leg";
+
+    // (a) reference: token by token from a clean cache.
+    SharedTestEnv::model->clearKVCache();
+    np::Array<float> shortRef;
+    for (int32_t t: shortTokens) {
+        shortRef = SharedTestEnv::model->forward({t});
+    }
+    ASSERT_FALSE(shortRef.empty());
+
+    // (b) prime the int8 pools with a foreign sequence (decode rows only).
+    {
+        auto otherTokens = SharedTestEnv::model->tokenizer().encode("Hello world!");
+        if (otherTokens.empty()) otherTokens.push_back(shortTokens.front());
+        SharedTestEnv::model->clearKVCache();
+        // n-1 decode steps: each writes exactly one row of every layer's pool,
+        // and n-1 is the number of rows the mixed leg will attend.
+        for (size_t k = 0; k + 1 < shortTokens.size(); ++k) {
+            (void) SharedTestEnv::model->forward(
+                    {otherTokens[k % otherTokens.size()]}, false);
+        }
+    }
+
+    // (c) mixed: prefill all but the last token, then decode the last one.
+    SharedTestEnv::model->clearKVCache();
+    {
+        std::vector<int32_t> head(shortTokens.begin(), shortTokens.end() - 1);
+        (void) SharedTestEnv::model->forward(head, false);
+    }
+    auto mixedLogits = SharedTestEnv::model->forward({shortTokens.back()});
+    ASSERT_FALSE(mixedLogits.empty());
+    float mixedDiff = 0.0f;
+    int32_t mixedBestId = -1;
+    float mixedBest = -std::numeric_limits<float>::max();
+    for (uint32_t i = 0; i < vocabSize; ++i) {
+        const float v = mixedLogits.get(i);
+        mixedDiff = std::max(mixedDiff, std::abs(v - shortRef.get(i)));
+        if (v > mixedBest) {
+            mixedBest = v;
+            mixedBestId = static_cast<int32_t>(i);
+        }
+    }
+    int32_t refBestId = -1;
+    float refBest = -std::numeric_limits<float>::max();
+    for (uint32_t i = 0; i < vocabSize; ++i) {
+        if (shortRef.get(i) > refBest) {
+            refBest = shortRef.get(i);
+            refBestId = static_cast<int32_t>(i);
+        }
+    }
+    std::cout << "\n=== Prefill-then-decode vs token-by-token ("
+              << shortTokens.size() << " tokens) ===" << std::endl;
+    std::cout << "  maxDiff=" << mixedDiff << "  top-1=" << mixedBestId
+              << " (reference top-1=" << refBestId << ")" << std::endl;
+    // Dedicated bound, NOT the batch-vs-sequential one: both legs here end in
+    // the decode GEMV, so the LM-head GEMM/GEMV order difference that widens
+    // the pair above is absent.  Measured on the qwen35 27B EXL3 checkpoint:
+    // 0.02 on the fixed engine, 7.04 on the pre-fix one (one layer rebuilt its
+    // pool, 15 attended the foreign rows) — 2.0 sits ~100x above the pass and
+    // ~3.5x below the failure.
+    constexpr float kMixedGate = 2.0f;
+    EXPECT_LT(mixedDiff, kMixedGate)
+            << "A decode step after a batch prefill disagrees with the "
+               "token-by-token path: the decode-only int8 KV pool was not "
+               "rebuilt from the f32 cache for every layer. maxDiff="
+            << mixedDiff;
+    EXPECT_EQ(mixedBestId, refBestId)
+            << "Prefill-then-decode predicts a different next token than the "
+               "token-by-token path: the decode attended the wrong KV rows";
+    // Leave the cache clean for the tests that follow.
+    SharedTestEnv::model->clearKVCache();
 }
 
 // ===========================================================================
