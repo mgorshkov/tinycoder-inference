@@ -28,6 +28,7 @@ SOFTWARE.
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstring>
 #include <iostream>
@@ -485,32 +486,149 @@ namespace tinycoder {
         // GPU accumulation pass (per-rank kQ35MoeAccumScaled in rank order
         // 0..eu-1 reads down[r*seqLen*H + s*H + i]), so mixed CPU+GPU ranks
         // compose to the exact reference accumulation order.
-        std::vector<float> g(expertFF), u(expertFF), d(hiddenSize);
+        auto typeBytes = [](uint32_t t) -> uint32_t { return ggmlTypeSize(t); };
+        auto rowBytesFor = [&](const QuantizedMatrix &m) -> uint64_t {
+            const uint32_t bs = ggmlBlockSize(m.type);
+            const uint64_t bpr = (static_cast<uint64_t>(m.cols) + bs - 1) / bs;
+            return bpr * typeBytes(m.type);
+        };
+        auto batchMat = [&](const QuantizedMatrix &m, const uint8_t *w,
+                            const float *x, uint32_t n, uint32_t rows,
+                            uint32_t cols, float *out) -> bool {
+            switch (m.type) {
+                case GGML_TYPE_Q4_K:
+                    return matMulVecBatchQ4K_SIMD(w, x, n, rows, cols, out);
+                case GGML_TYPE_Q6_K:
+                    return matMulVecBatchQ6K_SIMD(w, x, n, rows, cols, out);
+                case GGML_TYPE_Q5_K:
+                    return matMulVecBatchQ5K_SIMD(w, x, n, rows, cols, out);
+                case GGML_TYPE_Q3_K:
+                    return matMulVecBatchQ3K_SIMD(w, x, n, rows, cols, out);
+                case GGML_TYPE_Q8_0:
+                    return matMulVecBatchQ8_0_SIMD(w, x, n, rows, cols, out);
+                default:
+                    return false;
+            }
+        };
+
+        std::vector<float> xg, gg, ug, dg;
         for (uint32_t r = 0; r < eu; ++r) {
             float *outRank = ffnOut + static_cast<size_t>(r) * seqLen * hiddenSize;
+            // Group this rank's tokens by expert.  The expert FFN is then a
+            // weight-stationary batch GEMM over the group instead of one
+            // mat-vec per token (the prefill bottleneck).
+            std::vector<std::vector<uint32_t>> byExpert(expertCount);
             for (uint32_t s = 0; s < seqLen; ++s) {
                 const int32_t e0 = expertIdx[static_cast<size_t>(s) * eu + r];
                 if (e0 < 0 || isResident(static_cast<uint32_t>(e0))) continue;
-                const uint32_t ue = static_cast<uint32_t>(e0);
-                const float *x = ffnNorm + static_cast<size_t>(s) * hiddenSize;
+                byExpert[static_cast<uint32_t>(e0)].push_back(s);
+            }
+            for (uint32_t ue = 0; ue < expertCount; ++ue) {
+                const auto &toks = byExpert[ue];
+                if (toks.empty()) continue;
+                const uint32_t n = static_cast<uint32_t>(toks.size());
                 const uint32_t gRows0 = ue * expertFF;
                 const uint32_t dRows0 = ue * hiddenSize;
+                const uint64_t gRowBytes = rowBytesFor(gateM);
+                const uint64_t dRowBytes = rowBytesFor(w.ffnDownExpsMoe);
+                if (n == 1 || forceScalarPath()) {
+                    std::vector<float> g(expertFF), u(expertFF), d(hiddenSize);
+                    for (uint32_t ti = 0; ti < n; ++ti) {
+                        const uint32_t s = toks[ti];
+                        const float *x = ffnNorm + static_cast<size_t>(s) * hiddenSize;
+                        if (fused) {
+                            gateM.matMulVecRows(x, gRows0 * 2, expertFF, g.data());
+                            gateM.matMulVecRows(x, gRows0 * 2 + expertFF, expertFF, u.data());
+                        } else {
+                            gateM.matMulVecRows(x, gRows0, expertFF, g.data());
+                            upM->matMulVecRows(x, gRows0, expertFF, u.data());
+                        }
+                        for (uint32_t i = 0; i < expertFF; ++i)
+                            g[i] = (g[i] / (1.0f + std::exp(-g[i]))) * u[i];
+                        w.ffnDownExpsMoe.matMulVecRows(g.data(), dRows0, hiddenSize, d.data());
+                        std::memcpy(outRank + static_cast<size_t>(s) * hiddenSize,
+                                    d.data(), hiddenSize * sizeof(float));
+                    }
+                    continue;
+                }
+                xg.resize(static_cast<size_t>(n) * hiddenSize);
+                for (uint32_t ti = 0; ti < n; ++ti) {
+                    std::memcpy(xg.data() + static_cast<size_t>(ti) * hiddenSize,
+                                ffnNorm + static_cast<size_t>(toks[ti]) * hiddenSize,
+                                hiddenSize * sizeof(float));
+                }
+                bool ok = false;
                 if (fused) {
-                    gateM.matMulVecRows(x, gRows0 * 2, expertFF, g.data());
-                    gateM.matMulVecRows(x, gRows0 * 2 + expertFF, expertFF,
-                                        u.data());
+                    gg.resize(static_cast<size_t>(n) * 2 * expertFF);
+                    ok = batchMat(gateM,
+                                  gateM.data.data() + static_cast<uint64_t>(ue) * 2 * expertFF * gRowBytes,
+                                  xg.data(), n, 2 * expertFF, hiddenSize, gg.data());
                 } else {
-                    gateM.matMulVecRows(x, gRows0, expertFF, g.data());
-                    upM->matMulVecRows(x, gRows0, expertFF, u.data());
+                    gg.resize(static_cast<size_t>(n) * expertFF);
+                    ug.resize(static_cast<size_t>(n) * expertFF);
+                    ok = batchMat(gateM,
+                                  gateM.data.data() + static_cast<uint64_t>(ue) * expertFF * gRowBytes,
+                                  xg.data(), n, expertFF, hiddenSize, gg.data());
+                    if (ok)
+                        ok = batchMat(*upM,
+                                      upM->data.data() + static_cast<uint64_t>(ue) * expertFF * rowBytesFor(*upM),
+                                      xg.data(), n, expertFF, hiddenSize, ug.data());
                 }
-                for (uint32_t i = 0; i < expertFF; ++i) {
-                    g[i] = (g[i] / (1.0f + std::exp(-g[i]))) * u[i];
+                if (!ok) {
+                    // Type/shape not covered by a batch kernel: per-token.
+                    std::vector<float> g(expertFF), u(expertFF), d(hiddenSize);
+                    for (uint32_t ti = 0; ti < n; ++ti) {
+                        const uint32_t s = toks[ti];
+                        const float *x = ffnNorm + static_cast<size_t>(s) * hiddenSize;
+                        if (fused) {
+                            gateM.matMulVecRows(x, gRows0 * 2, expertFF, g.data());
+                            gateM.matMulVecRows(x, gRows0 * 2 + expertFF, expertFF, u.data());
+                        } else {
+                            gateM.matMulVecRows(x, gRows0, expertFF, g.data());
+                            upM->matMulVecRows(x, gRows0, expertFF, u.data());
+                        }
+                        for (uint32_t i = 0; i < expertFF; ++i)
+                            g[i] = (g[i] / (1.0f + std::exp(-g[i]))) * u[i];
+                        w.ffnDownExpsMoe.matMulVecRows(g.data(), dRows0, hiddenSize, d.data());
+                        std::memcpy(outRank + static_cast<size_t>(s) * hiddenSize,
+                                    d.data(), hiddenSize * sizeof(float));
+                    }
+                    continue;
                 }
-                w.ffnDownExpsMoe.matMulVecRows(g.data(), dRows0, hiddenSize,
-                                               d.data());
-                float *dst = outRank + static_cast<size_t>(s) * hiddenSize;
-                for (uint32_t i = 0; i < hiddenSize; ++i) {
-                    dst[i] = d[i];
+                // SwiGLU for the whole batch.
+                if (fused) {
+                    for (uint32_t t = 0; t < n; ++t) {
+                        float *gp = gg.data() + static_cast<size_t>(t) * 2 * expertFF;
+                        for (uint32_t i = 0; i < expertFF; ++i) {
+                            const float gv = gp[i];
+                            const float uv = gp[expertFF + i];
+                            gp[i] = (gv / (1.0f + std::exp(-gv))) * uv;
+                        }
+                    }
+                    dg.resize(static_cast<size_t>(n) * hiddenSize);
+                    if (!batchMat(w.ffnDownExpsMoe,
+                                  w.ffnDownExpsMoe.data.data() + static_cast<uint64_t>(dRows0) * dRowBytes,
+                                  gg.data(), n, hiddenSize, expertFF, dg.data())) {
+                        continue;
+                    }
+                } else {
+                    for (uint32_t t = 0; t < n; ++t) {
+                        float *gp = gg.data() + static_cast<size_t>(t) * expertFF;
+                        const float *up = ug.data() + static_cast<size_t>(t) * expertFF;
+                        for (uint32_t i = 0; i < expertFF; ++i)
+                            gp[i] = (gp[i] / (1.0f + std::exp(-gp[i]))) * up[i];
+                    }
+                    dg.resize(static_cast<size_t>(n) * hiddenSize);
+                    if (!batchMat(w.ffnDownExpsMoe,
+                                  w.ffnDownExpsMoe.data.data() + static_cast<uint64_t>(dRows0) * dRowBytes,
+                                  gg.data(), n, hiddenSize, expertFF, dg.data())) {
+                        continue;
+                    }
+                }
+                for (uint32_t t = 0; t < n; ++t) {
+                    std::memcpy(outRank + static_cast<size_t>(toks[t]) * hiddenSize,
+                                dg.data() + static_cast<size_t>(t) * hiddenSize,
+                                hiddenSize * sizeof(float));
                 }
             }
         }
@@ -572,6 +690,16 @@ namespace tinycoder {
 
         const uint32_t eu = expertUsedCount;
 
+        // Optional CPU-phase attribution (TINYCODER_MOE_CPU_PROFILE=1).
+        const bool cpuProf = std::getenv("TINYCODER_MOE_CPU_PROFILE") != nullptr;
+        auto cpuNow = [] {
+            return std::chrono::duration<double, std::milli>(
+                           std::chrono::steady_clock::now().time_since_epoch())
+                    .count();
+        };
+        const double tR0 = cpuProf ? cpuNow() : 0.0;
+        double tGemm = 0.0, tScatter = 0.0, tRouter = 0.0;
+
         // ---- Reference router (CPU, fp32): softmax + top-k + renormalize ----
         // Build the per-token (rank -> expertId, weight) tables.
         std::vector<int32_t> expertIdx(static_cast<size_t>(seqLen) * eu);
@@ -622,6 +750,8 @@ namespace tinycoder {
                 }
             }
         }
+
+        if (cpuProf) tRouter = cpuNow() - tR0;
 
         // ---- Routed experts: BATCH over per-expert token groups ----
         // (2026-09-15 rewrite)  The old body dispatched parallelFor2D(seqLen,
@@ -803,7 +933,10 @@ namespace tinycoder {
                            static_cast<uint64_t>(dRows0) *
                                    rowBytes(w.ffnDownExpsMoe);
 
+                const double tB0 = cpuProf ? cpuNow() : 0.0;
                 if (routeBatch(grpCount, gateRows, upRows, downRows)) {
+                    if (cpuProf) tGemm += cpuNow() - tB0;
+                    const double tS0 = cpuProf ? cpuNow() : 0.0;
                     // Scatter the weighted partials into the disjoint slab
                     // rows (bit-identical wg * down per (s, r)).
                     for (uint32_t m = 0; m < grpCount; ++m) {
@@ -819,6 +952,7 @@ namespace tinycoder {
                             dst[i] = wg * src[i];
                         }
                     }
+                    if (cpuProf) tScatter += cpuNow() - tS0;
                     continue;
                 }
             }
@@ -866,6 +1000,14 @@ namespace tinycoder {
                     o[i] += src[i];
                 }
             }
+        }
+        if (cpuProf) {
+            const double total = cpuNow() - tR0;
+            std::fprintf(stderr,
+                         "[moe cpu] seq=%u router=%.1f gemm+swiglu=%.1f "
+                         "scatter=%.1f reduce+rest=%.1f total=%.1f ms\n",
+                         seqLen, tRouter, tGemm, tScatter,
+                         total - tRouter - tGemm - tScatter, total);
         }
     }
 

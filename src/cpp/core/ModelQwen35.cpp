@@ -41,7 +41,8 @@ SOFTWARE.
 //   attn_norm -> attn_qkv (Q|K|V fused: [keyDim*2 + valueDim] output),
 //   attn_gate (z) -> conv1d (kernel 4 over conv state, silu) -> slice
 //   q_conv/k_conv/v_conv -> L2-norm q/k -> repeat q,k over value heads
-//   (periodic: value-head hv reads k-head hv % nKHeads) -> gated delta net
+//   (contiguous groups: value-head hv reads k-head hv / (nVHeads/nKHeads),
+//   HF repeat_interleave) -> gated delta net
 //   recurrence (per value-head [headV, headV] state M stored transposed:
 //   M[j*Sv+i] = S[i][j], decay S *= exp(gate), delta, outer product,
 //   output M@q * 1/sqrt(headV)) -> gated RMSNorm with silu(z) -> ssm_out
@@ -124,7 +125,7 @@ namespace tinycoder {
         // NOT the MRoPE theta_scale (computed with nDims=64), so the MRoPE cache
         // is computed inline here. The standard rope tables are unused for qwen35.
         //
-        // CRITICAL: ggml's ggml_mrope_cache_init() seeds theta_base with the
+        // CRITICAL: the GGUF reference mrope cache initialization seeds theta_base with the
         // token POSITION (ggml_compute_forward_rope_flt passes p = pos[i2]), so
         // the angular frequency of pair k is  theta(k) = p * theta_scale^k
         // (freq_base enters ONLY through theta_scale = freq_base^(-2/n_dims)).
@@ -144,7 +145,7 @@ namespace tinycoder {
         }
 
         // Rotation helper (Neox-style: pair (k, k + nDimsHalf)).
-        // Matches ggml's rotate_pairs(n_dims, n_dims/2): for k in [0, n_dims/2),
+        // Matches the GGUF reference rotate_pairs(n_dims, n_dims/2): for k in [0, n_dims/2),
         // rotate the pair (head[k], head[k + n_dims/2]) with cache index k.
         auto rotateHead = [&](float *head, uint32_t p) {
             const float *cosRow =
@@ -360,7 +361,8 @@ namespace tinycoder {
     //   q_conv = l2_norm(conv_out[:keyDim])   reshaped [headK, nKHeads]
     //   k_conv = l2_norm(conv_out[keyDim:2*keyDim])
     //   v_conv = conv_out[2*keyDim:]          reshaped [headV, nVHeads]
-    //   repeat q,k nVHeads/nKHeads times (periodic: head hv reads head hv%16)
+    //   repeat q,k nVHeads/nKHeads times (contiguous groups: head hv reads
+    //   head hv / (nVHeads/nKHeads), NOT hv % nKHeads)
     //   per value-head h (state M_h [headV, headV], M[j*Sv+i] = S[i][j]):
     //     M *= exp(gate[h])
     //     delta[j] = (v[j] - dot(row_j(M), k)) * beta[h]
@@ -517,10 +519,15 @@ namespace tinycoder {
             const float *convK = convOut.data() + keyDim;
             const float *convV = convOut.data() + 2 * keyDim;
 
-            // L2-norm per k-head on q/k, then repeat over value heads
-            // (periodic: value head hv reads k-head hv % nKHeads).
+            // L2-norm per k-head on q/k, then repeat over value heads.
+            // The repeat is CONTIGUOUS GROUPS: value head hv reads k-head
+            // hv / (nVHeads / nKHeads) -- HF `repeat_interleave`, fla's
+            // `i_h // (HV // H)`.  A periodic hv % nKHeads mapping agrees with
+            // the reference only for hv == 0 and was the last correctness bug
+            // in this engine (branch 3.6 % small, logits 2x flat, decode loop).
+            const uint32_t ng = nKHeads > 0 ? nVHeads / nKHeads : 1u;
             for (uint32_t hv = 0; hv < nVHeads; ++hv) {
-                uint32_t hk = hv % nKHeads;
+                uint32_t hk = hv / ng;
                 const float *qSrc = convQ + static_cast<size_t>(hk) * headK;
                 const float *kSrc = convK + static_cast<size_t>(hk) * headK;
                 double sq = 0.0, sk = 0.0;
@@ -547,7 +554,7 @@ namespace tinycoder {
 
             // ---- Gated delta net recurrence ----
             // M layout per head: M[j*Sv + i] = S[i][j] (transposed store, so
-            // row j of M = column j of S, matching ggml's gated_delta_net).
+            // row j of M = column j of S, matching the reference gated delta net).
             for (uint32_t hv = 0; hv < nVHeads; ++hv) {
                 float *state = gdnState.data() + static_cast<size_t>(hv) * headV * headV;
                 const float *qHead = qN.data() + static_cast<size_t>(hv) * headK;

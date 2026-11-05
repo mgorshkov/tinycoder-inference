@@ -48,6 +48,43 @@ namespace tinycoder {
             return s;
         };
 
+        // Qwen35 (Qwen3.8) and Qwen35MoE (Qwen3-Omni hybrid) embed a large
+        // multiturn/tool Jinja template (macros, namespaces, `~` concat,
+        // raise_exception) that the lightweight ChatTemplateRenderer cannot
+        // evaluate faithfully. Use the plain Qwen3-style <|im_start|> framing
+        // instead of the mangled rendered output.
+        //
+        // This branch MUST stay above the `chatTemplate.empty()` fallback: the
+        // EXL3 checkpoints carry no template at all (`chatTemplate` is empty),
+        // so with the order reversed they fell into the generic fallback, which
+        // calls applyRefWrap() and re-introduces exactly the wrap removed here.
+        // Measured on qwen3.8-27B-exl3-1.60bpw: the wrapped prompt
+        // ("<|im_start|>user\n$<system><|im_end|>\n...<|im_start|>assistant\n
+        // <|im_end|>\n<|im_start|>assistant\n") made greedy decoding open a
+        // code block and then collapse into repeated fence/python tokens
+        // instead of answering the question.
+        //
+        // NOTE: the reference CLI "$" wrap is deliberately NOT applied here.
+        // It was originally added for token-count parity with the reference CLI's
+        // -p evaluation, but it produces a prompt the model cannot follow:
+        // measured on Ornith-1.5-35B-A3B-Q8_0 (qwen35moe), the stray '$' plus
+        // the duplicated <|im_start|>assistant header makes the model read the
+        // ENTIRE prompt as a template placeholder (thinking: "The user has just
+        // sent \"$user$\" ... no actual question") and reply with a
+        // clarification request instead of the code. This is the same failure
+        // mode documented for ARCH_QWEN2 below. Correct generation wins over
+        // token-count parity with the reference CLI.
+        if (config_.architecture == ARCH_QWEN35 || config_.architecture == ARCH_QWEN35MOE) {
+            std::string result;
+            for (const auto &msg: messages) {
+                result += "<|im_start|>" + msg.first + "\n" + msg.second + "<|im_end|>\n";
+            }
+            if (addGenerationPrompt) {
+                result += "<|im_start|>assistant\n";
+            }
+            return result;
+        }
+
         // If no chat template is available, fall back to architecture-specific default
         if (config_.chatTemplate.empty()) {
             if (config_.architecture == ARCH_GEMMA4) {
@@ -71,33 +108,6 @@ namespace tinycoder {
                 }
                 return applyRefWrap(result);
             }
-        }
-
-        // Qwen35 (Qwen3.8) and Qwen35MoE (Qwen3-Omni hybrid) embed a large
-        // multiturn/tool Jinja template (macros, namespaces, `~` concat,
-        // raise_exception) that the lightweight ChatTemplateRenderer cannot
-        // evaluate faithfully. Use the plain Qwen3-style <|im_start|> framing
-        // instead of the mangled rendered output.
-        //
-        // NOTE: the reference CLI "$" wrap is deliberately NOT applied here.
-        // It was originally added for token-count parity with the reference CLI's
-        // -p evaluation, but it produces a prompt the model cannot follow:
-        // measured on Ornith-1.5-35B-A3B-Q8_0 (qwen35moe), the stray '$' plus
-        // the duplicated <|im_start|>assistant header makes the model read the
-        // ENTIRE prompt as a template placeholder (thinking: "The user has just
-        // sent \"$user$\" ... no actual question") and reply with a
-        // clarification request instead of the code. This is the same failure
-        // mode documented for ARCH_QWEN2 below. Correct generation wins over
-        // token-count parity with the reference CLI.
-        if (config_.architecture == ARCH_QWEN35 || config_.architecture == ARCH_QWEN35MOE) {
-            std::string result;
-            for (const auto &msg: messages) {
-                result += "<|im_start|>" + msg.first + "\n" + msg.second + "<|im_end|>\n";
-            }
-            if (addGenerationPrompt) {
-                result += "<|im_start|>assistant\n";
-            }
-            return result;
         }
 
         // Qwen2 / Qwen2.5-series models (including Qwen2.5-Coder) ship a Jinja

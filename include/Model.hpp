@@ -72,7 +72,7 @@ namespace tinycoder {
         // Eliminates bit extraction overhead in the SIMD kernel.
         AlignedVector<uint8_t> prepackedData;
 
-        bool empty() const { return data.empty(); }
+        bool empty() const { return data.empty() && exl3 == nullptr; }
 
         /// @brief Compute y = x * W^T where W is this quantized matrix.
         /// Dequantizes the matrix and uses np::Array::dot() for multiplication.
@@ -1045,7 +1045,8 @@ namespace tinycoder {
         // @brief Process one recurrent (gated delta net) qwen35 layer:
         // attn_qkv, attn_gate (z), ssm_beta/ssm_alpha/ssm_dt/ssm_a
         // (gate/decay), conv1d with silu, L2-norm'ed q/k repeated over value
-        // heads (periodic hv % nKHeads), the gated delta net recurrence (per
+        // heads (contiguous groups, hv / (nVHeads/nKHeads)), the gated delta
+        // net recurrence (per
         // value-head [headV, headV] state M stored transposed: M[j][i] =
         // S[i][j]), gated RMSNorm with silu(z), ssm_out projection and residual
         // add.

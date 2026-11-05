@@ -69,6 +69,14 @@ protected:
                                      ? std::string("no model path")
                                      : SharedTestEnv::loadError);
         }
+        // EXL3 native-only: the loader keeps the packed trellis and does not
+        // materialize the 54 GB host F16 copy, so CPU-reference comparisons
+        // are not available.  The GPU path is covered by ModelTest; use
+        // TINYCODER_EXL3_F16=1 to force host F16.
+        if (SharedTestEnv::modelPath.find("exl3") != std::string::npos ||
+            SharedTestEnv::modelPath.find("EXL3") != std::string::npos) {
+            GTEST_SKIP() << "EXL3 native-only loader has no host F16 reference";
+        }
     }
 
     /// @brief Print a hex dump of raw block data for comparison.

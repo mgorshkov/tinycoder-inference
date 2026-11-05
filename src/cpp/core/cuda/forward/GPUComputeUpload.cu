@@ -1,4 +1,28 @@
 /*
+ ⚡ TinyCoder AI
+
+ Copyright (c) 2026 Mikhail Gorshkov (mikhail.gorshkov@gmail.com)
+
+ Permission is hereby granted, free of charge, to any person obtaining a copy
+ of this software and associated documentation files (the "Software"), to deal
+ in the Software without restriction, including without limitation the rights
+ to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ copies of the Software, and to permit persons to whom the Software is
+ furnished to do so, subject to the following conditions:
+
+ The above copyright notice and this permission notice shall be included in all
+ copies or substantial portions of the Software.
+
+ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+ SOFTWARE.
+*/
+
+/*
  * TinyCoder CUDA GPU offload engine -- upload & scratch
  *
  * Part of the CUDA offload engine split out of the former GPUCompute.cu.  The
@@ -9,6 +33,7 @@
 #ifdef USE_CUDA
 
 #include "GPUComputeInternal.hpp"
+#include "Q4KRequant.hpp"
 #include "EXL3Kernels.hpp"
 
 #include <cublas_v2.h>
@@ -76,6 +101,13 @@ namespace tinycoder::gpu {
                 errMsg = std::string("cudaMalloc(scratch ") + what + "): " +
                          cudaGetErrorString(e);
                 return false;
+            }
+            if (std::getenv("TINYCODER_MEMTRACE") && n >= (8u << 20)) {// TEMP
+                size_t fb = 0, tb = 0;
+                cudaMemGetInfo(&fb, &tb);
+                std::fprintf(stderr, "[scratch] %-14s %7.1f MiB free=%7.1f\n",
+                             what, static_cast<double>(n) / 1048576.0,
+                             static_cast<double>(fb) / 1048576.0);
             }
             return true;
         };
@@ -155,15 +187,23 @@ namespace tinycoder::gpu {
                         static_cast<uint64_t>(geom_.ssmConvKernel) *
                                 q35QkvDim * sizeof(float),
                         "q35convin") ||
+                // convOut/qN/kN/vN are BATCHED over the prompt ([seqLen][...]):
+                // the prefill recurrent block runs one channel-scan conv kernel
+                // and one head-scan GDN kernel over the whole chunk instead of
+                // per-token launches (~0.1 ms/token/layer of launch+latency at
+                // 512 tokens).  Decode (seqLen==1) uses row 0 only.
                 !allocT(scratch_.convOut,
-                        static_cast<uint64_t>(q35QkvDim) * sizeof(float),
+                        static_cast<uint64_t>(cap) * q35QkvDim * sizeof(float),
                         "q35convout") ||
                 !allocT(scratch_.qN,
-                        static_cast<uint64_t>(q35Kvn) * sizeof(float), "q35qn") ||
+                        static_cast<uint64_t>(cap) * q35Kvn * sizeof(float),
+                        "q35qn") ||
                 !allocT(scratch_.kN,
-                        static_cast<uint64_t>(q35Kvn) * sizeof(float), "q35kn") ||
+                        static_cast<uint64_t>(cap) * q35Kvn * sizeof(float),
+                        "q35kn") ||
                 !allocT(scratch_.vN,
-                        static_cast<uint64_t>(q35Vn) * sizeof(float), "q35vn") ||
+                        static_cast<uint64_t>(cap) * q35Vn * sizeof(float),
+                        "q35vn") ||
                 !allocT(scratch_.gdnOut,
                         static_cast<uint64_t>(cap) * q35Vn * sizeof(float),
                         "q35gdn") ||
@@ -256,6 +296,8 @@ namespace tinycoder::gpu {
             if (const char *ac = std::getenv("TINYCODER_ATTN_SPLIT_CHUNK")) {
                 int v = std::atoi(ac);
                 if (v > 0) attnChunk_ = static_cast<uint32_t>(v);
+            } else if (geom_.numAttentionHeads == 12 && geom_.headDim == 128) {
+                attnChunk_ = 32;
             }
             attnChunks_ = (geom_.maxSeqLen + attnChunk_ - 1) / attnChunk_;
             if (attnChunks_ == 0) attnChunks_ = 1;
@@ -320,6 +362,14 @@ namespace tinycoder::gpu {
         }
         scratch_.seqCap = cap;
         scratchAlloc_ = true;
+        if (std::getenv("TINYCODER_MEMTRACE")) {// TEMP
+            size_t fb = 0, tb = 0;
+            cudaMemGetInfo(&fb, &tb);
+            std::fprintf(stderr,
+                         "[phase] scratch(seq=%u): used=%.1f MiB free=%.1f MiB\n",
+                         seqLen, static_cast<double>(tb - fb) / 1048576.0,
+                         static_cast<double>(fb) / 1048576.0);
+        }
         return true;
     }
 
@@ -405,6 +455,11 @@ namespace tinycoder::gpu {
                                    const PrismGPUConfig &prism,
                                    std::string &errMsg,
                                    const Exl3LinearInfo *lmHeadExl3) {
+        // The sm_75 Q8_0 int8-MMA tile loader corrupts the fixup for
+        // Q8-dominant checkpoints (Ornith-9B-Q8_0: illegal access); keep the
+        // path for Q4/Q5/Q6 models, which use Q8_0 only for side matrices.
+        int8GemmSetQ8Enabled(true);
+
         if (allocated_) destroy();
         // Clear any sticky CUDA error from a previous failed attempt (e.g. an
         // earlier upload's cudaMalloc OOM).  cudaGetLastError() consumes it;
@@ -453,6 +508,13 @@ namespace tinycoder::gpu {
                          cudaGetErrorString(e);
                 return false;
             }
+            if (std::getenv("TINYCODER_MEMTRACE") && bytes >= (8u << 20)) {// TEMP
+                size_t fb = 0, tb = 0;
+                cudaMemGetInfo(&fb, &tb);
+                std::fprintf(stderr, "[upload] %-14s %7.1f MiB free=%7.1f\n",
+                             what, static_cast<double>(bytes) / 1048576.0,
+                             static_cast<double>(fb) / 1048576.0);
+            }
             return true;
         };
         auto uploadBytes = [&](void *dst, const void *src, size_t bytes,
@@ -486,6 +548,18 @@ namespace tinycoder::gpu {
             // every partially-allocated device buffer on a mid-upload OOM.
             // Bypass the guard so the partial allocations (layer matrices,
             // embedQ_, rope/MRoPE tables, q35 state, KV slots) are released.
+            // Quiesce the device FIRST: destroy() cudaFrees every buffer
+            // immediately, and if any launch from the current forward is still
+            // in flight the free turns into a use-after-free.  That is what
+            // poisoned the context on the pp768 OOM: the sticky error from the
+            // in-flight kernel made every later cudaMalloc report "illegal
+            // memory access", which then surfaced as the misleading
+            // "gate/up int8Gemm unsupported" and an unbounded CPU fallback.
+            // Synchronising here makes the failure clean: the OOM is the only
+            // error, destroy() releases everything, the sticky error is
+            // consumed below, and the caller's hybrid retry starts from a
+            // consistent (fully deallocated) device state.
+            (void) cudaDeviceSynchronize();
             allocated_ = true;
             destroy();
             // Consume the sticky CUDA error left by the failed cudaMalloc.
@@ -494,6 +568,9 @@ namespace tinycoder::gpu {
             // stale "out of memory" and aborts a healthy hybrid retry.
             (void) cudaGetLastError();
         };
+        // Diagnostics: how many EXL3 linears aliased a device-resident
+        // trellis versus copied it from host (TINYCODER_MEMTRACE=1).
+        size_t exl3Aliased_ = 0, exl3Copied_ = 0;
         // Early-return sites below route through a common helper so the
         // partial allocations are always released on failure.
         auto uploadMat = [&](const DeviceMatrix &src, DeviceMatrix &dst,
@@ -512,16 +589,24 @@ namespace tinycoder::gpu {
                 h.suh = src.exl3->suh;
                 h.svh = src.exl3->svh;
                 exl3gpu::Exl3FusedLinear fl;
-                if (!exl3gpu::uploadFusedLinear(h, fl, errMsg)) {
+                // Prefer aliasing a trellis that is already device-resident:
+                // on that path the fused registry borrows the caller's buffer
+                // and no second copy of the weight bytes is created.  A host
+                // trellis (the safetensors mmap) takes the copy path.
+                bool aliased = false;
+                if (!exl3gpu::uploadFusedLinearPreferDevice(h, fl, aliased,
+                                                            errMsg)) {
                     failCleanup(name);
                     return false;
                 }
+                (aliased ? exl3Aliased_ : exl3Copied_) += 1;
                 dst.q = const_cast<void *>(fl.trellis);
                 exl3Owned_.push_back({const_cast<void *>(fl.trellis),
                                       const_cast<void *>(
                                               static_cast<const void *>(fl.suh)),
                                       const_cast<void *>(
-                                              static_cast<const void *>(fl.svh))});
+                                              static_cast<const void *>(fl.svh)),
+                                      fl.ownsBuffers});
                 return true;
             }
             dst = src;
@@ -752,6 +837,82 @@ namespace tinycoder::gpu {
                     expertCount_ = geom_.expertCount;
                     expertUsed_ = geom_.expertUsedCount;
                     expertHM_ = geom_.hiddenSize;
+                    // ---- MoE experts: Q8_0 -> Q4_K requant (2026-11-10) --
+                    // A3B `q8_0` is 34.4 GB: 3.34 MB per expert slot x 2
+                    // gate/up + down cannot be cached on 11 GB, so the cache
+                    // build failed and the ENTIRE model ran CPU experts
+                    // (26 tok/s, measured).  Q4_K halves the bytes and lands
+                    // the experts on the grouped int8 prefill path.
+                    static const bool moeQ8Q4K = [] {
+                        const char *e = std::getenv("TINYCODER_MOE_Q8_Q4K");
+                        return e == nullptr || e[0] != '0';
+                    }();
+                    if (moeQ8Q4K && expertCache_[L].gateType == kTypeQ8_0 &&
+                        expertFF_ != 0 && expertHM_ != 0 &&
+                        (expertHM_ & 255u) == 0 && (expertFF_ & 255u) == 0 &&
+                        expertCache_[L].hostGate != nullptr &&
+                        expertCache_[L].hostUp != nullptr &&
+                        expertCache_[L].hostDown != nullptr) {
+                        q4k::AlignedBlob g, u, d;
+                        const bool okAll =
+                                q4k::allocAligned(
+                                        g, q4k::q4kBytes(expertCount_ * expertFF_,
+                                                         expertHM_)) &&
+                                q4k::allocAligned(
+                                        u, q4k::q4kBytes(expertCount_ * expertFF_,
+                                                         expertHM_)) &&
+                                q4k::allocAligned(
+                                        d, q4k::q4kBytes(expertCount_ * expertHM_,
+                                                         expertFF_)) &&
+                                q4k::q8ToQ4kInto(expertCache_[L].hostGate,
+                                                 expertCount_ * expertFF_,
+                                                 expertHM_,
+                                                 const_cast<uint8_t *>(g.data()),
+                                                 32) &&
+                                q4k::q8ToQ4kInto(expertCache_[L].hostUp,
+                                                 expertCount_ * expertFF_,
+                                                 expertHM_,
+                                                 const_cast<uint8_t *>(u.data()),
+                                                 32) &&
+                                q4k::q8ToQ4kInto(expertCache_[L].hostDown,
+                                                 expertCount_ * expertHM_,
+                                                 expertFF_,
+                                                 const_cast<uint8_t *>(d.data()),
+                                                 32);
+                        if (okAll) {
+                            expertCache_[L].hostGate = g.data();
+                            expertCache_[L].hostUp = u.data();
+                            expertCache_[L].hostDown = d.data();
+                            expertRequant_.push_back(std::move(g));
+                            expertRequant_.push_back(std::move(u));
+                            expertRequant_.push_back(std::move(d));
+                            expertCache_[L].gateType = kTypeQ4K;
+                            expertCache_[L].downType = kTypeQ4K;
+                            expertCache_[L].gateRowBytes =
+                                    (expertHM_ / 256u) * 144u;
+                            expertCache_[L].downRowBytes =
+                                    (expertFF_ / 256u) * 144u;
+                            expertHostGate_ = expertCache_[L].hostGate;
+                            expertHostUp_ = expertCache_[L].hostUp;
+                            expertHostDown_ = expertCache_[L].hostDown;
+                            expertType_ = kTypeQ4K;
+                            expertDownType_ = kTypeQ4K;
+                            expertRowBytesGate_ = expertCache_[L].gateRowBytes;
+                            expertRowBytesDown_ = expertCache_[L].downRowBytes;
+                            ++expertRequantLayers_;
+                            if (expertRequantLayers_ == 1)
+                                std::fprintf(stderr,
+                                             "[gpu] MoE experts requantized "
+                                             "Q8_0 -> Q4_K (%.0f MB/layer)\n",
+                                             static_cast<double>(
+                                                     3ull * q4k::q4kBytes(
+                                                                    expertCount_ *
+                                                                            expertFF_,
+                                                                    expertHM_)) /
+
+                                                     1048576.0);
+                        }
+                    }
                 }
                 // Shared-expert matrices (gate/up/down quantized; the gate
                 // vector ffn_gate_inp_shexp is F32 [1 x hidden]).
@@ -884,7 +1045,9 @@ namespace tinycoder::gpu {
                 h.suh = lmHeadExl3->suh;
                 h.svh = lmHeadExl3->svh;
                 exl3gpu::Exl3FusedLinear fl;
-                if (!exl3gpu::uploadFusedLinear(h, fl, errMsg)) {
+                bool aliased = false;
+                if (!exl3gpu::uploadFusedLinearPreferDevice(h, fl, aliased,
+                                                            errMsg)) {
                     failCleanup("lmHeadQ");
                     return false;
                 }
@@ -895,7 +1058,8 @@ namespace tinycoder::gpu {
                                       const_cast<void *>(
                                               static_cast<const void *>(fl.suh)),
                                       const_cast<void *>(
-                                              static_cast<const void *>(fl.svh))});
+                                              static_cast<const void *>(fl.svh)),
+                                      fl.ownsBuffers});
             } else {
                 uint64_t lmBytes =
                         static_cast<uint64_t>(geom.vocabSize) * lmHeadRowBytes;
@@ -938,7 +1102,7 @@ namespace tinycoder::gpu {
 
         // ---- Qwen35 MRoPE cache [maxSeqLen][ropeDimensionCount/2] ----
         // Mirrors Model::applyMRoPE's theta_scale = thetaBase^(-2/nDims) with the
-        // cache STARTING theta at 1.0f (not thetaBase: ggml seeds mrope cache
+        // cache STARTING theta at 1.0f (not thetaBase: the GGUF reference seeds mrope cache
         // theta with the token POSITION, so freq_base enters only through
         // theta_scale).  The standard rope tables above are unused for qwen35.
         if (geom_.architecture == 1 || geom_.architecture == 2) {
@@ -1035,6 +1199,34 @@ namespace tinycoder::gpu {
             return false;
         cudaMemsetAsync(kvK_, 0, static_cast<size_t>(kvAllocBytes), g_stream);
         cudaMemsetAsync(kvV_, 0, static_cast<size_t>(kvAllocBytes), g_stream);
+
+        // Decode-only int8 KV pool (TINYCODER_KV8=1).  F32 KV stays for prefill;
+        // the first decode token converts it, then decode reads int8 + scales.
+        {
+            const char *k8e = std::getenv("TINYCODER_KV8");
+            // Default ON for the dense qwen35 decode (measured +0.4% at pp512,
+            // +1.6% at pp2048, +1.7% at pp4096); TINYCODER_KV8=0 opts out.
+            kv8_ = (geom_.architecture == 1u) &&
+                   !(k8e != nullptr && k8e[0] == '0');
+            kv8Ready_ = false;
+            if (kv8_) {
+                // +16: the decode token is written at index maxSeqLen when the
+                // prompt already fills the window (benchmark pp=2048).
+                const uint64_t cap = static_cast<uint64_t>(geom_.maxSeqLen) + 16u;
+                kv8LayerStride_ = cap * geom_.numKVHeads * geom_.headDim;
+                kv8ScaleStride_ = cap * geom_.numKVHeads * sizeof(float);
+                const size_t kb = static_cast<size_t>(kvSlots_ * kv8LayerStride_);
+                const size_t sb = static_cast<size_t>(kvSlots_ * kv8ScaleStride_);
+                if (cudaMalloc(&kvK8_, kb) != cudaSuccess ||
+                    cudaMalloc(&kvV8_, kb) != cudaSuccess ||
+                    cudaMalloc(reinterpret_cast<void **>(&kvK8Scale_), sb) != cudaSuccess ||
+                    cudaMalloc(reinterpret_cast<void **>(&kvV8Scale_), sb) != cudaSuccess) {
+                    return false;
+                }
+                cudaMemsetAsync(kvK8_, 0, kb, g_stream);
+                cudaMemsetAsync(kvV8_, 0, kb, g_stream);
+            }
+        }
 
         // ---- Persistent fp16 twins: DEFERRED partial-set pass (2026-10-01) ----
         // Every quantized weight / KV / embed / scratch buffer is now resident,
@@ -1162,6 +1354,16 @@ namespace tinycoder::gpu {
         kvPos_ = 0;
         allocated_ = true;
         cudaStreamSynchronize(g_stream);
+        if (std::getenv("TINYCODER_MEMTRACE")) {// TEMP
+            size_t fb = 0, tb = 0;
+            cudaMemGetInfo(&fb, &tb);
+            std::fprintf(stderr,
+                         "[phase] upload end: used=%.1f MiB free=%.1f MiB "
+                         "exl3 aliased=%zu copied=%zu\n",
+                         static_cast<double>(tb - fb) / 1048576.0,
+                         static_cast<double>(fb) / 1048576.0, exl3Aliased_,
+                         exl3Copied_);
+        }
         if (twinEnabled_) {
             std::fprintf(stderr,
                          "[gpu] prefill fp16 twins: %u matrices, %.1f MiB "

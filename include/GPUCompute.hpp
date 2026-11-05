@@ -30,6 +30,7 @@ SOFTWARE.
 #include "IModelLoader.hpp"
 #include <string>
 #include <vector>
+#include "Q4KRequant.hpp"
 
 #ifdef USE_CUDA
 
@@ -208,6 +209,24 @@ namespace tinycoder::gpu {
                              std::string &errMsg,
                              const Exl3LinearInfo *lmHeadExl3 = nullptr);
 
+        /// @brief Grouped-expert GPU MMQ for prefill.
+        ///
+        /// Streams one expert's gate/up/down slice to the device, batches all
+        /// tokens routed to that expert through int8Gemm, then accumulates the
+        /// weighted down rows into the host ffnOut.  The expert weights are
+        /// host-resident, so this works even when the full expert set does not
+        /// fit VRAM.  Returns false when a type/shape is not covered (caller
+        /// falls back to the CPU grouped path).
+        bool moeBatchExperts(const uint8_t *gate, uint32_t gateType,
+                             uint32_t gateRowsPerExpert, const uint8_t *up,
+                             uint32_t upType, uint32_t upRowsPerExpert,
+                             const uint8_t *down, uint32_t downType,
+                             uint32_t downRowsPerExpert, const float *normHost,
+                             float *outHost, uint32_t seqLen, uint32_t hidden,
+                             uint32_t expertFF, const int32_t *expertIdx,
+                             const float *expertWgt, uint32_t expertsUsed,
+                             uint32_t expertCount, std::string &errMsg);
+
         /// @brief Copy the current GPU-side hidden state (after the offloaded layer
         /// prefix) back to the host.  Used by the partial-offload path: the caller
         /// feeds this vector into the CPU Model::forward for the remaining layers.
@@ -268,6 +287,10 @@ namespace tinycoder::gpu {
         /// driver to slice the cached expert matrices.  Grown on demand;
         /// indexed [seqLen * expertUsed].
         std::vector<int32_t> moeRouterIdxHost_;
+        // GPU router scratch (TINYCODER_GPU_ROUTER): [seqLen*expertUsed]
+        // int32 indices followed by float weights.
+        void *moeRouterDev_ = nullptr;
+        uint64_t moeRouterDevBytes_ = 0;
         std::vector<float> moeRouterWgtHost_;
 
         /// @brief Qwen35-specific forward (embed + offloaded layer prefix).
@@ -319,6 +342,25 @@ namespace tinycoder::gpu {
                                           std::string &errMsg,
                                           const uint8_t **downQOut = nullptr);
 
+        /// @brief Prefill expert residency: DIRECT-MAPPED full-layer arena.
+        ///
+        /// The 2-way cache above holds 64 slots per layer, but a 512-token
+        /// prefill routes to essentially every expert of every layer (~250 of
+        /// 256), so the 2-way sets thrash and each layer re-reads ~2.7x its
+        /// distinct expert bytes (measured 51.2 GB moved for a 20.2 GB model at
+        /// pp512).  This arena instead holds ALL experts of ONE layer at a time
+        /// (expertCount * slotBytes, ~466 MB) so a layer fills each expert
+        /// EXACTLY ONCE per pass; residency is tracked by an epoch stamp that
+        /// beginExpertArenaEpoch() bumps per layer.  Byte traffic then equals
+        /// the distinct expert bytes = what llama.cpp streams.
+        const uint8_t *ensureExpertArenaCached(uint32_t L, uint32_t e,
+                                               std::string &errMsg,
+                                               const uint8_t **downQOut = nullptr);
+        /// @brief Invalidate every arena slot (call once per layer pass).
+        void beginExpertArenaEpoch();
+        /// @brief g_stream must wait for expert e's arena fill (no-op if warm).
+        void waitExpertArenaFill(uint32_t e);
+
         /// @brief Free all device resources.
         ~GPUModel();
 
@@ -367,56 +409,6 @@ namespace tinycoder::gpu {
         float debugQGemvRow(uint32_t type, const uint8_t *wRow,
                             uint32_t blocksPerRow, const float *x,
                             uint32_t cols, uint32_t rowBytes);
-
-        /// @brief Debug: run the int8 tensor-core MMQ GEMM/GEMV
-        /// (kQuantizeQ8K + kMmqGemm_8x8x16, mma.s8.m8n8k16) on an already-packed
-        /// IQ3_XXS matrix and a batch of activations.  This is the SAME kernel
-        /// for prefill (seq > 1) and decode (seq == 1) -- one warp per
-        /// (8-token x 8-row) output tile, one block per 8-row weight tile
-        /// spanning 64 tokens.
-        /// @param wPacked int8 B cells from Int8Pack::packMma
-        ///        (ceil(rows/8) * ceil(cols/16) * 128 bytes)
-        /// @param wScales per-(n8-tile, k16-tile, n-row) group scales from
-        ///        Int8Pack::packMma (ceil(rows/8) * ceil(cols/16) * 8 floats)
-        /// @param rows, cols PACKED matrix geometry (cols must be a multiple of
-        ///        32 so a weight k16-tile never straddles a 32-group)
-        /// @param x seq-row-major fp32 activation (seq * cols)
-        /// @param seq Number of activation rows (prefill batch / 1 for decode)
-        /// @param out seq-row-major fp32 output (seq * rows)
-        /// @param outXq Optional: receives the GPU-quantized Q8_K activations
-        ///        (seq * ceil(cols/256) * kQ8K_STRIDE bytes) so the caller can
-        ///        recompute the reference on the EXACT bytes the kernel used.
-        /// @return false (out untouched) if this GPU has no int8 m8n8k16
-        ///        tensor-core mma (pre-Turing) or CUDA is unavailable.
-        bool debugMmqGemm(const int8_t *wPacked, const float *wScales,
-                          uint32_t rows, uint32_t cols, const float *x,
-                          uint32_t seq, float *out, uint8_t *outXq);
-
-        /// @brief Debug: run the AFFINE Q4_K int8 tensor-core MMQ GEMM/GEMV
-        /// (kQuantizeQ8K + kMmqGemmQ4K_Affine, mma.s8.m8n8k16) on an
-        /// already-packed Q4_K matrix and a batch of activations.  Q4_K
-        /// dequantizes as w = d*sc*q - dmin*m, so unlike the pure-scale
-        /// kMmqGemm_8x8x16 this kernel adds the per-32-group activation-sum
-        /// min term outside the tensor core.  Used by unit tests to compare the
-        /// affine mma path against kQGemmKxQ8K<kTypeQ4K>.
-        /// @param qPacked int8 B cells from Int8Pack::packMmaQ4K
-        ///        (ceil(rows/8) * ceil(cols/16) * 128 bytes)
-        /// @param dsc,dmn per-(n8-tile, k16-tile, n-row) d*sc / dmin*m floats
-        ///        from Int8Pack::packMmaQ4K (ceil(rows/8)*ceil(cols/16)*8 each)
-        /// @param rows, cols PACKED matrix geometry (cols must be a multiple of
-        ///        32 so a weight k16-tile never straddles a 32-group)
-        /// @param x seq-row-major fp32 activation (seq * cols)
-        /// @param seq Number of activation rows (prefill batch / 1 for decode)
-        /// @param out seq-row-major fp32 output (seq * rows)
-        /// @param outXq Optional: receives the GPU-quantized Q8_K activations
-        ///        (seq * ceil(cols/256) * kQ8K_STRIDE bytes) so the caller can
-        ///        recompute the reference on the EXACT bytes the kernel used.
-        /// @return false (out untouched) if this GPU has no int8 m8n8k16
-        ///        tensor-core mma (pre-Turing) or CUDA is unavailable.
-        bool debugMmqQ4K(const int8_t *qPacked, const float *dsc,
-                         const float *dmn, uint32_t rows, uint32_t cols,
-                         const float *x, uint32_t seq, float *out,
-                         uint8_t *outXq);
 
         /// @brief Debug: quantize x with kQuantizeQ8_0x32 and emit the
         /// per-block float contributions kQGemvQ8_0xQ8K would accumulate.
@@ -624,6 +616,7 @@ namespace tinycoder::gpu {
             // uploaded layer's weights (the root cause of the L0 routed-expert
             // divergence — L0 executed layer-39 expert bytes while the router/
             // shared expert/trunk used layer-0 data).
+            bool hostPinned = false;// this layer's blobs are page-locked
             const uint8_t *hostGate = nullptr;
             const uint8_t *hostUp = nullptr;
             const uint8_t *hostDown = nullptr;
@@ -677,6 +670,45 @@ namespace tinycoder::gpu {
         // way becomes LRU next — the natural 2-way pseudo-LRU).
         uint8_t expertCacheLru_[kExpertCacheLayers][kExpertCacheSets] = {};
         uint64_t expertCacheLayerBytes_ = 0;// bytes per layer arena (0 = not built)
+        // ---- Full-layer prefill arena (see ensureExpertArenaCached) ----
+        uint8_t *expertArena_ = nullptr;
+        uint64_t expertArenaBytes_ = 0;
+        int64_t expertArenaEpoch_ = -1;
+        std::vector<int64_t> expertArenaStamp_;// per expert id
+        // Per-expert "fill finished" events: arena fills enqueue on g_stream2
+        // (the copy engine) and each consumer waits on its own expert's event,
+        // so DMA of later experts overlaps the GEMVs of earlier ones.
+        std::vector<cudaEvent_t> expertArenaEv_;
+        // Page-locked host ranges registered for direct H2D (no staging copy).
+        std::vector<std::pair<void *, size_t>> expertPinnedRegions_;
+        // ---- Grouped prefill scratch (see kQGemvKxQ8K_BatchGU_Multi) ----
+        // Sized for seqLen*expertUsed (token,rank) pairs, grown on demand.
+        float *moePreGateUp_ = nullptr;
+        uint64_t moePreGateUpBytes_ = 0;
+        float *moePreGateUp2_ = nullptr;
+        uint64_t moePreGateUp2Bytes_ = 0;
+        float *moePreDown_ = nullptr;
+        uint64_t moePreDownBytes_ = 0;
+        uint8_t *moePreDownQ8_ = nullptr;
+        uint64_t moePreDownQ8Bytes_ = 0;
+        uint8_t *moePreX8_ = nullptr;
+        uint64_t moePreX8Bytes_ = 0;
+        uint8_t *moePreWq_ = nullptr;
+        uint64_t moePreWqBytes_ = 0;
+        cudaEvent_t moePreEv_ = nullptr;
+        // Trunk phase timing (TINYCODER_TRUNK_PROF): attention start/end.
+        cudaEvent_t moeAttnEv_ = nullptr;
+        cudaEvent_t moeAttnEvStart_ = nullptr;// "all grouped fills enqueued" fence
+        float *moePreXg_ = nullptr;    // [pairs][H] gathered activations
+        uint64_t moePreXgBytes_ = 0;
+        float *moePreGu_ = nullptr;    // [seqLen][2*expertFF] int8Gemm output
+        uint64_t moePreGuBytes_ = 0;
+        int32_t *moePreTok_ = nullptr; // [pairs] token index (expert-sorted)
+        uint64_t moePreTokBytes_ = 0;
+        int32_t *moePreRanked_ = nullptr;// [pairs] s*eu + r (rank-major slot)
+        uint64_t moePreRankedBytes_ = 0;
+        int32_t *moePreStart_ = nullptr;// [experts+1] expert-sorted pair offsets
+        uint64_t moePreStartBytes_ = 0;
         // Pinned H2D staging ring (2026-09-14): a miss H2Ds ONE CONTIGUOUS
         // 3.3 MB slot.  The host pages of the packed expert matrices are
         // pageable, and a pageable cudaMemcpyAsync H2D quietly BLOCKS the host
@@ -713,6 +745,11 @@ namespace tinycoder::gpu {
         uint32_t expertHM_ = 0;// hidden size
         // Host pointers of the FULL packed expert matrices (hybrid mode keeps
         // them off-device; the cache H2Ds slices from these).
+        // Host-resident Q4_K copies of requantised Q8_0 expert blobs (see
+        // TINYCODER_MOE_Q8_Q4K).  One entry per (layer, gate/up/down); the
+        // per-layer ExpertSlot points into these and the arena pins them.
+        std::vector<q4k::AlignedBlob> expertRequant_;
+        uint32_t expertRequantLayers_ = 0;
         const uint8_t *expertHostGate_ = nullptr;
         const uint8_t *expertHostUp_ = nullptr;
         const uint8_t *expertHostDown_ = nullptr;
@@ -785,6 +822,17 @@ namespace tinycoder::gpu {
         // (architecture == 0) uses it; qwen35 keeps fp32 (its GDN/full-attention
         // kernels index kvK_/kvV_ as float*).
         bool kvHalf_ = false;
+        // Decode-only int8 KV (TINYCODER_KV8): F32 KV is kept for prefill; on
+        // the first decode token it is converted to an int8 pool + per-head
+        // scales, and decode reads the int8 pool.
+        bool kv8_ = false;
+        bool kv8Ready_ = false;
+        void *kvK8_ = nullptr;
+        void *kvV8_ = nullptr;
+        float *kvK8Scale_ = nullptr;
+        float *kvV8Scale_ = nullptr;
+        uint64_t kv8LayerStride_ = 0;
+        uint64_t kv8ScaleStride_ = 0;
         // ---- KV-cache layer slotting ----
         // Dense architectures allocate ONE KV slot per offloaded layer
         // (kvLayerStride_ = maxSeqLen*kvHeads*headDim*elem, kvSlots_ = nGpu).
@@ -831,6 +879,16 @@ namespace tinycoder::gpu {
         // per-layer), so 7B+ models fit in VRAM without ~14 GB of persistent
         // FP16 twins.
         void *wF16_ = nullptr;
+        void *pipeBuf_[3] = {nullptr, nullptr, nullptr};
+        uint64_t pipeBufBytes_[3] = {0, 0, 0};
+        cudaEvent_t pipeEv_[3] = {nullptr, nullptr, nullptr};
+        cudaEvent_t pipeDone_[3] = {nullptr, nullptr, nullptr};
+
+        void *qkvCatOut_ = nullptr;
+        uint64_t qkvCatOutBytes_ = 0;
+
+        void *cublasX16_ = nullptr;
+        uint64_t cublasX16Bytes_ = 0;
         uint64_t wF16Bytes_ = 0;
         const void *wF16SrcQ_ = nullptr;// matrix source whose dequant is in wF16_
         // Persistent per-matrix FP16 prefill twins (2026-09-29): when the VRAM
@@ -977,6 +1035,10 @@ namespace tinycoder::gpu {
             void *trellis = nullptr;
             void *suh = nullptr;
             void *svh = nullptr;
+            // False when the fused linear aliases another owner's device
+            // memory (uploadFusedLinearDevice): destroy() must then only
+            // unregister it, never cudaFree it.
+            bool ownsBuffers = true;
         };
         std::vector<Exl3OwnedBuffer> exl3Owned_;
 
@@ -1033,6 +1095,10 @@ namespace tinycoder::gpu {
         // graphPos_ (blocking H2D) BEFORE cudaStreamBeginCapture so the
         // recorded kernels see the right value at first launch.
         bool captureDecodeGraph(uint32_t pos);
+        /// @brief Replay the captured dense-qwen35 decode graph (refreshes the
+        ///        token + position device scalars, launches, copies logits).
+        bool replayQwen35DecodeGraph(const std::vector<int32_t> &tokens,
+                                     float *logitsOut, std::string &errMsg);
         // Replay the captured decode graph (which contains kernels only --
         // no memcpys / position values): the caller has already H2D'd the
         // tokens into s.tokens; this updates the graphPos_ device scalar,
@@ -1096,6 +1162,26 @@ namespace tinycoder::gpu {
         /// reusable per-layer FP16 scratch (wF16_), growing it as needed.
         /// @param m Device-layout matrix descriptor
         /// @param outBuf Receives the (cached) fp16 scratch pointer.
+        /// @brief Q8_0 prefill: dequantize the matrix to F16 and run a
+        /// cuBLAS tensor-core GEMM for batch prefill.
+        // Batched EXL3 prefill: decode the trellis to F16 ONCE per matrix and
+        // run the fp16 tensor-core GEMM (the fused GEMV path is per-token, so a
+        // 512-token prefill streams the trellis 512 times).
+        bool gemmExl3Batch(const DeviceMatrix &m, const float *x, float *y,
+                           uint32_t seqLen, std::string &errMsg);
+        void *exl3F16_ = nullptr;
+        uint64_t exl3F16Bytes_ = 0;
+
+        bool gemmQ8Cublas(const DeviceMatrix &m, const float *x, float *y,
+                          uint32_t seqLen, std::string &errMsg);
+
+        /// @brief F32 prefill GEMM via cuBLAS (ssm alpha/beta projections).
+        bool gemmF32Cublas(const DeviceMatrix &m, const float *x, float *y,
+                           uint32_t seqLen, std::string &errMsg);
+
+        bool dequantMatrixF16Into(const DeviceMatrix &m, void *dst,
+                                  void *stream, std::string &errMsg);
+
         bool dequantMatrixF16(const DeviceMatrix &m, void **outBuf,
                               std::string &errMsg);
 

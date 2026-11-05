@@ -76,7 +76,7 @@ namespace tinycoder {
             case GGML_TYPE_BF16:
                 return 2;// 2 bytes/element (no quantized block)
             // Quantized types: bytes per block
-            // Reference: quants.h (block_q4_0, block_q4_1, etc.)
+            // Reference: the GGUF quant block layouts (block_q4_0, block_q4_1, etc.)
             case GGML_TYPE_Q4_0:
                 return 18;// 32 weights: d(fp16,2) + qs(16) = 18 bytes
             case GGML_TYPE_Q4_1:
@@ -810,8 +810,13 @@ namespace tinycoder {
         const uint64_t mapOffset = tensorDataOffset_ - pageOffset;
         const uint64_t mapLength = totalSize + pageOffset;
 
-        void *mapResult = ::mmap(nullptr, mapLength, PROT_READ, MAP_PRIVATE,
-                                 mmapFd_, static_cast<off_t>(mapOffset));
+        // PROT_WRITE is required only so the CUDA runtime will accept the
+        // range in cudaHostRegister (it rejects read-only file mappings with
+        // EINVAL).  MAP_PRIVATE means writes would copy-on-write, and nothing
+        // ever writes through this mapping.
+        void *mapResult = ::mmap(nullptr, mapLength, PROT_READ | PROT_WRITE,
+                                 MAP_PRIVATE, mmapFd_,
+                                 static_cast<off_t>(mapOffset));
         if (mapResult == MAP_FAILED) {
             std::cerr << "[TinyCoder] Failed to mmap tensor data: "
                       << std::strerror(errno) << std::endl;

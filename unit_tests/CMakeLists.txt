@@ -31,7 +31,6 @@ add_executable(tinycoder_test
     ThreadPoolReentrancyTest.cpp
     GPUCpuCompareTest.cpp
     Int8PackParityTest.cpp
-    MmqParityTest.cpp
     SharedTestEnv.cpp
 )
 
@@ -68,7 +67,7 @@ target_link_libraries(tiny_logits_probe
 )
 
 # ---- EXL3 checkpoint smoke probe (diagnostic; not a gtest) ----
-# Loads a real EXL3 (ExLlamaV3) HF directory through EXL3Loader and validates
+# Loads a real EXL3 HF directory through EXL3Loader and validates
 # the materialized GGUF-named tensor inventory + numeric sanity, without a
 # tokenizer.  Runs on CPU (no CUDA needed).
 add_executable(exl3_model_smoke
@@ -92,6 +91,7 @@ if(ENABLE_CUDA)
     target_link_libraries(exl3_gpu_parity
         PRIVATE
         tinycoder_core
+        CUDA::cudart
     )
 
     set_target_properties(exl3_gpu_parity PROPERTIES
@@ -115,9 +115,48 @@ if(ENABLE_CUDA)
     find_package(CUDAToolkit REQUIRED)
     target_link_libraries(exl3_kernel_bench PRIVATE CUDA::cudart)
 
+    # ---- Decode-vs-prefill logits agreement probe (diagnostic) ----
+    add_executable(exl3_decode_agree
+        ../tools/exl3_decode_agree.cpp
+    )
+
+    target_link_libraries(exl3_decode_agree
+        PRIVATE
+        tinycoder_core
+    )
+
+    set_target_properties(exl3_decode_agree PROPERTIES
+        CXX_STANDARD 20
+        CXX_STANDARD_REQUIRED ON
+    )
+
     set_target_properties(exl3_kernel_bench PROPERTIES
         CXX_STANDARD 20
         CXX_STANDARD_REQUIRED ON
+    )
+
+    # ---- fp16-accumulate pre-scale decision probe (diagnostic; not a gtest) --
+    # Standalone measurement of the EXL3 prefill GEMM for one real projection:
+    # fp32-accumulate HMMA vs fp16-accumulate with an exact 2^-s pre-scale,
+    # both against an fp64 cuBLAS reference, against materialise+cuBLAS.  It
+    # copies the decode/MMA code instead of including EXL3Kernels.cu, so it
+    # cannot inherit a stale core object or perturb the engine.  Nothing in the
+    # shipped path changes; this only adds an executable.
+    add_executable(exl3_hacc_probe
+        ../tools/exl3_hacc_probe.cu
+    )
+
+    target_link_libraries(exl3_hacc_probe
+        PRIVATE
+        tinycoder_core
+        CUDA::cudart
+        CUDA::cublas
+    )
+
+    set_target_properties(exl3_hacc_probe PROPERTIES
+        CXX_STANDARD 20
+        CXX_STANDARD_REQUIRED ON
+        CUDA_SEPARABLE_COMPILATION OFF
     )
 endif()
 

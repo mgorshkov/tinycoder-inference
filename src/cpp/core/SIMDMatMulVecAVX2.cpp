@@ -2986,6 +2986,55 @@ namespace tinycoder::simd {
         if (seqLen == 0 || rows == 0 || cols == 0) {
             return;
         }
+        // ---- seqLen == 1: parallelize over ROWS (2026-11-04) --------------
+        // The tile path below uses 8 rows/tile, so a 256-row router produces
+        // 32 tiles and ThreadPool::parallelForSlab serializes any range
+        // <= numThreads (32 <= 36) -- the qwen35moe router (256x2048 fp32 per
+        // layer) then ran on ONE core and cost ~10 ms/token in the hybrid
+        // decode.  Rows are independent and the per-row dot is the identical
+        // code, so this is bit-identical to the tile path at seqLen==1.
+        if (seqLen == 1) {
+            const uint32_t vecGroups = cols >> 3;
+            const uint32_t tail = cols & 7u;
+            const float *xrow = X;
+            ThreadPool::instance().parallelForSlab(0, rows, [&](uint32_t row) {
+                const float *wrow = W_f32 + static_cast<size_t>(row) * cols;
+                __m256 acc0 = _mm256_setzero_ps();
+                __m256 acc1 = _mm256_setzero_ps();
+                __m256 acc2 = _mm256_setzero_ps();
+                __m256 acc3 = _mm256_setzero_ps();
+                uint32_t i = 0;
+                for (; i + 31 < vecGroups * 8; i += 32) {
+                    acc0 = _mm256_fmadd_ps(_mm256_loadu_ps(xrow + i),
+                                           _mm256_loadu_ps(wrow + i), acc0);
+                    acc1 = _mm256_fmadd_ps(_mm256_loadu_ps(xrow + i + 8),
+                                           _mm256_loadu_ps(wrow + i + 8), acc1);
+                    acc2 = _mm256_fmadd_ps(_mm256_loadu_ps(xrow + i + 16),
+                                           _mm256_loadu_ps(wrow + i + 16), acc2);
+                    acc3 = _mm256_fmadd_ps(_mm256_loadu_ps(xrow + i + 24),
+                                           _mm256_loadu_ps(wrow + i + 24), acc3);
+                }
+                for (; i + 7 < vecGroups * 8; i += 8) {
+                    acc0 = _mm256_fmadd_ps(_mm256_loadu_ps(xrow + i),
+                                           _mm256_loadu_ps(wrow + i), acc0);
+                }
+                __m256 sv01 = _mm256_add_ps(acc0, acc1);
+                __m256 sv23 = _mm256_add_ps(acc2, acc3);
+                __m256 sv = _mm256_add_ps(sv01, sv23);
+                __m128 hi = _mm256_extractf128_ps(sv, 1);
+                __m128 lo = _mm256_castps256_ps128(sv);
+                __m128 sum128 = _mm_hadd_ps(_mm_add_ps(lo, hi),
+                                            _mm_add_ps(lo, hi));
+                sum128 = _mm_hadd_ps(sum128, sum128);
+                float v = _mm_cvtss_f32(sum128);
+                for (uint32_t k = 0; k < tail; ++k) {
+                    v += xrow[vecGroups * 8 + k] * wrow[vecGroups * 8 + k];
+                }
+                out[row] = v;
+            });
+            return;
+        }
+
         uint32_t numTiles = (rows + BATCH_SIZE - 1) / BATCH_SIZE;
         ThreadPool::instance().parallelForSlab(0, numTiles, [&](uint32_t tile) {
             uint32_t rowStart = tile * BATCH_SIZE;
@@ -3588,6 +3637,83 @@ namespace tinycoder::simd {
 
         const __m256i one16 = _mm256_set1_epi16(1);
         const __m256i lowmask = _mm256_set1_epi8(0x0F);
+
+        // Single-token fast path (2026-11-04): process ONE ROW CONTIGUOUSLY.
+        // The batch path is block-major (8 rows per tile, per 256-block), which
+        // has no streaming prefetch at seqLen==1 -- measured ~10 GB/s with 8
+        // threads on the 35B experts (the per-block setup dominated and every
+        // access was a cold DRAM line).  Row-major lets the hardware
+        // prefetcher stream the 2304-B row; same block math and same
+        // block-order accumulation -> bit-identical to the batch path at
+        // seqLen==1.
+        if (seqLen == 1) {
+            const tinycoder::Q8KBlock *q8 = q8All.data();
+            ThreadPool::instance().parallelForSlab(0, rows, [&](uint32_t row) {
+                const uint8_t *rp =
+                        W_q4k + static_cast<uint64_t>(row) * rowStride;
+                float sum = 0.0f;
+                for (uint32_t b = 0; b < blocksPerRow; ++b) {
+                    if (b + 2u < blocksPerRow) {
+                        _mm_prefetch(
+                                reinterpret_cast<const char *>(
+                                        rp + static_cast<uint64_t>(b + 2u) *
+                                                     Q4K_BLOCK_BYTES),
+                                _MM_HINT_T0);
+                    }
+                    const uint8_t *blockData =
+                            rp + static_cast<uint64_t>(b) * Q4K_BLOCK_BYTES;
+                    const float d =
+                            halfToFloat(*reinterpret_cast<const uint16_t *>(blockData));
+                    const float dmin = halfToFloat(
+                            *reinterpret_cast<const uint16_t *>(blockData + 2));
+                    const uint8_t *scales = blockData + 4;
+                    const uint8_t *qs = blockData + 16;
+                    const tinycoder::Q8KBlock &q8b = q8[b];
+                    __m256i xraw[8];
+                    for (int i = 0; i < 8; ++i) {
+                        xraw[i] = _mm256_loadu_si256(
+                                (const __m256i *) (q8b.qs + i * 32));
+                    }
+                    float mainS = 0.0f, minS = 0.0f;
+                    for (int i = 0; i < 8; ++i) {
+                        uint8_t scv, mv;
+                        if (i < 4) {
+                            scv = scales[i] & 63u;
+                            mv = scales[i + 4] & 63u;
+                        } else {
+                            scv = (uint8_t) ((scales[i + 4] & 0xFu) |
+                                             ((scales[i - 4] >> 6) << 4));
+                            mv = (uint8_t) ((scales[i + 4] >> 4) |
+                                            ((scales[i] >> 6) << 4));
+                        }
+                        const float ds = d * static_cast<float>(scv);
+                        const float mn = dmin * static_cast<float>(mv);
+                        __m256i bv = _mm256_loadu_si256(
+                                (const __m256i *) (qs + 32 * (i >> 1)));
+                        __m256i nv = ((i & 1) != 0)
+                                             ? _mm256_and_si256(
+                                                       _mm256_srli_epi16(bv, 4),
+                                                       lowmask)
+                                             : _mm256_and_si256(bv, lowmask);
+                        __m256i p = _mm256_maddubs_epi16(nv, xraw[i]);
+                        __m256i pi = _mm256_madd_epi16(p, one16);
+                        __m128i lo = _mm256_castsi256_si128(pi);
+                        __m128i hi = _mm256_extracti128_si256(pi, 1);
+                        __m128i sv = _mm_add_epi32(lo, hi);
+                        sv = _mm_hadd_epi32(sv, sv);
+                        sv = _mm_hadd_epi32(sv, sv);
+                        const int s32q = _mm_cvtsi128_si32(sv);
+                        mainS += ds * static_cast<float>(s32q);
+                        minS += mn * static_cast<float>(
+                                            q8b.bsums[2 * i] +
+                                            q8b.bsums[2 * i + 1]);
+                    }
+                    sum += q8b.d * (mainS - minS);
+                }
+                out[row] = sum;
+            });
+            return;
+        }
 
         // Process rows in tiles of BATCH_SIZE, parallelized over tiles.
         uint32_t numTiles = (rows + BATCH_SIZE - 1) / BATCH_SIZE;
