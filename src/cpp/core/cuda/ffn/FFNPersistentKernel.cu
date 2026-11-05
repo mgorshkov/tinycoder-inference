@@ -60,7 +60,7 @@ namespace cg = cooperative_groups;
 namespace tinycoder::gpu {
     namespace {
 
-        // GGML QK_K block byte sizes (kQ2K_BYTES matches GPUComputeInternal.hpp).
+        // GGUF QK_K block byte sizes (kQ2K_BYTES matches GPUComputeInternal.hpp).
         constexpr uint32_t kQ2K_BYTES = 84;
         constexpr uint32_t kQ3K_BYTES = 110;
 

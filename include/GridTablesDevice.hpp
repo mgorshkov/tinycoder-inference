@@ -1,3 +1,27 @@
+/*
+ ⚡ TinyCoder AI
+
+ Copyright (c) 2026 Mikhail Gorshkov (mikhail.gorshkov@gmail.com)
+
+ Permission is hereby granted, free of charge, to any person obtaining a copy
+ of this software and associated documentation files (the "Software"), to deal
+ in the Software without restriction, including without limitation the rights
+ to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ copies of the Software, and to permit persons to whom the Software is
+ furnished to do so, subject to the following conditions:
+
+ The above copyright notice and this permission notice shall be included in all
+ copies or substantial portions of the Software.
+
+ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+ SOFTWARE.
+*/
+
 // Auto-generated device-side grid/sign tables for the IQ2_XS / IQ3_S
 // GPU kernels. Byte-identical copies of the host tables in
 // GridTables.cpp, GridTablesIQ3S.cpp and GGMLDequantize.hpp.
@@ -9,7 +33,7 @@ namespace tinycoder::gpu {
 
     // IQ2_XS grid table: 512 entries, each storing 8 dequantized byte values
     // packed into a uint64_t (low byte = grid[0], high byte = grid[7]).
-    // Byte-identical copy of ggml's iq2xs_grid in ggml-common.h.
+    // Byte-identical copy of the GGUF iq2xs_grid definition.
     static __device__ uint64_t c_iq2xs_grid[512] = {
             0x0808080808080808,
             0x080808080808082b,
@@ -1175,7 +1199,7 @@ namespace tinycoder::gpu {
 
     // IQ2_XXS grid table: 256 entries, each storing 8 dequantized byte values
     // packed into a uint64_t (low byte = grid[0], high byte = grid[7]).
-    // Byte-identical copy of ggml's iq2xxs_grid (from GGMLDequantize::iq2xxs_grid).
+    // Byte-identical copy of the GGUF iq2xxs_grid (from GGMLDequantize::iq2xxs_grid).
     static __device__ uint64_t c_iq2xxs_grid[256] = {
             0x0808080808080808,
             0x080808080808082b,
@@ -1439,7 +1463,7 @@ namespace tinycoder::gpu {
 
     // IQ2_S grid table: 1024 entries, each storing 8 dequantized byte values
     // packed into a uint64_t (low byte = grid[0], high byte = grid[7]).
-    // Byte-identical copy of ggml's iq2s_grid (from GGMLDequantize::IQ2S_GRID).
+    // Byte-identical copy of the GGUF iq2s_grid (from GGMLDequantize::IQ2S_GRID).
     static __device__ uint64_t c_iq2s_grid[1024] = {
             0x0808080808080808,
             0x080808080808082b,
@@ -2470,7 +2494,7 @@ namespace tinycoder::gpu {
 
     // IQ3_XXS grid table: 256 entries, each storing 4 dequantized byte values
     // packed into a uint32_t (low byte = grid[0], high byte = grid[3]).
-    // Byte-identical copy of ggml's iq3xxs_grid (from GGMLDequantize::IQ3XXS_GRID).
+    // Byte-identical copy of the GGUF iq3xxs_grid (from GGMLDequantize::IQ3XXS_GRID).
     static __device__ uint32_t c_iq3xxs_grid[256] = {
             0x04040404,
             0x04040414,

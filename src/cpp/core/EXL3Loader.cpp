@@ -26,9 +26,13 @@
 
 #include <algorithm>
 #include <cctype>
+#include <chrono>
 #include <cmath>
 #include <cstring>
 #include <filesystem>
+#if defined(_OPENMP)
+#include <omp.h>
+#endif
 #if defined(__linux__)
 #include <pthread.h>
 #include <sched.h>
@@ -89,7 +93,7 @@ namespace tinycoder {
                 if (((bits >> 23) & 0xffu) == 0xffu && mant != 0) {
                     return static_cast<uint16_t>(sign | 0x7e00u);// NaN
                 }
-                return static_cast<uint16_t>(sign | 0x7c00u);   // Inf / overflow
+                return static_cast<uint16_t>(sign | 0x7c00u);// Inf / overflow
             }
             uint32_t half = (static_cast<uint32_t>(exp) << 10) | (mant >> 13);
             if (mant & 0x1000u) {
@@ -135,7 +139,7 @@ namespace tinycoder {
         // RoPE settings live in a nested `rope_parameters` object in the newer
         // HF configs (Qwen3.5 / Qwen3.8 / Gemma4), but older checkpoints keep
         // `rope_theta` / `partial_rotary_factor` flat.  Search the same four
-        // locations exllamav3's read_rope_settings_default() does:
+        // locations the EXL3 reference read_rope_settings_default() does:
         //   text_config.rope_parameters.<key>, text_config.<key>,
         //   root.rope_parameters.<key>, root.<key>
         const JsonValue *cfgFindRope(const JsonValue &root, const std::string &key) {
@@ -163,7 +167,7 @@ namespace tinycoder {
             return root.find(key);
         }
 
-        uint32_t cfgU32Rope(const JsonValue &root, const std::string &key, uint32_t def) {
+        [[maybe_unused]] uint32_t cfgU32Rope(const JsonValue &root, const std::string &key, uint32_t def) {
             const JsonValue *v = cfgFindRope(root, key);
             return v ? static_cast<uint32_t>(v->asU64()) : def;
         }
@@ -212,7 +216,31 @@ namespace tinycoder {
         if (it == recIndex_.end()) {
             return nullptr;
         }
-        return buffers_[it->second]->data();
+        const size_t idx = it->second;
+        if (buffers_[idx]->empty() && lazy_.find(name) != lazy_.end()) {
+            const_cast<EXL3Loader *>(this)->materializeLazy(name);
+        }
+        return buffers_[idx]->empty() ? nullptr : buffers_[idx]->data();
+    }
+
+    void EXL3Loader::materializeLazy(const std::string &name) {
+        auto lit = lazy_.find(name);
+        if (lit == lazy_.end()) return;
+        auto rit = recIndex_.find(name);
+        if (rit == recIndex_.end()) return;
+        const Src src = resolve(lit->second.hf);
+        std::vector<uint8_t> bytes;
+        if (!src.valid ||
+            !decodeLinear(src, lit->second.out, lit->second.in, lit->second.forceF32,
+                          bytes, nullptr)) {
+            return;
+        }
+        const size_t idx = rit->second;
+        *buffers_[idx] = std::move(bytes);
+        records_[idx].size = buffers_[idx]->size();
+        records_[idx].offset =
+                reinterpret_cast<uint64_t>(buffers_[idx]->data());
+        lazy_.erase(lit);
     }
 
     const TensorInfo *EXL3Loader::getTensorInfo(const std::string &name) const {
@@ -382,7 +410,7 @@ namespace tinycoder {
         // qwen35/qwen35moe derived fields.
         if (detectedArch_ == ARCH_QWEN35 || detectedArch_ == ARCH_QWEN35MOE) {
             config_.fullAttentionInterval = cfgU32(root, "full_attention_interval",
-                                                  config_.fullAttentionInterval);
+                                                   config_.fullAttentionInterval);
             fullAttentionInterval_ = config_.fullAttentionInterval;
             if (convChannels_ > 0) {
                 config_.ssmConvKernel = convChannels_;
@@ -539,14 +567,31 @@ namespace tinycoder {
             AffinityScope() = default;
 #endif
         } affinityScope;
+#ifdef _OPENMP
+        omp_set_num_threads(std::max(1, omp_get_num_procs()));
+#endif
+        // GPU offload consumes the packed trellis directly, so the host F16
+        // copy is dead weight: materializing it costs ~6 minutes and 54 GB for
+        // a 27B checkpoint (enough to OOM the host next to the engine).  Keep
+        // it lazy unless a CPU-only run or an explicit override asks for it.
+#ifdef USE_CUDA
+        const char *f16env = std::getenv("TINYCODER_EXL3_F16");
+        const char *gpuenv = std::getenv("TINYCODER_GPU");
+        lazyF16_ = !(f16env && std::atoi(f16env) != 0) &&
+                   !(gpuenv && std::atoi(gpuenv) == 0);
+#endif
+        const auto loadT0 = std::chrono::steady_clock::now();
         if (!emitAllTensors()) {
             std::cerr << "[EXL3] Failed to materialize tensors" << std::endl;
             return false;
         }
 
         loaded_ = true;
-        std::cout << "[EXL3] Materialized " << records_.size() << " GGUF-named tensors"
-                  << std::endl;
+        const auto loadMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                    std::chrono::steady_clock::now() - loadT0)
+                                    .count();
+        std::cout << "[EXL3] Materialized " << records_.size()
+                  << " GGUF-named tensors in " << loadMs << " ms" << std::endl;
         return true;
     }
 
@@ -681,12 +726,35 @@ namespace tinycoder {
                                              haveSv ? svh.data() : nullptr,
                                              in, out, wRaw.data());
             }
-            w.resize(static_cast<size_t>(out) * in);
+            // Transpose [in][out] -> [out][in].  For the normal F16 path fuse
+            // the transpose with the half conversion in 32x32 cache blocks:
+            // the old code materialized a second full float matrix and then
+            // walked it column-wise (a 27B checkpoint spends minutes here).
+            if (recon || forceF32) {
+                w.resize(static_cast<size_t>(out) * in);
 #pragma omp parallel for schedule(static)
-            for (uint32_t r = 0; r < out; ++r) {
-                for (uint32_t c = 0; c < in; ++c) {
-                    w[static_cast<size_t>(r) * in + c] =
-                            wRaw[static_cast<size_t>(c) * out + r];
+                for (uint32_t r = 0; r < out; ++r) {
+                    for (uint32_t c = 0; c < in; ++c) {
+                        w[static_cast<size_t>(r) * in + c] =
+                                wRaw[static_cast<size_t>(c) * out + r];
+                    }
+                }
+            } else {
+                outBytes.resize(static_cast<size_t>(out) * in * sizeof(uint16_t));
+                uint16_t *dst = reinterpret_cast<uint16_t *>(outBytes.data());
+                constexpr uint32_t kB = 32;
+#pragma omp parallel for collapse(2) schedule(static)
+                for (uint32_t rb = 0; rb < out; rb += kB) {
+                    for (uint32_t cb = 0; cb < in; cb += kB) {
+                        const uint32_t re = std::min(out, rb + kB);
+                        const uint32_t ce = std::min(in, cb + kB);
+                        for (uint32_t r = rb; r < re; ++r) {
+                            for (uint32_t c = cb; c < ce; ++c) {
+                                dst[static_cast<size_t>(r) * in + c] =
+                                        floatToHalf(wRaw[static_cast<size_t>(c) * out + r]);
+                            }
+                        }
+                    }
                 }
             }
         } else {
@@ -731,7 +799,9 @@ namespace tinycoder {
         }
         if (forceF32) {
             writeF32(outBytes, w);
-        } else {
+        } else if (recon) {
+            // The fused F16 transpose above only runs when neither recon nor
+            // forceF32 was requested; keep the generic conversion for those.
             writeF16(outBytes, w);
         }
         return true;
@@ -878,6 +948,15 @@ namespace tinycoder {
         Src src = resolve(hfCandidates);
         if (!src.valid) {
             return false;
+        }
+        // The separate LM head is also read by the CPU logits paths; keep its
+        // F16 copy (2.4 GB, ~20 s) so CPU/GPU logits agree and debugging works.
+        // Every other linear stays packed-only on the GPU path.
+        if (lazyF16_ && !forceF32 && ggmlName != "output.weight" &&
+            recordNative(ggmlName, hfCandidates, expectedOut, expectedIn)) {
+            addTensorShape(ggmlName, GGML_TYPE_F16, {expectedIn, expectedOut}, {});
+            lazy_[ggmlName] = {hfCandidates, expectedOut, expectedIn, false};
+            return true;
         }
         std::vector<uint8_t> bytes;
         if (!decodeLinear(src, expectedOut, expectedIn, forceF32, bytes, nullptr)) {
@@ -1284,8 +1363,8 @@ namespace tinycoder {
         //   in_proj_a:   hidden -> num_v_heads (a, used for the decay gate)
         //   beta = sigmoid(b); g = -A_log.exp() * softplus(a + dt_bias)
         const uint32_t H = hidden_;
-        const uint32_t nKHeads = config_.ssmGroupCount; // linear_num_key_heads
-        const uint32_t headK = config_.ssmStateSize;    // linear_key_head_dim
+        const uint32_t nKHeads = config_.ssmGroupCount;  // linear_num_key_heads
+        const uint32_t headK = config_.ssmStateSize;     // linear_key_head_dim
         const uint32_t nVHeads = config_.ssmTimeStepRank;// linear_num_value_heads
         const uint32_t headV = nVHeads > 0 ? ssmInner_ / nVHeads : 0;
         const uint32_t keyDim = nKHeads * headK;

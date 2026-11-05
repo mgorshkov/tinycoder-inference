@@ -1,3 +1,27 @@
+/*
+ ⚡ TinyCoder AI
+
+ Copyright (c) 2026 Mikhail Gorshkov (mikhail.gorshkov@gmail.com)
+
+ Permission is hereby granted, free of charge, to any person obtaining a copy
+ of this software and associated documentation files (the "Software"), to deal
+ in the Software without restriction, including without limitation the rights
+ to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ copies of the Software, and to permit persons to whom the Software is
+ furnished to do so, subject to the following conditions:
+
+ The above copyright notice and this permission notice shall be included in all
+ copies or substantial portions of the Software.
+
+ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+ SOFTWARE.
+*/
+
 // tiny_logits_probe.cpp
 //
 // Loads the FULL model (like the unit tests) so this is slow (~5-6 min on the
@@ -45,6 +69,8 @@ int main(int argc, char **argv) {
     const char *modelPath = std::getenv("TINYCODER_MODEL_PATH");
     std::string prompt;
     std::string promptLabel;
+    std::vector<int32_t> idsPrompt;   // --ids-file: raw ids, no tokenizer
+    int seqGen = 0;                   // --seq-gen: decode-vs-prefill chain
     bool dumpTokens = false;
     bool runGenerate = false;
     int32_t genMaxTokens = 160;
@@ -56,6 +82,24 @@ int main(int argc, char **argv) {
         if (strcmp(a, "--file") == 0 && i + 1 < argc) {
             prompt = readFile(argv[i + 1]);
             promptLabel = std::string("file:") + argv[i + 1];
+            i += 2;
+        } else if (strcmp(a, "--ids-file") == 0 && i + 1 < argc) {
+            // Raw token ids, whitespace/comma separated.  Lets an oracle be fed
+            // the exact same ids without a tokenizer round-trip, which is the
+            // only way to compare logits at a position whose text form the
+            // tokenizer does not round-trip (special tokens like ' thinking').
+            std::ifstream in(argv[i + 1]);
+            long long v = 0;
+            while (in >> v) {
+                idsPrompt.push_back((int32_t) v);
+                in >> std::ws;
+                if (in.peek() == ',') in.get();
+                in >> std::ws;
+            }
+            promptLabel = std::string("ids:") + argv[i + 1];
+            i += 2;
+        } else if (strcmp(a, "--seq-gen") == 0 && i + 1 < argc) {
+            seqGen = std::atoi(argv[i + 1]);
             i += 2;
         } else if (strcmp(a, "--tokens") == 0) {
             dumpTokens = true;
@@ -121,28 +165,73 @@ int main(int argc, char **argv) {
            cfg.architecture.c_str(), (long long) vocabSize);
     printf("  prompt=%s (%zu bytes)\n", promptLabel.c_str(), prompt.size());
 
-    std::vector<int32_t> toks = model.tokenize(prompt);
+    std::vector<int32_t> toks =
+            idsPrompt.empty() ? model.tokenize(prompt) : idsPrompt;
     printf("  tokens: %zu\n", toks.size());
 
     if (runGenerate) {
         // Replicate SampleQuestionTest.AnswersQuestion exactly: formatChat with
         // the Q1 system/user pair + addGenerationPrompt=true, then generate()
         // with the test's InferenceParams.
-        std::string chatPrompt = model.formatChat(
-                {{"system", "You are TinyCoder, an AI coding assistant. Be concise."},
-                 {"user", "Write a C++ function to add two numbers."}},
-                true);
-        printf("  formatChat prompt: %zu bytes\n", chatPrompt.size());
-        printf("  generate params: maxTokens=%d temp=0.7 topP=0.9 topK=40 "
-               "repeatPenalty=1.1 seed=%u\n",
-               (int) genMaxTokens, genSeed);
+        //
+        // TINYCODER_GEN_QUESTION overrides the user turn and TINYCODER_GEN_TEMP
+        // the temperature, so the same binary can run the acceptance question
+        // greedily (TINYCODER_GEN_TEMP=0) on any prompt; defaults reproduce the
+        // test byte-for-byte.
+        const char *qEnv = std::getenv("TINYCODER_GEN_QUESTION");
+        const std::string question =
+                qEnv != nullptr ? std::string(qEnv)
+                                : std::string("Write a C++ function to add two numbers.");
+        const char *tEnv = std::getenv("TINYCODER_GEN_TEMP");
+        const float genTemp = tEnv != nullptr ? std::stof(tEnv) : 0.7f;
+        const char *rpEnv = std::getenv("TINYCODER_GEN_REPEAT");
+        const float genRepeat = rpEnv != nullptr ? std::stof(rpEnv) : 1.1f;
+        // topK=0 disables the exact top-K LM-head pruning inside forward(), i.e.
+        // the full vocabulary path.  Diffing the two isolates a pruning bug.
+        const char *tkEnv = std::getenv("TINYCODER_GEN_TOPK");
+        const int genTopK = tkEnv != nullptr ? std::atoi(tkEnv) : 40;
+        // --file / positional prompt: use those bytes verbatim as the generate
+        // prompt (no chat template), so an arbitrary prompt -- including an
+        // oracle-verified one -- can be run through the real generate() path.
+        std::string chatPrompt =
+                promptLabel.empty() || promptLabel == "default-wrapped-Q1"
+                        ? model.formatChat(
+                                  {{"system",
+                                    "You are TinyCoder, an AI coding assistant. Be concise."},
+                                   {"user", question}},
+                                  true)
+                        : prompt;
+        printf("  formatChat prompt: %zu bytes, question=\"%s\"\n",
+               chatPrompt.size(), question.c_str());
+        // Escaped dump of the exact bytes generate() sees, so an oracle can be
+        // fed the identical prompt (a chat-template difference otherwise hides
+        // a math difference behind a different token stream).
+        {
+            std::string esc;
+            for (char c: chatPrompt) {
+                if (c == '\n') esc += "\\n";
+                else if (c == '\r') esc += "\\r";
+                else esc += c;
+            }
+            printf("  formatChat prompt escaped: \"%s\"\n", esc.c_str());
+            if (const char *po = std::getenv("TINYCODER_GEN_PROMPT_OUT");
+                po != nullptr) {
+                std::ofstream out(po, std::ios::binary);
+                out.write(chatPrompt.data(), (std::streamsize) chatPrompt.size());
+                printf("  wrote prompt bytes to %s\n", po);
+            }
+        }
+        printf("  generate params: maxTokens=%d temp=%.3f topP=0.9 topK=%d "
+               "repeatPenalty=%.3f seed=%u\n",
+               (int) genMaxTokens, (double) genTemp, genTopK, (double) genRepeat,
+               genSeed);
 
         InferenceParams params;
         params.maxTokens = genMaxTokens;
-        params.temperature = 0.7f;
+        params.temperature = genTemp;
         params.topP = 0.9f;
-        params.topK = 40;
-        params.repeatPenalty = 1.1f;
+        params.topK = genTopK;
+        params.repeatPenalty = genRepeat;
         params.seed = genSeed;
 
         std::string generatedText;
@@ -186,6 +275,71 @@ int main(int argc, char **argv) {
             printf("    tok[%zu]: id=%d \"%s\"%s\n", t, toks[t], piece.c_str(),
                    tok0.isSpecialToken(toks[t]) ? " !SPECIAL" : "");
         }
+    }
+
+
+    if (seqGen > 0) {
+        // Decode-vs-prefill chain.  Greedy decoding samples from BOTH paths at
+        // every step and prints them side by side:
+        //   prefill: forward(ids[0..n-1])            (batched)
+        //   decode : forward(ids[0..n-2]) then forward(ids[n-1])  (seqLen==1)
+        // This is the only probe that walks the *stateful* decode path (GDN
+        // recurrent state + conv state, EXL3 fused GEMV) across steps, which is
+        // what Model::generate() actually uses; exl3_decode_agree restarts from
+        // a fresh batched prefill for every position it checks.
+        auto top1 = [&](const np::Array<float> &l, float *outLogit,
+                        int32_t *outId) {
+            const float *row = l.size() <= (size_t) vocabSize
+                                       ? l.data()
+                                       : l.data() + (l.size() - (size_t) vocabSize);
+            int best = -1;
+            float bv = -1e30f;
+            for (int64_t k = 0; k < vocabSize; ++k)
+                if (std::isfinite(row[k]) && row[k] > bv) { bv = row[k]; best = (int32_t) k; }
+            *outId = best;
+            *outLogit = bv;
+        };
+        std::vector<int32_t> ids = toks;
+        const size_t base = ids.size();
+        printf("  == decode-vs-prefill chain (%d steps) ==\n", seqGen);
+        // Pass A: the authoritative greedy chain, each step re-anchored by a
+        // fresh batched prefill (this is the path the oracle comparison uses).
+        std::vector<int32_t> chainIds;
+        std::vector<int32_t> chainTop;
+        std::vector<float> chainLogit;
+        for (int step = 0; step < seqGen; ++step) {
+            model.clearKVCache();
+            np::Array<float> pre = model.forward(ids, false);
+            float l = 0.f;
+            int32_t id = -1;
+            top1(pre, &l, &id);
+            chainTop.push_back(id);
+            chainLogit.push_back(l);
+            ids.push_back(id);
+        }
+        // Pass B: ONE base prefill followed by seqLen==1 forwards only -- the
+        // stateful path Model::generate() actually uses.  If the two chains
+        // disagree, the decode-time state update (GDN recurrent + conv state)
+        // is diverging from what a batched prefill computes for the same ids.
+        model.clearKVCache();
+        np::Array<float> live = model.forward(
+                std::vector<int32_t>(ids.begin(), ids.begin() + (long) base), false);
+        for (int step = 0; step < seqGen; ++step) {
+            float l = 0.f;
+            int32_t id = -1;
+            top1(live, &l, &id);
+            printf("    step %2d  pos=%3zu  prefill: id=%-7d logit=%9.4f   "
+                   "seqdec: id=%-7d logit=%9.4f   %s\n",
+                   step, base - 1 + (size_t) step, chainTop[(size_t) step],
+                   chainLogit[(size_t) step], id, l,
+                   chainTop[(size_t) step] == id ? "AGREE" : "DIFFER");
+            fflush(stdout);
+            if (step + 1 < seqGen) {
+                live = model.forward({chainTop[(size_t) step]}, false);
+            }
+        }
+        model.clearKVCache();
+        return 0;
     }
 
     printf("  forward(computeAllLogits=false) ...\n");

@@ -120,7 +120,7 @@ namespace tinycoder {
     private:
         struct Shard {
             std::string path;
-            uint64_t payloadOffset = 0;// file offset where the payload begins
+            uint64_t payloadOffset = 0;   // file offset where the payload begins
             const uint8_t *base = nullptr;// mapped file base
             uint64_t mapLen = 0;
             void *mmapPtr = nullptr;

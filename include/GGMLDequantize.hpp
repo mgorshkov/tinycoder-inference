@@ -816,13 +816,13 @@ namespace tinycoder {
 
         // IQ2_XS grid lookup table: 512 entries, each storing 8 dequantized
         // values byte-packed into a uint64_t (low byte = grid[0], high =
-        // grid[7]). Byte-identical to ggml's iq2xs_grid table in ggml-common.h.
+        // grid[7]). Byte-identical to the GGUF iq2xs_grid table.
         // (ksigns_iq2xs and kmask_iq2xs are already defined inline above and reused)
         static const uint64_t iq2xs_grid[512];
 
         // IQ2_XXS grid lookup table: 256 entries, each storing 8 dequantized
         // values byte-packed into a uint64_t (low byte = grid[0], high =
-        // grid[7]). Byte-identical to ggml's iq2xxs_grid table in ggml-common.h.
+        // grid[7]). Byte-identical to the GGUF iq2xxs_grid table.
         static const uint64_t iq2xxs_grid[256];
 
         /// @brief Dequantize IQ2_S tensor data to float32.

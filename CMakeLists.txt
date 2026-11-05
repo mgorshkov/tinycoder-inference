@@ -104,8 +104,8 @@ file(GLOB TINYCODER_CORE_SOURCES CONFIGURE_DEPENDS
 #   -DCMAKE_CUDA_ARCHITECTURES=89     # Ada (RTX 40xx) native SASS
 #   -DCMAKE_CUDA_ARCHITECTURES=120    # Blackwell (RTX 50xx) native SASS
 if(ENABLE_CUDA)
-    file(GLOB TINYCODER_CUDA_SOURCES CONFIGURE_DEPENDS
-        ${CMAKE_CURRENT_SOURCE_DIR}/src/cpp/core/*.cu
+    file(GLOB_RECURSE TINYCODER_CUDA_SOURCES CONFIGURE_DEPENDS
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/cpp/core/cuda/*.cu
     )
     list(APPEND TINYCODER_CORE_SOURCES ${TINYCODER_CUDA_SOURCES})
     # The CUDA runtime needs explicit cuBLAS (already found below) plus the
@@ -266,10 +266,20 @@ if(ENABLE_CUDA)
         CUDA_SEPARABLE_COMPILATION ON
     )
     find_library(CUBLAS_LIBRARY cublas)
+    # cublasLt is used for the EXL3 prefill GEMM: cublasGemmEx's default tile
+    # quantises badly on this model's shapes (1.25x slower on ffn_down).  It
+    # ships in the same package as cublas.
+    find_library(CUBLASLT_LIBRARY cublasLt)
     if(CUBLAS_LIBRARY)
         target_link_libraries(tinycoder_core PRIVATE ${CUBLAS_LIBRARY})
         target_compile_definitions(tinycoder_core PRIVATE USE_CUBLAS)
         message(STATUS "cuBLAS found: ${CUBLAS_LIBRARY}")
+        if(CUBLASLT_LIBRARY)
+            target_link_libraries(tinycoder_core PRIVATE ${CUBLASLT_LIBRARY})
+            message(STATUS "cuBLASLt found: ${CUBLASLT_LIBRARY}")
+        else()
+            message(WARNING "cuBLASLt not found - EXL3 prefill GEMM uses cublasGemmEx")
+        endif()
     else()
         message(WARNING "cuBLAS not found - LM head CUDA acceleration disabled")
     endif()

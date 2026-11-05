@@ -24,6 +24,7 @@
 
 #include "EXL3Codec.hpp"
 
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstring>
@@ -102,8 +103,8 @@ namespace tinycoder {
     // ---- Half-integer bitrate tile unpack ----
     void EXL3Codec::unpackTileFrac(const uint16_t *packed, uint32_t KA, uint16_t *codes) {
         // 16 * (KA + 0.5) uint16 words per tile == 8 * KA + 4 uint32 words.
-        const uint32_t K = KA + 1;          // max bits per code
-        const uint32_t nWords = 8u * K;     // upper bound on the uint32 word count
+        const uint32_t K = KA + 1;     // max bits per code
+        const uint32_t nWords = 8u * K;// upper bound on the uint32 word count
         std::array<uint32_t, 128> words{};
         std::memcpy(words.data(), packed, sizeof(uint32_t) * (8u * KA + 4u));
 
@@ -136,12 +137,12 @@ namespace tinycoder {
     }
 
     void EXL3Codec::decodeTileNative(const uint16_t *packed, uint32_t K, int codebook,
-                                    float *tileRowMajor256) {
+                                     float *tileRowMajor256) {
         if (K < 1 || K > 3) {
             decodeTile(packed, K, codebook, tileRowMajor256);
             return;
         }
-        // CPU port of exllamav3 dq8_aligned_{1,2,3}bit + reconstruct_tile's
+        // CPU port of the EXL3 reference dq8_aligned_{1,2,3}bit + reconstruct_tile's
         // tensor-core shuffle.  The runtime layout is a per-lane 16-bit window
         // stream, not a straightforward K-bit-per-code stream: each lane decodes
         // 8 overlapping 16-bit windows through the codebook, then the tensor-core
@@ -269,7 +270,7 @@ namespace tinycoder {
     //     w *= suh                        (input-side signs)
     //     w = preapply_had_r_(w, 128)    (right Hadamard over output dims)
     //     w *= svh                        (output-side signs)
-    template <typename DecodeTile>
+    template<typename DecodeTile>
     static void exl3ReconstructFromTiles(const uint16_t *packed, uint32_t tileU16,
                                          uint32_t tilesK, uint32_t tilesN,
                                          const float *suh, const float *svh,
@@ -279,7 +280,7 @@ namespace tinycoder {
         // Tiles are independent; decode them in parallel (the loader is a
         // one-time cost but 27B checkpoints are ~54 GB of F16 output).
 #pragma omp parallel for schedule(static)
-        for (uint32_t ki = 0; ki < static_cast<int>(tilesK); ++ki) {
+        for (uint32_t ki = 0; ki < tilesK; ++ki) {
             for (uint32_t ni = 0; ni < tilesN; ++ni) {
                 const uint16_t *tile =
                         packed + (static_cast<size_t>(ki) * tilesN + ni) * tileU16;
@@ -306,7 +307,7 @@ namespace tinycoder {
         {
             constexpr uint32_t kBlk = EXL3Codec::kHad;// 128
 #pragma omp parallel for schedule(static)
-            for (uint32_t kb = 0; kb < static_cast<int>(k); kb += kBlk) {
+            for (uint32_t kb = 0; kb < k; kb += kBlk) {
                 alignas(64) float blk[kBlk * kBlk];
                 std::array<float, kBlk> tmp{};
                 const uint32_t rows = std::min(kBlk, k - kb);
@@ -322,6 +323,14 @@ namespace tinycoder {
                     for (uint32_t c = 0; c < cols; ++c) {
                         for (uint32_t r = 0; r < rows; ++r) {
                             tmp[r] = blk[static_cast<size_t>(r) * cols + c];
+                        }
+                        // A partial k block is zero-padded on the missing rows.
+                        // tmp is reused across columns, so its tail must be
+                        // cleared explicitly or the previous column's Hadamard
+                        // output leaks into this one.  For rows == kBlk this is
+                        // skipped and the loop below is bit-identical.
+                        if (rows < kBlk) {
+                            std::fill(tmp.begin() + rows, tmp.end(), 0.0f);
                         }
                         EXL3Codec::hadamard128(tmp.data());
                         for (uint32_t r = 0; r < rows; ++r) {
@@ -341,7 +350,7 @@ namespace tinycoder {
         // 3) suh: scale each row by its input-side sign.
         if (suh) {
 #pragma omp parallel for schedule(static)
-            for (uint32_t r = 0; r < static_cast<int>(k); ++r) {
+            for (uint32_t r = 0; r < k; ++r) {
                 const float s = suh[r];
                 float *row = out + static_cast<size_t>(r) * n;
                 for (uint32_t c = 0; c < n; ++c) {
@@ -351,14 +360,22 @@ namespace tinycoder {
         }
 
         // 4) Right Hadamard: 128-wide blocks over the n (col) axis, per row.
+        //
+        // n is normally a multiple of kHad, but the API does not require it.
+        // Copy only the columns that exist and zero-pad the last block, so a
+        // short row never reads or writes past out[r*n .. r*n+n).
         {
             std::array<float, EXL3Codec::kHad> tmp{};
             for (uint32_t r = 0; r < k; ++r) {
                 float *row = out + static_cast<size_t>(r) * n;
                 for (uint32_t nb = 0; nb < n; nb += EXL3Codec::kHad) {
-                    std::memcpy(tmp.data(), row + nb, EXL3Codec::kHad * sizeof(float));
+                    const uint32_t cols = std::min(EXL3Codec::kHad, n - nb);
+                    std::memcpy(tmp.data(), row + nb, cols * sizeof(float));
+                    if (cols < EXL3Codec::kHad) {
+                        std::fill(tmp.begin() + cols, tmp.end(), 0.0f);
+                    }
                     EXL3Codec::hadamard128(tmp.data());
-                    std::memcpy(row + nb, tmp.data(), EXL3Codec::kHad * sizeof(float));
+                    std::memcpy(row + nb, tmp.data(), cols * sizeof(float));
                 }
             }
         }
@@ -366,7 +383,7 @@ namespace tinycoder {
         // 5) svh: scale each column by its output-side sign.
         if (svh) {
 #pragma omp parallel for schedule(static)
-            for (uint32_t r = 0; r < static_cast<int>(k); ++r) {
+            for (uint32_t r = 0; r < k; ++r) {
                 float *row = out + static_cast<size_t>(r) * n;
                 for (uint32_t c = 0; c < n; ++c) {
                     row[c] *= svh[c];
