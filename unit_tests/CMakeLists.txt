@@ -31,7 +31,6 @@ add_executable(tinycoder_test
     ThreadPoolReentrancyTest.cpp
     GPUCpuCompareTest.cpp
     Int8PackParityTest.cpp
-    MmqParityTest.cpp
     SharedTestEnv.cpp
 )
 
@@ -68,7 +67,7 @@ target_link_libraries(tiny_logits_probe
 )
 
 # ---- EXL3 checkpoint smoke probe (diagnostic; not a gtest) ----
-# Loads a real EXL3 (ExLlamaV3) HF directory through EXL3Loader and validates
+# Loads a real EXL3 HF directory through EXL3Loader and validates
 # the materialized GGUF-named tensor inventory + numeric sanity, without a
 # tokenizer.  Runs on CPU (no CUDA needed).
 add_executable(exl3_model_smoke

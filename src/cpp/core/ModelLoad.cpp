@@ -44,6 +44,154 @@ namespace tinycoder {
 
     // ---- Model loading ----
 
+    namespace {
+        // Quantize 256 floats into one compact Q4_K block (144 B): d, dmin,
+        // 12 packed 6-bit scale/min bytes, 128 nibble bytes.  Affine per-32
+        // groups with a non-positive min so the Q4_K min term stays >= 0.
+        void quantizeQ4KBlock(const float *x, uint8_t *out) {
+            float scale[8], minv[8];
+            uint8_t q[256];
+            float maxScale = 0.0f, maxMin = 0.0f;
+            for (uint32_t g = 0; g < 8; ++g) {
+                const float *xp = x + g * 32;
+                float mn = 0.0f, mx = 0.0f;
+                for (uint32_t i = 0; i < 32; ++i) {
+                    mn = std::min(mn, xp[i]);
+                    mx = std::max(mx, xp[i]);
+                }
+                const float sc = (mx - mn) / 15.0f;
+                scale[g] = sc;
+                minv[g] = -mn;
+                maxScale = std::max(maxScale, sc);
+                maxMin = std::max(maxMin, minv[g]);
+                for (uint32_t i = 0; i < 32; ++i) {
+                    int v = sc > 1e-30f ? static_cast<int>(std::lrintf((xp[i] - mn) / sc)) : 0;
+                    q[g * 32 + i] = static_cast<uint8_t>(std::min(15, std::max(0, v)));
+                }
+            }
+            const uint16_t hd = maxScale > 0.0f
+                                        ? GGMLDequantize::floatToHalf(maxScale / 63.0f)
+                                        : 0;
+            const uint16_t hdm = maxMin > 0.0f
+                                         ? GGMLDequantize::floatToHalf(maxMin / 63.0f)
+                                         : 0;
+            const float d = GGMLDequantize::halfToFloat(hd);
+            const float dm = GGMLDequantize::halfToFloat(hdm);
+            uint8_t sc6[8], m6[8];
+            for (uint32_t g = 0; g < 8; ++g) {
+                int s = d > 1e-30f ? static_cast<int>(std::lrintf(scale[g] / d)) : 0;
+                int m = dm > 1e-30f ? static_cast<int>(std::lrintf(minv[g] / dm)) : 0;
+                sc6[g] = static_cast<uint8_t>(std::min(63, std::max(0, s)));
+                m6[g] = static_cast<uint8_t>(std::min(63, std::max(0, m)));
+            }
+            std::memcpy(out + 0, &hd, 2);
+            std::memcpy(out + 2, &hdm, 2);
+            uint8_t *scales = out + 4;
+            for (uint32_t j = 0; j < 4; ++j) {
+                scales[j] = static_cast<uint8_t>(sc6[j] | ((sc6[j + 4] >> 4) << 6));
+                scales[j + 4] = static_cast<uint8_t>(m6[j] | ((m6[j + 4] >> 4) << 6));
+                scales[j + 8] = static_cast<uint8_t>((sc6[j + 4] & 0x0F) |
+                                                     ((m6[j + 4] & 0x0F) << 4));
+            }
+            uint8_t *qs = out + 16;
+            std::memset(qs, 0, 128);
+            for (uint32_t g = 0; g < 8; ++g) {
+                uint8_t *dst = qs + (g / 2) * 32;
+                const uint32_t sh = (g & 1) * 4;
+                for (uint32_t i = 0; i < 32; ++i)
+                    dst[i] |= static_cast<uint8_t>(q[g * 32 + i] << sh);
+            }
+        }
+
+        void requantIQ2XSGateUpToQ4K(std::vector<Model::LayerWeights> &layers) {
+            const char *e = std::getenv("TINYCODER_IQ2_GATEUP_Q4K");
+            if (e != nullptr && e[0] == '0') return;
+            uint32_t converted = 0;
+            std::vector<float> x(256);
+            for (auto &l : layers) {
+                for (QuantizedMatrix *m : {&l.ffnGate, &l.ffnUp}) {
+                    if (m->type != 17 || m->cols == 0 || (m->cols & 255u) != 0 ||
+                        m->data.empty())
+                        continue;
+                    const uint32_t blocks = m->cols / 256u;
+                    const uint32_t srcBytes = ggmlTypeSize(17);
+                    AlignedVector<uint8_t> out;
+                    out.resize(static_cast<size_t>(m->rows) * blocks * 144u);
+                    for (uint32_t r = 0; r < m->rows; ++r) {
+                        const uint8_t *src = m->data.data() +
+                                             static_cast<size_t>(r) * blocks * srcBytes;
+                        uint8_t *dst = out.data() +
+                                       static_cast<size_t>(r) * blocks * 144u;
+                        for (uint32_t b = 0; b < blocks; ++b) {
+                            GGMLDequantize::dequantizeIQ2_XSBlock(
+                                    src + b * srcBytes, x.data());
+                            quantizeQ4KBlock(x.data(), dst + b * 144u);
+                        }
+                    }
+                    m->data = std::move(out);
+                    m->type = GGML_TYPE_Q4_K;
+                    m->prepackedData.clear();
+                    ++converted;
+                }
+            }
+            if (converted != 0) {
+                std::cout << "[TinyCoder] IQ2_XS gate/up requantized to Q4_K ("
+                          << converted << " matrices)" << std::endl;
+            }
+        }
+        // Requantize IQ3_XXS / IQ3_S projections to Q4_K for larger dense
+        // models (Qwen2.5-7B): the Q4_K int8 dot is much cheaper per weight than
+        // the IQ3 grid-lookup dot, and the 4.5 bpw form still fits VRAM.
+        void requantIQ3ToQ4K(std::vector<Model::LayerWeights> &layers,
+                             uint32_t hiddenSize) {
+            const char *e = std::getenv("TINYCODER_IQ3_Q4K");
+            if (e != nullptr && e[0] == '0') return;
+            if (hiddenSize < 2048u) return;// keep the 1.5B IQ3 fast path
+            uint32_t converted = 0;
+            std::vector<float> x(256);
+            for (auto &l : layers) {
+                QuantizedMatrix *mats[] = {&l.attnQ,  &l.attnK,  &l.attnV,
+                                           &l.attnO,  &l.ffnGate, &l.ffnUp,
+                                           &l.ffnDown};
+                for (QuantizedMatrix *m : mats) {
+                    if ((m->type != 18 && m->type != 21) || m->cols == 0 ||
+                        (m->cols & 255u) != 0 || m->data.empty())
+                        continue;
+                    const uint32_t blocks = m->cols / 256u;
+                    const uint32_t srcType = m->type;
+                    const uint32_t srcBytes = ggmlTypeSize(srcType);
+                    AlignedVector<uint8_t> out;
+                    out.resize(static_cast<size_t>(m->rows) * blocks * 144u);
+                    for (uint32_t r = 0; r < m->rows; ++r) {
+                        const uint8_t *src = m->data.data() +
+                                             static_cast<size_t>(r) * blocks * srcBytes;
+                        uint8_t *dst = out.data() +
+                                       static_cast<size_t>(r) * blocks * 144u;
+                        for (uint32_t b = 0; b < blocks; ++b) {
+                            if (srcType == 18) {
+                                GGMLDequantize::dequantizeIQ3_XXSBlock(
+                                        src + b * srcBytes, x.data());
+                            } else {
+                                GGMLDequantize::dequantizeIQ3_SBlock(
+                                        src + b * srcBytes, x.data());
+                            }
+                            quantizeQ4KBlock(x.data(), dst + b * 144u);
+                        }
+                    }
+                    m->data = std::move(out);
+                    m->type = GGML_TYPE_Q4_K;
+                    m->prepackedData.clear();
+                    ++converted;
+                }
+            }
+            if (converted != 0) {
+                std::cout << "[TinyCoder] IQ3 projections requantized to Q4_K ("
+                          << converted << " matrices)" << std::endl;
+            }
+        }
+
+    }// namespace
+
     bool Model::load(const std::string &modelPath, std::string *outError,
                      ProgressCallback progressCb) {
         std::cout << "[TinyCoder] Loading model from: " << modelPath << std::endl;
@@ -259,6 +407,9 @@ namespace tinycoder {
             return false;
         }
 
+        requantIQ2XSGateUpToQ4K(layers_);
+        requantIQ3ToQ4K(layers_, config_.hiddenSize);
+
         reportProgress(0.7f, "Building pre-dequantized embeddings...");
 
         // Build pre-dequantized embedding matrix for fast LM head computation
@@ -418,8 +569,14 @@ namespace tinycoder {
                 return QuantizedMatrix{};
             }
 
-            const uint8_t *data = loader.getTensor(name);
-            if (!data) {
+            // EXL3 linears are uploaded from the packed trellis; the host F16
+            // copy is optional and materialized lazily only for CPU fallback.
+            const auto *exl3Loader = dynamic_cast<const EXL3Loader *>(&loader);
+            const bool lazyLinear = exl3Loader && exl3Loader->isLazyLinear(name);
+            const Exl3LinearInfo *native =
+                    exl3Loader ? exl3Loader->nativeLinear(name) : nullptr;
+            const uint8_t *data = lazyLinear ? nullptr : loader.getTensor(name);
+            if (!data && native == nullptr) {
                 std::cerr << "[TinyCoder] Tensor data not found: " << name << std::endl;
                 return QuantizedMatrix{};
             }
@@ -474,9 +631,7 @@ namespace tinycoder {
             // EXL3 checkpoints: keep the packed trellis available so the CUDA
             // adapter can upload the native compressed linear instead of the
             // F16 materialization (the CPU path still uses `data`).
-            if (const auto *ex = dynamic_cast<const EXL3Loader *>(&loader)) {
-                qm.exl3 = ex->nativeLinear(name);
-            }
+            qm.exl3 = native;
             // Mark folded (Prism-rotated) weights so the forward pass routes
             // their activation through applyPrismTransform.
             if (isFoldedWeight(name)) {
@@ -490,7 +645,9 @@ namespace tinycoder {
             // 16/40 on the 31 GB host. The SIMD kernels only use unaligned
             // loads, so the mmap pointer (which is not 64-byte aligned) is
             // safe to hand to them directly.
-            qm.data.setExternal(data, static_cast<size_t>(dataBytes));
+            if (data != nullptr) {
+                qm.data.setExternal(data, static_cast<size_t>(dataBytes));
+            }
             return qm;
         };
 
@@ -599,6 +756,9 @@ namespace tinycoder {
         // token_embd.weight)
         auto lmHeadInfo = loader.getTensorInfo("output.weight");
         if (lmHeadInfo) {
+            const auto *exl3Loader = dynamic_cast<const EXL3Loader *>(&loader);
+            const bool nativeLm =
+                    exl3Loader && exl3Loader->nativeLinear("output.weight") != nullptr;
             auto lmHeadData = loader.getTensor("output.weight");
             auto embData = loader.getTensor("token_embd.weight");
             if (lmHeadData && embData && lmHeadData == embData) {
@@ -606,13 +766,15 @@ namespace tinycoder {
                 lmHeadTied_ = true;
                 std::cout << "[TinyCoder] LM head: tied with token embeddings"
                           << std::endl;
-            } else if (lmHeadData) {
+            } else if (nativeLm || lmHeadData) {
                 // Separate LM head - load as quantized matrix
                 lmHead_ = loadQuantized("output.weight");
                 if (!lmHead_.empty()) {
                     lmHeadTied_ = false;
                     std::cout << "[TinyCoder] LM head: separate, "
-                              << (lmHead_.data.size() / (1024 * 1024)) << " MB quantized"
+                              << ((lmHead_.exl3 ? lmHead_.exl3->trellisBytes
+                                                : lmHead_.data.size()) / (1024 * 1024))
+                              << " MB quantized"
                               << std::endl;
                 } else {
                     lmHeadTied_ = true;
@@ -1164,7 +1326,7 @@ namespace tinycoder {
         // run through the int8 _mm256_maddubs_epi16 kernels with the hidden
         // vector quantized once per token. Since the source LM head uses K-quant
         // types, Q8_K is lossless. Mirrors the tied-embedding Q8_K build above.
-        if (!lmHeadTied_ && !lmHead_.empty()) {
+        if (!lmHeadTied_ && !lmHead_.empty() && !lmHead_.data.empty()) {
             uint32_t srcBlockSize = ggmlBlockSize(lmHead_.type);
             uint32_t srcTypeSize = ggmlTypeSize(lmHead_.type);
             uint32_t srcBlocksPerRow = (lmHead_.cols + srcBlockSize - 1) / srcBlockSize;

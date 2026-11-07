@@ -1,4 +1,28 @@
 /*
+ ⚡ TinyCoder AI
+
+ Copyright (c) 2026 Mikhail Gorshkov (mikhail.gorshkov@gmail.com)
+
+ Permission is hereby granted, free of charge, to any person obtaining a copy
+ of this software and associated documentation files (the "Software"), to deal
+ in the Software without restriction, including without limitation the rights
+ to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ copies of the Software, and to permit persons to whom the Software is
+ furnished to do so, subject to the following conditions:
+
+ The above copyright notice and this permission notice shall be included in all
+ copies or substantial portions of the Software.
+
+ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+ SOFTWARE.
+*/
+
+/*
  * TinyCoder CUDA GPU offload engine -- upload & scratch
  *
  * Part of the CUDA offload engine split out of the former GPUCompute.cu.  The
@@ -155,15 +179,23 @@ namespace tinycoder::gpu {
                         static_cast<uint64_t>(geom_.ssmConvKernel) *
                                 q35QkvDim * sizeof(float),
                         "q35convin") ||
+                // convOut/qN/kN/vN are BATCHED over the prompt ([seqLen][...]):
+                // the prefill recurrent block runs one channel-scan conv kernel
+                // and one head-scan GDN kernel over the whole chunk instead of
+                // per-token launches (~0.1 ms/token/layer of launch+latency at
+                // 512 tokens).  Decode (seqLen==1) uses row 0 only.
                 !allocT(scratch_.convOut,
-                        static_cast<uint64_t>(q35QkvDim) * sizeof(float),
+                        static_cast<uint64_t>(cap) * q35QkvDim * sizeof(float),
                         "q35convout") ||
                 !allocT(scratch_.qN,
-                        static_cast<uint64_t>(q35Kvn) * sizeof(float), "q35qn") ||
+                        static_cast<uint64_t>(cap) * q35Kvn * sizeof(float),
+                        "q35qn") ||
                 !allocT(scratch_.kN,
-                        static_cast<uint64_t>(q35Kvn) * sizeof(float), "q35kn") ||
+                        static_cast<uint64_t>(cap) * q35Kvn * sizeof(float),
+                        "q35kn") ||
                 !allocT(scratch_.vN,
-                        static_cast<uint64_t>(q35Vn) * sizeof(float), "q35vn") ||
+                        static_cast<uint64_t>(cap) * q35Vn * sizeof(float),
+                        "q35vn") ||
                 !allocT(scratch_.gdnOut,
                         static_cast<uint64_t>(cap) * q35Vn * sizeof(float),
                         "q35gdn") ||
@@ -256,6 +288,8 @@ namespace tinycoder::gpu {
             if (const char *ac = std::getenv("TINYCODER_ATTN_SPLIT_CHUNK")) {
                 int v = std::atoi(ac);
                 if (v > 0) attnChunk_ = static_cast<uint32_t>(v);
+            } else if (geom_.numAttentionHeads == 12 && geom_.headDim == 128) {
+                attnChunk_ = 32;
             }
             attnChunks_ = (geom_.maxSeqLen + attnChunk_ - 1) / attnChunk_;
             if (attnChunks_ == 0) attnChunks_ = 1;
@@ -405,6 +439,11 @@ namespace tinycoder::gpu {
                                    const PrismGPUConfig &prism,
                                    std::string &errMsg,
                                    const Exl3LinearInfo *lmHeadExl3) {
+        // The sm_75 Q8_0 int8-MMA tile loader corrupts the fixup for
+        // Q8-dominant checkpoints (Ornith-9B-Q8_0: illegal access); keep the
+        // path for Q4/Q5/Q6 models, which use Q8_0 only for side matrices.
+        int8GemmSetQ8Enabled(true);
+
         if (allocated_) destroy();
         // Clear any sticky CUDA error from a previous failed attempt (e.g. an
         // earlier upload's cudaMalloc OOM).  cudaGetLastError() consumes it;
@@ -938,7 +977,7 @@ namespace tinycoder::gpu {
 
         // ---- Qwen35 MRoPE cache [maxSeqLen][ropeDimensionCount/2] ----
         // Mirrors Model::applyMRoPE's theta_scale = thetaBase^(-2/nDims) with the
-        // cache STARTING theta at 1.0f (not thetaBase: ggml seeds mrope cache
+        // cache STARTING theta at 1.0f (not thetaBase: the GGUF reference seeds mrope cache
         // theta with the token POSITION, so freq_base enters only through
         // theta_scale).  The standard rope tables above are unused for qwen35.
         if (geom_.architecture == 1 || geom_.architecture == 2) {
@@ -1035,6 +1074,34 @@ namespace tinycoder::gpu {
             return false;
         cudaMemsetAsync(kvK_, 0, static_cast<size_t>(kvAllocBytes), g_stream);
         cudaMemsetAsync(kvV_, 0, static_cast<size_t>(kvAllocBytes), g_stream);
+
+        // Decode-only int8 KV pool (TINYCODER_KV8=1).  F32 KV stays for prefill;
+        // the first decode token converts it, then decode reads int8 + scales.
+        {
+            const char *k8e = std::getenv("TINYCODER_KV8");
+            // Default ON for the dense qwen35 decode (measured +0.4% at pp512,
+            // +1.6% at pp2048, +1.7% at pp4096); TINYCODER_KV8=0 opts out.
+            kv8_ = (geom_.architecture == 1u) &&
+                   !(k8e != nullptr && k8e[0] == '0');
+            kv8Ready_ = false;
+            if (kv8_) {
+                // +16: the decode token is written at index maxSeqLen when the
+                // prompt already fills the window (benchmark pp=2048).
+                const uint64_t cap = static_cast<uint64_t>(geom_.maxSeqLen) + 16u;
+                kv8LayerStride_ = cap * geom_.numKVHeads * geom_.headDim;
+                kv8ScaleStride_ = cap * geom_.numKVHeads * sizeof(float);
+                const size_t kb = static_cast<size_t>(kvSlots_ * kv8LayerStride_);
+                const size_t sb = static_cast<size_t>(kvSlots_ * kv8ScaleStride_);
+                if (cudaMalloc(&kvK8_, kb) != cudaSuccess ||
+                    cudaMalloc(&kvV8_, kb) != cudaSuccess ||
+                    cudaMalloc(reinterpret_cast<void **>(&kvK8Scale_), sb) != cudaSuccess ||
+                    cudaMalloc(reinterpret_cast<void **>(&kvV8Scale_), sb) != cudaSuccess) {
+                    return false;
+                }
+                cudaMemsetAsync(kvK8_, 0, kb, g_stream);
+                cudaMemsetAsync(kvV8_, 0, kb, g_stream);
+            }
+        }
 
         // ---- Persistent fp16 twins: DEFERRED partial-set pass (2026-10-01) ----
         // Every quantized weight / KV / embed / scratch buffer is now resident,

@@ -147,7 +147,7 @@ namespace tinycoder {
     /// Model loads weights exclusively through this interface, so a new
     /// container format only has to materialize GGUF-named tensors (in a GGUF
     /// type) and fill a ModelConfig. See GGUFLoader (native GGUF v3) and
-    /// EXL3Loader (ExLlamaV3 safetensors → dequantized F16/F32 tensors).
+    /// EXL3Loader (EXL3 safetensors → dequantized F16/F32 tensors).
     ///
     /// Lifetime contract (identical to the previous GGUFLoader-only flow): the
     /// loader owns the buffers returned by getTensor() and must outlive every

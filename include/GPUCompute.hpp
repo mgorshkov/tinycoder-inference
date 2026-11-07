@@ -208,6 +208,24 @@ namespace tinycoder::gpu {
                              std::string &errMsg,
                              const Exl3LinearInfo *lmHeadExl3 = nullptr);
 
+        /// @brief Grouped-expert GPU MMQ for prefill.
+        ///
+        /// Streams one expert's gate/up/down slice to the device, batches all
+        /// tokens routed to that expert through int8Gemm, then accumulates the
+        /// weighted down rows into the host ffnOut.  The expert weights are
+        /// host-resident, so this works even when the full expert set does not
+        /// fit VRAM.  Returns false when a type/shape is not covered (caller
+        /// falls back to the CPU grouped path).
+        bool moeBatchExperts(const uint8_t *gate, uint32_t gateType,
+                             uint32_t gateRowsPerExpert, const uint8_t *up,
+                             uint32_t upType, uint32_t upRowsPerExpert,
+                             const uint8_t *down, uint32_t downType,
+                             uint32_t downRowsPerExpert, const float *normHost,
+                             float *outHost, uint32_t seqLen, uint32_t hidden,
+                             uint32_t expertFF, const int32_t *expertIdx,
+                             const float *expertWgt, uint32_t expertsUsed,
+                             uint32_t expertCount, std::string &errMsg);
+
         /// @brief Copy the current GPU-side hidden state (after the offloaded layer
         /// prefix) back to the host.  Used by the partial-offload path: the caller
         /// feeds this vector into the CPU Model::forward for the remaining layers.
@@ -367,56 +385,6 @@ namespace tinycoder::gpu {
         float debugQGemvRow(uint32_t type, const uint8_t *wRow,
                             uint32_t blocksPerRow, const float *x,
                             uint32_t cols, uint32_t rowBytes);
-
-        /// @brief Debug: run the int8 tensor-core MMQ GEMM/GEMV
-        /// (kQuantizeQ8K + kMmqGemm_8x8x16, mma.s8.m8n8k16) on an already-packed
-        /// IQ3_XXS matrix and a batch of activations.  This is the SAME kernel
-        /// for prefill (seq > 1) and decode (seq == 1) -- one warp per
-        /// (8-token x 8-row) output tile, one block per 8-row weight tile
-        /// spanning 64 tokens.
-        /// @param wPacked int8 B cells from Int8Pack::packMma
-        ///        (ceil(rows/8) * ceil(cols/16) * 128 bytes)
-        /// @param wScales per-(n8-tile, k16-tile, n-row) group scales from
-        ///        Int8Pack::packMma (ceil(rows/8) * ceil(cols/16) * 8 floats)
-        /// @param rows, cols PACKED matrix geometry (cols must be a multiple of
-        ///        32 so a weight k16-tile never straddles a 32-group)
-        /// @param x seq-row-major fp32 activation (seq * cols)
-        /// @param seq Number of activation rows (prefill batch / 1 for decode)
-        /// @param out seq-row-major fp32 output (seq * rows)
-        /// @param outXq Optional: receives the GPU-quantized Q8_K activations
-        ///        (seq * ceil(cols/256) * kQ8K_STRIDE bytes) so the caller can
-        ///        recompute the reference on the EXACT bytes the kernel used.
-        /// @return false (out untouched) if this GPU has no int8 m8n8k16
-        ///        tensor-core mma (pre-Turing) or CUDA is unavailable.
-        bool debugMmqGemm(const int8_t *wPacked, const float *wScales,
-                          uint32_t rows, uint32_t cols, const float *x,
-                          uint32_t seq, float *out, uint8_t *outXq);
-
-        /// @brief Debug: run the AFFINE Q4_K int8 tensor-core MMQ GEMM/GEMV
-        /// (kQuantizeQ8K + kMmqGemmQ4K_Affine, mma.s8.m8n8k16) on an
-        /// already-packed Q4_K matrix and a batch of activations.  Q4_K
-        /// dequantizes as w = d*sc*q - dmin*m, so unlike the pure-scale
-        /// kMmqGemm_8x8x16 this kernel adds the per-32-group activation-sum
-        /// min term outside the tensor core.  Used by unit tests to compare the
-        /// affine mma path against kQGemmKxQ8K<kTypeQ4K>.
-        /// @param qPacked int8 B cells from Int8Pack::packMmaQ4K
-        ///        (ceil(rows/8) * ceil(cols/16) * 128 bytes)
-        /// @param dsc,dmn per-(n8-tile, k16-tile, n-row) d*sc / dmin*m floats
-        ///        from Int8Pack::packMmaQ4K (ceil(rows/8)*ceil(cols/16)*8 each)
-        /// @param rows, cols PACKED matrix geometry (cols must be a multiple of
-        ///        32 so a weight k16-tile never straddles a 32-group)
-        /// @param x seq-row-major fp32 activation (seq * cols)
-        /// @param seq Number of activation rows (prefill batch / 1 for decode)
-        /// @param out seq-row-major fp32 output (seq * rows)
-        /// @param outXq Optional: receives the GPU-quantized Q8_K activations
-        ///        (seq * ceil(cols/256) * kQ8K_STRIDE bytes) so the caller can
-        ///        recompute the reference on the EXACT bytes the kernel used.
-        /// @return false (out untouched) if this GPU has no int8 m8n8k16
-        ///        tensor-core mma (pre-Turing) or CUDA is unavailable.
-        bool debugMmqQ4K(const int8_t *qPacked, const float *dsc,
-                         const float *dmn, uint32_t rows, uint32_t cols,
-                         const float *x, uint32_t seq, float *out,
-                         uint8_t *outXq);
 
         /// @brief Debug: quantize x with kQuantizeQ8_0x32 and emit the
         /// per-block float contributions kQGemvQ8_0xQ8K would accumulate.
@@ -785,6 +753,17 @@ namespace tinycoder::gpu {
         // (architecture == 0) uses it; qwen35 keeps fp32 (its GDN/full-attention
         // kernels index kvK_/kvV_ as float*).
         bool kvHalf_ = false;
+        // Decode-only int8 KV (TINYCODER_KV8): F32 KV is kept for prefill; on
+        // the first decode token it is converted to an int8 pool + per-head
+        // scales, and decode reads the int8 pool.
+        bool kv8_ = false;
+        bool kv8Ready_ = false;
+        void *kvK8_ = nullptr;
+        void *kvV8_ = nullptr;
+        float *kvK8Scale_ = nullptr;
+        float *kvV8Scale_ = nullptr;
+        uint64_t kv8LayerStride_ = 0;
+        uint64_t kv8ScaleStride_ = 0;
         // ---- KV-cache layer slotting ----
         // Dense architectures allocate ONE KV slot per offloaded layer
         // (kvLayerStride_ = maxSeqLen*kvHeads*headDim*elem, kvSlots_ = nGpu).
@@ -831,6 +810,8 @@ namespace tinycoder::gpu {
         // per-layer), so 7B+ models fit in VRAM without ~14 GB of persistent
         // FP16 twins.
         void *wF16_ = nullptr;
+        void *cublasX16_ = nullptr;
+        uint64_t cublasX16Bytes_ = 0;
         uint64_t wF16Bytes_ = 0;
         const void *wF16SrcQ_ = nullptr;// matrix source whose dequant is in wF16_
         // Persistent per-matrix FP16 prefill twins (2026-09-29): when the VRAM
@@ -1033,6 +1014,10 @@ namespace tinycoder::gpu {
         // graphPos_ (blocking H2D) BEFORE cudaStreamBeginCapture so the
         // recorded kernels see the right value at first launch.
         bool captureDecodeGraph(uint32_t pos);
+        /// @brief Replay the captured dense-qwen35 decode graph (refreshes the
+        ///        token + position device scalars, launches, copies logits).
+        bool replayQwen35DecodeGraph(const std::vector<int32_t> &tokens,
+                                     float *logitsOut, std::string &errMsg);
         // Replay the captured decode graph (which contains kernels only --
         // no memcpys / position values): the caller has already H2D'd the
         // tokens into s.tokens; this updates the graphPos_ device scalar,
@@ -1096,6 +1081,11 @@ namespace tinycoder::gpu {
         /// reusable per-layer FP16 scratch (wF16_), growing it as needed.
         /// @param m Device-layout matrix descriptor
         /// @param outBuf Receives the (cached) fp16 scratch pointer.
+        /// @brief Q8_0 prefill: dequantize the matrix to F16 and run a
+        /// cuBLAS tensor-core GEMM for batch prefill.
+        bool gemmQ8Cublas(const DeviceMatrix &m, const float *x, float *y,
+                          uint32_t seqLen, std::string &errMsg);
+
         bool dequantMatrixF16(const DeviceMatrix &m, void **outBuf,
                               std::string &errMsg);
 

@@ -434,7 +434,7 @@ namespace tinycoder {
                     // Also test a TRUE full offload: every layer PLUS the
                     // separate LM head must fit in the budget.  Only then does
                     // the device run the final norm + LM head (upload()'s
-                    // useGpuLmHead); a single LM_head.cpp automatic fit.  Prefer
+                    // useGpuLmHead); a single LM-head fit.  Prefer
                     // it when affordable; otherwise the LM head stays on the CPU
                     // with the partial tail.
                     if (lmHeadBytes > 0) {
@@ -867,8 +867,52 @@ namespace tinycoder {
                         // path: reference router + the 8 routed experts into
                         // ffnOut (the GPU then adds the shared expert +
                         // residual).
-                        m.computeQwen35MoEFromLogits(ffnNorm, ffnOut, seqLen,
-                                                     m.config_.hiddenSize, w);
+                        bool gpuBatchDone = false;
+#ifdef USE_CUDA
+                        const char *gbEnv = std::getenv("TINYCODER_MOE_GPU_BATCH");
+                        // Opt-in until the grouped GPU expert path is proven
+                        // faster on the 35B hybrid; the CPU grouped path is
+                        // the default.
+                        const bool tryGpuBatch =
+                                seqLen > 1 && gbEnv != nullptr &&
+                                gbEnv[0] != '\0' && gbEnv[0] != '0';
+                        if (tryGpuBatch) {
+                            const uint32_t eu = m.config_.expertUsedCount;
+                            const uint32_t ff = m.config_.expertFeedForwardLength;
+                            const uint32_t H = m.config_.hiddenSize;
+                            const size_t n = static_cast<size_t>(seqLen) * eu;
+                            std::vector<int32_t> idx(n);
+                            std::vector<float> wgt(n);
+                            m.computeQwen35MoERouterOnly(ffnNorm, seqLen, H, w,
+                                                        idx.data(), wgt.data());
+                            const bool fused = !w.ffnGateUpExpsMoe.empty() &&
+                                               w.ffnUpExps.empty();
+                            const QuantizedMatrix &gate =
+                                    fused ? w.ffnGateUpExpsMoe : w.ffnGateExps;
+                            const QuantizedMatrix &up = w.ffnUpExps;
+                            std::fill(ffnOut, ffnOut + static_cast<size_t>(seqLen) * H,
+                                      0.0f);
+                            std::string batchErr;
+                            gpuBatchDone = gpu_.moeBatchExperts(
+                                    gate.data.data(), gate.type,
+                                    fused ? 2u * ff : ff,
+                                    fused ? nullptr : up.data.data(), up.type,
+                                    fused ? 0u : ff,
+                                    w.ffnDownExpsMoe.data.data(),
+                                    w.ffnDownExpsMoe.type, H, ffnNorm, ffnOut,
+                                    seqLen, H, ff, idx.data(), wgt.data(), eu,
+                                    m.config_.expertCount, batchErr);
+                            if (!gpuBatchDone) {
+                                std::fill(ffnOut,
+                                          ffnOut + static_cast<size_t>(seqLen) * H,
+                                          0.0f);
+                            }
+                        }
+#endif
+                        if (!gpuBatchDone) {
+                            m.computeQwen35MoEFromLogits(ffnNorm, ffnOut, seqLen,
+                                                         m.config_.hiddenSize, w);
+                        }
                         // TINYCODER_DUMP_MOE=1: dump the CPU reference
                         // per-rank (s=0) gate/up/down for expert 0 to compare
                         // against the GPU cache path dumps.
@@ -924,12 +968,22 @@ namespace tinycoder {
                         // it (for scripts/docs that already set it);
                         // TINYCODER_MOE_FALLBACK=1 forces the CPU expert path
                         // even with the cache built.
+                        //
+                        // DEFAULT: ON (2026-11-04, second measurement).  The
+                        // 2026-09 default was on, then the 2026-11 CPU-expert
+                        // pass measured the LRU cache at 7.3 tok/s vs 14.0 and
+                        // made it opt-in -- but that was with the in-tree
+                        // quantized GEMV.  With the the int8 tensor-core GEMV port the
+                        // cached experts' GPU GEMVs run at ~500 GB/s again:
+                        // Ornith-1.5-35B-Q4_K_M pp512/tg128 = **37.3 tok/s**
+                        // decode / 40.9 pp128 (vs 15.3 CPU experts), i.e. above
+                        // the int8 tensor-core 30.4.  TINYCODER_MOE_CACHE=0 restores the
+                        // grouped-batch CPU-expert path (Option B).
                         const char *moeCacheEnv =
                                 std::getenv("TINYCODER_MOE_CACHE");
-                        const bool moeCacheDisabled =
-                                moeCacheEnv != nullptr && moeCacheEnv[0] != '\0' &&
-                                moeCacheEnv[0] == '0';
-                        const bool moeCache = !moeCacheDisabled;
+                        const bool moeCache =
+                                moeCacheEnv == nullptr || moeCacheEnv[0] == '\0' ||
+                                moeCacheEnv[0] != '0';
                         if (moeCache) {
                             if (!gpu_.buildExpertCache(err)) {
                                 std::fprintf(stderr,
