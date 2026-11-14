@@ -31,6 +31,9 @@ SOFTWARE.
 #include "EXL3Codec.hpp"
 #include "EXL3Kernels.hpp"
 
+#include <cuda_fp16.h>
+#include <cuda_runtime.h>
+
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -98,11 +101,154 @@ namespace {
         return m;
     }
 
+
     int failures = 0;
 
     void check(bool ok, const std::string &what) {
         std::printf("  [%s] %s\n", ok ? "PASS" : "FAIL", what.c_str());
         if (!ok) ++failures;
+    }
+
+    // Batched-prefill parity: y = W @ x with x = e_j returns row j of the [k][n]
+    // basis matrix, so comparing that row against the F16 the batched path
+    // materialises pins the convention the batched GEMM must reproduce.
+    void checkMaterializeVsFused(const tinycoder::exl3gpu::Exl3HostLinear &lin,
+                                 const void *trellis,
+                                 const std::vector<float> &refCpu) {
+        const uint32_t k = lin.k;
+        const uint32_t n = lin.n;
+        const size_t nelem = static_cast<size_t>(k) * n;
+        __half *matF16 = nullptr;
+        __half *rawF16 = nullptr;
+        float *xDev = nullptr;
+        float *yDev = nullptr;
+        cudaMalloc(&matF16, nelem * sizeof(__half));
+        cudaMalloc(&rawF16, nelem * sizeof(__half));
+        cudaMalloc(&xDev, k * sizeof(float));
+        cudaMalloc(&yDev, n * sizeof(float));
+
+        std::string err;
+        bool ok = tinycoder::exl3gpu::materializeF16(trellis, matF16, 0, err);
+        check(ok, "materializeF16 call" + (ok ? std::string() : (": " + err)));
+        ok = tinycoder::exl3gpu::materializeRawF16(trellis, rawF16, 0, err);
+        check(ok, "materializeRawF16 call" + (ok ? std::string() : (": " + err)));
+
+        std::vector<__half> hMat(nelem);
+        std::vector<__half> hRaw(nelem);
+        cudaMemcpy(hMat.data(), matF16, nelem * sizeof(__half), cudaMemcpyDeviceToHost);
+        cudaMemcpy(hRaw.data(), rawF16, nelem * sizeof(__half), cudaMemcpyDeviceToHost);
+
+        // Gate (a) for the fused kernel: decode+WMMA in one pass (raw basis) must
+        // reproduce the materialised raw matrix rows.
+        {
+            std::vector<__half> xh(static_cast<size_t>(16) * k, __float2half(0.0f));
+            for (uint32_t r = 0; r < 16u && r < k; ++r)
+                xh[static_cast<size_t>(r) * k + r] = __float2half(1.0f);
+            __half *xhDev = nullptr;
+            float *yG = nullptr;
+            cudaMalloc(&xhDev, xh.size() * sizeof(__half));
+            cudaMalloc(&yG, static_cast<size_t>(16) * n * sizeof(float));
+            cudaMemcpy(xhDev, xh.data(), xh.size() * sizeof(__half), cudaMemcpyHostToDevice);
+            std::string ferr;
+            const bool fok = tinycoder::exl3gpu::gemmFusedRawLaunch(trellis, xhDev, yG, 16u, 0, ferr);
+            check(fok, "fused gemm launch" + (fok ? std::string() : (": " + ferr)));
+            if (fok) {
+                std::vector<float> hy(static_cast<size_t>(16) * n);
+                cudaMemcpy(hy.data(), yG, hy.size() * sizeof(float), cudaMemcpyDeviceToHost);
+                float w = 0.0f;
+                for (uint32_t r = 0; r < 16u && r < k; ++r)
+                    for (uint32_t c = 0; c < n; ++c)
+                        w = std::fmax(w, std::fabs(hy[static_cast<size_t>(r) * n + c] -
+                                                   __half2float(hRaw[static_cast<size_t>(r) * n + c])));
+                check(w < 0.05f,
+                      "fused gemm vs raw matrix (maxAbsDiff=" +
+                              std::to_string(w) + ")");
+            }
+            cudaFree(xhDev);
+            cudaFree(yG);
+        }
+
+        // Multi-strip variant of the check above.  seqLen=16 only ever exercises
+        // the first m-strip, so a kernel that walks several strips per block
+        // (MLOOP > 1, or any multi-warp/multi-strip tiling) could have a broken
+        // strip index and still pass -- the logits probe uses a 12-token prompt,
+        // which does not reach a second strip either.  With x = I the GEMM must
+        // return rows 0..seqLen-1 of the raw matrix verbatim.
+        {
+            const uint32_t stripRows = (k < 512u) ? k : 512u;
+            const uint32_t mRows = (stripRows < n) ? stripRows : n;
+            std::vector<__half> xh(static_cast<size_t>(mRows) * k, __float2half(0.0f));
+            for (uint32_t r = 0; r < mRows; ++r)
+                xh[static_cast<size_t>(r) * k + r] = __float2half(1.0f);
+            __half *xhDev = nullptr;
+            float *yG = nullptr;
+            cudaMalloc(&xhDev, xh.size() * sizeof(__half));
+            cudaMalloc(&yG, static_cast<size_t>(mRows) * n * sizeof(float));
+            cudaMemcpy(xhDev, xh.data(), xh.size() * sizeof(__half), cudaMemcpyHostToDevice);
+            std::string ferr;
+            const bool fok =
+                    tinycoder::exl3gpu::gemmFusedRawLaunch(trellis, xhDev, yG, mRows, 0, ferr);
+            check(fok, "fused gemm multi-strip launch" + (fok ? std::string() : (": " + ferr)));
+            if (fok) {
+                std::vector<float> hy(static_cast<size_t>(mRows) * n);
+                cudaMemcpy(hy.data(), yG, hy.size() * sizeof(float), cudaMemcpyDeviceToHost);
+                float w = 0.0f;
+                for (uint32_t r = 0; r < mRows; ++r)
+                    for (uint32_t c = 0; c < n; ++c)
+                        w = std::fmax(w, std::fabs(hy[static_cast<size_t>(r) * n + c] -
+                                                   __half2float(hRaw[static_cast<size_t>(r) * n + c])));
+                check(w < 0.05f,
+                      "fused gemm multi-strip (" + std::to_string(mRows) +
+                              " rows) vs raw matrix (maxAbsDiff=" + std::to_string(w) + ")");
+            }
+            cudaFree(xhDev);
+            cudaFree(yG);
+        }
+
+        const uint32_t probes[4] = {0u, 1u, k / 2u, k - 1u};
+        float worstMat = 0.0f;
+        float worstRaw = 0.0f;
+        float worstCpu = 0.0f;
+        for (uint32_t p = 0; p < 4u; ++p) {
+            const uint32_t j = probes[p];
+            std::vector<float> x(k, 0.0f);
+            x[j] = 1.0f;
+            cudaMemcpy(xDev, x.data(), k * sizeof(float), cudaMemcpyHostToDevice);
+            ok = tinycoder::exl3gpu::gemvFused(trellis, xDev, yDev, 0, err);
+            check(ok, "gemvFused call" + (ok ? std::string() : (": " + err)));
+            std::vector<float> yG(n, 0.0f);
+            cudaMemcpy(yG.data(), yDev, n * sizeof(float), cudaMemcpyDeviceToHost);
+
+            float dMat = 0.0f;
+            float dRaw = 0.0f;
+            float dCpu = 0.0f;
+            for (uint32_t c = 0; c < n; ++c) {
+                const float g = yG[c];
+                dMat = std::fmax(dMat, std::fabs(g - __half2float(hMat[static_cast<size_t>(j) * n + c])));
+                dRaw = std::fmax(dRaw, std::fabs(g - __half2float(hRaw[static_cast<size_t>(j) * n + c])));
+                dCpu = std::fmax(dCpu, std::fabs(g - refCpu[static_cast<size_t>(j) * n + c]));
+            }
+            float dMatCpu = 0.0f;
+            float dRawCpu = 0.0f;
+            for (uint32_t c = 0; c < n; ++c) {
+                const float r = refCpu[static_cast<size_t>(j) * n + c];
+                dMatCpu = std::fmax(dMatCpu, std::fabs(r - __half2float(hMat[static_cast<size_t>(j) * n + c])));
+                dRawCpu = std::fmax(dRawCpu, std::fabs(r - __half2float(hRaw[static_cast<size_t>(j) * n + c])));
+            }
+            std::printf("    j=%u  mat-vs-fused %.6f  raw-vs-fused %.6f  fused-vs-cpu %.6f  mat-vs-cpu %.6f\n",
+                        j, dMat, dRaw, dCpu, dMatCpu);
+            worstMat = std::fmax(worstMat, dMat);
+            worstRaw = std::fmax(worstRaw, dRaw);
+            worstCpu = std::fmax(worstCpu, dCpu);
+        }
+        check(worstCpu < 1e-2f, "fused gemv row vs cpu (maxAbsDiff=" + std::to_string(worstCpu) + ")");
+        check(worstMat < 1e-2f, "materialize row vs fused gemv (maxAbsDiff=" + std::to_string(worstMat) + ")");
+        check(worstRaw < 1e-2f, "materializeRaw row vs fused gemv (maxAbsDiff=" + std::to_string(worstRaw) + ")");
+
+        cudaFree(matF16);
+        cudaFree(rawF16);
+        cudaFree(xDev);
+        cudaFree(yDev);
     }
 
     void runCase(uint32_t k, uint32_t n, uint32_t K10, int codebook, bool signs,
@@ -205,6 +351,19 @@ namespace {
             check(d < 2e-2f, "gemv parity (maxAbsDiff=" + std::to_string(d) + ")");
         }
         tinycoder::exl3gpu::releaseLinear(h);
+
+        // ---- Batched-prefill basis check (integer bitrates only: the fused
+        // upload rejects half-integer ones) ----
+        if (!frac) {
+            tinycoder::exl3gpu::Exl3FusedLinear fused{};
+            std::string ferr;
+            if (tinycoder::exl3gpu::uploadFusedLinear(lin, fused, ferr)) {
+                checkMaterializeVsFused(lin, fused.trellis, refCpu);
+                tinycoder::exl3gpu::releaseFusedLinear(fused);
+            } else {
+                check(false, "uploadFusedLinear: " + ferr);
+            }
+        }
         std::printf("\n");
     }
 
@@ -232,6 +391,18 @@ int main() {
     runCase(1024, 512, 40, 0, true, 9);
     runCase(1024, 256, 40, 0, true, 10);
     runCase(256, 1024, 40, 0, true, 11);
+
+    // Gate (a): the 27B's real geometries at their production bitrate (1.60 bpw => K=1).
+    // The synthetic squares above are 256-1024 on a side; a transpose or tile-order
+    // convention error only shows up at the aspect ratios and absolute offsets the
+    // model actually uses, which is how three convention bugs survived this long.
+    //   attention/MLP in  : k=5120, n=10240 (qkv+gate/up style, n >> k)
+    //   attention/MLP out : k=6144, n=5120  (k >> n)
+    runCase(5120, 2048, 16, 0, true, 20);
+    runCase(5120, 4096, 16, 0, true, 21);
+    runCase(5120, 8192, 16, 0, true, 22);
+    runCase(5120, 10240, 16, 0, true, 12);
+    runCase(6144, 5120, 16, 0, true, 13);
 
     tinycoder::exl3gpu::shutdown();
     if (failures == 0) {

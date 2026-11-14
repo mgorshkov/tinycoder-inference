@@ -133,7 +133,7 @@ namespace tinycoder::exl3gpu {
     //
     // so the Hadamard transforms are applied to the ACTIVATION (O(k) and
     // O(n)) instead of to the O(k*n) weight.  Per token this reads only the
-    // packed trellis (~5.4 GB at 1.6 bpw) — the same traffic exllamav3's
+    // packed trellis (~5.4 GB at 1.6 bpw) — the same traffic the EXL3 reference
     // native EXL3 kernels stream.
     // =======================================================================
     struct Exl3FusedLinear {
@@ -146,6 +146,12 @@ namespace tinycoder::exl3gpu {
         int32_t codebook = 0;         // 0 = 3INST, 1 = MCG, 2 = mul1
         bool frac = false;            // half-integer bitrate (mul1 only)
         uint32_t tileU16 = 0;         // uint16 words per 16x16 tile
+        // Ownership: true when `uploadFusedLinear` allocated trellis/suh/svh
+        // and `releaseFusedLinear` must cudaFree them; false when the linear
+        // aliases memory owned by the caller (`uploadFusedLinearDevice`), in
+        // which case release only unregisters.  Freeing an aliased buffer here
+        // would be a double free.
+        bool ownsBuffers = true;
     };
 
     /// @brief Upload one linear's packed trellis + float sign vectors and
@@ -154,6 +160,26 @@ namespace tinycoder::exl3gpu {
     bool uploadFusedLinear(const Exl3HostLinear &lin, Exl3FusedLinear &out,
                            std::string &err);
 
+    /// @brief Register a linear whose trellis (and optional sign vectors) are
+    /// ALREADY resident on the device, without allocating or copying anything.
+    /// `out.ownsBuffers` is false, so releaseFusedLinear() will only
+    /// unregister: the caller keeps ownership of dTrellis/dSuh/dSvh.
+    /// `bitrate10` is K*10 (the fused kernels need the integer K).
+    bool uploadFusedLinearDevice(const void *dTrellis, const float *dSuh,
+                                 const float *dSvh, uint32_t k, uint32_t n,
+                                 uint32_t bitrate10, int32_t codebook,
+                                 Exl3FusedLinear &out, std::string &err);
+
+    /// @brief Upload/register a linear, preferring to ALIAS an
+    /// already-device-resident trellis over copying it.  When the host
+    /// description's `packed` (and its sign vectors) are device pointers this
+    /// is uploadFusedLinearDevice(); otherwise it falls back to the existing
+    /// host-copy uploadFusedLinear().  `aliased` reports which path ran.
+    /// Either way exactly one copy of the weight bytes ends up in VRAM.
+    bool uploadFusedLinearPreferDevice(const Exl3HostLinear &lin,
+                                       Exl3FusedLinear &out, bool &aliased,
+                                       std::string &err);
+
     /// @brief Unregister + free the device buffers owned by `lin`.
     void releaseFusedLinear(Exl3FusedLinear &lin);
 
@@ -161,6 +187,33 @@ namespace tinycoder::exl3gpu {
     void registerFusedLinear(const Exl3FusedLinear &lin);
     void unregisterFusedLinear(const void *trellisDev);
     void clearFusedLinears();
+
+    /// @brief Decode a registered linear ONCE into F16 (row-major [n][k], the
+    /// operand layout the cuBLAS fp16 GEMM expects for CUBLAS_OP_T).  Used by
+    /// the batched prefill path; `dstF16` must hold 2*k*n bytes.
+    bool materializeF16(const void *trellisDev, void *dstF16, cudaStream_t stream,
+                        std::string &err);
+
+    /// @brief Decode into F16 WITHOUT the two Hadamard passes (the caller
+    /// applies them to the activations instead).
+    // True when the raw decode writes lane->fp16 directly (no shared F32
+    // scratch), which is what makes it safe to run concurrently with g_stream.
+    bool rawFastPath(const void *trellisDev);
+
+    bool materializeRawF16(const void *trellisDev, void *dstF16,
+                           cudaStream_t stream, std::string &err);
+
+    /// @brief Fused decode+WMMA GEMM: writes C[m][n] in the RAW basis
+    /// (the caller applies Dsv * Hn to the output).
+    bool gemmFusedRawLaunch(const void *trellisDev, const void *aF16Dev, float *yDev,
+                            uint32_t seqLen, cudaStream_t stream, std::string &err);
+
+    /// @brief Device sign vectors of a registered linear (may be null).
+    bool linearSides(const void *trellisDev, const float *&suh,
+                     const float *&svh);
+
+    /// @brief (k, n) of a registered fused linear.
+    bool linearGeometry(const void *trellisDev, uint32_t &k, uint32_t &n);
 
     /// @brief y = W @ x for a registered fused linear; x/y are DEVICE pointers.
     /// Launches on `stream` (no host synchronisation, so it is CUDA-graph safe).
