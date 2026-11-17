@@ -1,4 +1,5 @@
 #!/bin/sh
+# profile_ncu.sh — nsight-compute profile of the decode GEMV and attention kernels; needs root for GPU counters.
 # Nsight Compute profile of the TinyCoder decode GEMV + attention kernels.
 #
 # GPU performance counters are restricted to root by default (driver >= 441),

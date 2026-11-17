@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# exl3_lt_ab.sh — A/B the cublasLt EXL3 prefill GEMM against the exact-order cublasGemmEx path (TINYCODER_EXL3_LT).
 # A/B the cublasLt EXL3 prefill GEMM against the exact-order cublasGemmEx path.
 #
 # The knob is TINYCODER_EXL3_LT: ON is the shipped default (2026-11-14), 0 is the

@@ -1,4 +1,9 @@
 #!/usr/bin/env bash
+# ncu_deep.sh — Deep nsight-compute (stall / occupancy / instruction sections) of the dp4a mmvq-family decode GEMVs only.
+# Paths are relative to this checkout; override with TINYCODER_ROOT / LLAMA_DIR.
+ROOT="${TINYCODER_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+LLAMA_DIR="${LLAMA_DIR:-$ROOT/../llama.cpp}"
+PRISM_DIR="${PRISM_DIR:-$ROOT/../llama-prism}"
 # Deep ncu profile (stall/occupancy/instruction sections) of ONLY the two
 # dp4a mmvq-family decode GEMVs, on either side of the head-to-head.
 # Usage:
@@ -32,7 +37,7 @@ if [ "$MODE" = "tiny" ]; then
             --generate --max-tokens 8 > "$OUT" 2>&1
 else
     OUT=/tmp/ncu_deep_ref.txt
-    BENCH=/home/mike/git/llama.cpp/build-cuda/bin/llama-bench
+    BENCH=${LLAMA_DIR}/build-cuda/bin/llama-bench
     "$NCU" "${SECTIONS[@]}" \
         --kernel-name 'regex:mul_mat_vec_q' \
         --launch-skip 6 \

@@ -92,6 +92,9 @@ static_assert(sizeof(block_fp4_int8) == sizeof(block_q8_1_int8), "Unexpected blo
             return Q8_1_LAYOUT_DS4;
         case TC_TYPE_Q8_0:
             return Q8_1_LAYOUT_D4;
+        case TC_TYPE_PQ2_0:
+        case TC_TYPE_PTQ1_0:
+            return Q8_1_LAYOUT_D4;
         case TC_TYPE_MXFP4:
             return Q8_1_LAYOUT_D4;
         case TC_TYPE_NVFP4:
@@ -201,6 +204,9 @@ static constexpr __device__ int get_tile_y_device() {
 #define INT8_DP4A_TXS_Q4_0 tile_x_sizes{tile_y * INT8_TILE_NE_K + tile_y, tile_y * INT8_TILE_NE_K / QI4_0 + tile_y / QI4_0, 0}
 #define INT8_DP4A_TXS_Q4_1 tile_x_sizes{tile_y * INT8_TILE_NE_K + tile_y, tile_y * INT8_TILE_NE_K / QI4_1 + tile_y / QI4_1, 0}
 #define INT8_DP4A_TXS_Q8_0 tile_x_sizes{tile_y * INT8_TILE_NE_K * 2 + tile_y, tile_y * INT8_TILE_NE_K * 2 / QI8_0 + tile_y / (QI8_0 / 2), 0}
+// PQ2_0 decodes to exactly the Q8_0 tile layout (same int8 payload, one scale
+// per 32-weight slot), so it shares the tile_x sizes.
+#define INT8_DP4A_TXS_PQ2_0 INT8_DP4A_TXS_Q8_0
 #define INT8_DP4A_TXS_Q8_0_16 tile_x_sizes{tile_y * INT8_TILE_NE_K * 2 + tile_y, tile_y * INT8_TILE_NE_K * 4 / QI8_0 + tile_y / (QI8_0 / 4), 0}
 #define INT8_DP4A_TXS_Q8_1 tile_x_sizes{tile_y * INT8_TILE_NE_K * 2 + tile_y, tile_y * INT8_TILE_NE_K * 2 / QI8_1 + tile_y / (QI8_1 / 2), 0}
 #define INT8_DP4A_TXS_Q2_K tile_x_sizes{tile_y * INT8_TILE_NE_K * 2 + tile_y, tile_y * INT8_TILE_NE_K + tile_y, 0}
@@ -220,6 +226,9 @@ static constexpr __host__ __device__ tile_x_sizes int8_get_dp4a_tile_x_sizes(tc_
         case TC_TYPE_Q5_1:
             return INT8_DP4A_TXS_Q8_1;
         case TC_TYPE_Q8_0:
+            return INT8_DP4A_TXS_Q8_0;
+        case TC_TYPE_PQ2_0:
+        case TC_TYPE_PTQ1_0:
             return INT8_DP4A_TXS_Q8_0;
         case TC_TYPE_MXFP4:
             return INT8_DP4A_TXS_Q8_1;
@@ -285,6 +294,9 @@ static constexpr __host__ __device__ int int8_get_mma_tile_x_k(tc_type type) {
         case TC_TYPE_Q5_1:
             return INT8_MMA_TILE_X_K_Q8_1;
         case TC_TYPE_Q8_0:
+            return INT8_MMA_TILE_X_K_Q8_0;
+        case TC_TYPE_PQ2_0:
+        case TC_TYPE_PTQ1_0:
             return INT8_MMA_TILE_X_K_Q8_0;
         // tile sizes are the same for Q8_1 and FP4 for blackwell
         case TC_TYPE_MXFP4:
@@ -792,6 +804,155 @@ static __device__ __forceinline__ void load_tiles_q8_0(
 #else
         x_df[i * (2 * INT8_TILE_NE_K / QI8_0) + i / (QI8_0 / 2) + kbxd] = bxi->d;
 #endif// defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+    }
+}
+
+// PQ2_0: 34-byte block per 128 weights (fp16 d, then 32 code bytes, 4 codes per
+// byte, value = d*(code-1)).  A PQ2_0 block is exactly one k-half of the int8
+// activation tile (128 weights), so the k-unit convention stays Q8_0's -- 32
+// weights per unit, 8 units per tile row -- and the loader is the /4 and %4 map
+// from unit to block and byte.  That keeps the tuned k-loop untouched.
+// 4 packed 2-bit codes -> one int of four int8 values (code-1), using the
+// reference implementation's table trick: the selector's *nibbles* index a
+// 4-byte table 0x020100FF = {-1, 0, 1, 2}, and because that table is 4-periodic
+// (bytes 4..7 mirror 0..3) the "& 7" inside __byte_perm makes a nibble holding
+// TWO codes still resolve the low one.  So one perm yields the even codes and
+// the same perm on b>>2 the odd ones, and a third interleaves them back into
+// order: 3 instructions per 4 weights instead of a 12-op shift/mask chain.
+// The shift/mask version measured ~33 TFLOPS of prefill GEMM; this is the same
+// decode the reference's tile loader uses.
+__device__ __forceinline__ uint32_t pq2Decode4(const uint32_t b) {
+    constexpr uint32_t LUT = 0x020100FFu;
+    const uint32_t ev = __byte_perm(LUT, LUT, b);       // dec(c0), dec(c2)
+    const uint32_t od = __byte_perm(LUT, LUT, b >> 2);  // dec(c1), dec(c3)
+    return __byte_perm(ev, od, 0x5140);                 // c0, c1, c2, c3
+}
+
+// PTQ1_0: decode one int (four columns 4p..4p+3) of a native 28-byte block.
+// digit = ((uint8_t)(byte * 3^plane) * 3) >> 8, exactly the reference's fixed-
+// point base-3 unpack; the -1 code bias is the one __vsub4.
+__device__ __forceinline__ uint32_t ptq1Decode4(const uint8_t *blk, int p) {
+    if (p < 30) {
+        const int plane = (p < 20) ? (p >> 2) : ((p - 20) >> 1);
+        const uint32_t off = (p < 20) ? (static_cast<uint32_t>(p & 3) * 4u)
+                                      : (16u + static_cast<uint32_t>((p - 20) & 1) * 4u);
+        // 3^plane as a select chain: the static array compiles to a
+        // constant-memory load with a thread-dependent index, which serialises
+        // on the 5 distinct addresses a warp holds.
+        const uint32_t p3 = plane == 0 ? 1u
+                            : plane == 1 ? 3u
+                            : plane == 2 ? 9u
+                            : plane == 3 ? 27u
+                                         : 81u;
+        const uint32_t packed = *reinterpret_cast<const uint32_t *>(blk + off);
+        uint32_t a = __byte_perm(packed, 0u, 0x4140) * p3;
+        uint32_t b = __byte_perm(packed, 0u, 0x4342) * p3;
+        a = (a & 0x00FF00FFu) * 3u;
+        b = (b & 0x00FF00FFu) * 3u;
+        return __vsub4(__byte_perm(a, b, 0x7531), 0x01010101u);
+    }
+    uint32_t v = static_cast<uint32_t>(blk[24]) |
+                 (static_cast<uint32_t>(blk[25]) << 16);
+    const uint32_t a = v * 3u;
+    v = a & 0x00FF00FFu;
+    const uint32_t b = v * 3u;
+    v = b & 0x00FF00FFu;
+    if (p == 30)
+        return __vsub4(__byte_perm(a, b, 0x7531), 0x01010101u);
+    const uint32_t c = v * 3u;
+    v = c & 0x00FF00FFu;
+    const uint32_t d = v * 3u;
+    return __vsub4(__byte_perm(c, d, 0x7531), 0x01010101u);
+}
+
+template<int tile_y, bool need_check>
+static __device__ __forceinline__ void load_tiles_ptq1_0(
+        const char *__restrict__ x, int *__restrict__ x_tile, const int kbx0,
+        const int i_max, const int stride) {
+    constexpr int nwarps = int8_get_nwarps_device();
+    constexpr int warp_size = tc_warp_size();
+    int *x_qs = (int *) x_tile;
+    float *x_df = (float *) (x_tile + 2 * INT8_TILE_NE_K);
+    constexpr int threads_per_row = 32;
+    constexpr int nrows = warp_size / threads_per_row;
+    const int txi = warp_size > threads_per_row ? threadIdx.x % threads_per_row : threadIdx.x;
+#pragma unroll
+    for (int i0 = 0; i0 < tile_y; i0 += nrows * nwarps) {
+        int i = i0 + (nrows == 1 ? threadIdx.y : threadIdx.y * nrows + threadIdx.x / threads_per_row);
+        if (need_check) i = min(i, i_max);
+        const uint8_t *blk = (const uint8_t *) x + (size_t) (kbx0 + i * stride) * 28u;
+#pragma unroll
+        for (int half = 0; half < 2; ++half) {
+            x_qs[i * INT8_MMA_TILE_X_K_Q8_0 + half * INT8_TILE_NE_K + txi] =
+                    (int) ptq1Decode4(blk + half * 28u, txi);
+        }
+    }
+    constexpr int blocks_per_tile_x_row = 2 * INT8_TILE_NE_K / QI8_0;
+    constexpr int rows_per_warp = warp_size / blocks_per_tile_x_row;
+    const int kbxd = threadIdx.x % blocks_per_tile_x_row;
+#pragma unroll
+    for (int i0 = 0; i0 < tile_y; i0 += nwarps * rows_per_warp) {
+        int i = i0 + threadIdx.y * rows_per_warp + threadIdx.x / blocks_per_tile_x_row;
+        if (need_check) i = min(i, i_max);
+        const uint8_t *blk = (const uint8_t *) x +
+                             (size_t) (kbx0 + i * stride + kbxd / 4) * 28u;
+        x_df[i * INT8_MMA_TILE_X_K_Q8_0 + kbxd] =
+                __half2float(*reinterpret_cast<const __half *>(blk + 26u));
+    }
+}
+
+template<int tile_y, bool need_check>
+static __device__ __forceinline__ void load_tiles_pq2_0(
+        const char *__restrict__ x, int *__restrict__ x_tile, const int kbx0,
+        const int i_max, const int stride) {
+    constexpr int nwarps = int8_get_nwarps_device();
+    constexpr int warp_size = tc_warp_size();
+#if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+    int *x_qs = (int *) x_tile;
+    float *x_df = (float *) (x_tile + 2 * INT8_TILE_NE_K);
+#else
+    constexpr tile_x_sizes txs = int8_get_dp4a_tile_x_sizes(TC_TYPE_PQ2_0, tile_y);
+    int *x_qs = (int *) x_tile;
+    float *x_df = (float *) (x_qs + txs.qs);
+#endif// MMA available
+
+    constexpr int threads_per_row = 32;
+    constexpr int nrows = warp_size / threads_per_row;
+    const int txi = warp_size > threads_per_row ? threadIdx.x % threads_per_row : threadIdx.x;
+    const int kqsx = txi % QI8_0;         // 4-weight group within a 32-weight unit
+
+#pragma unroll
+    for (int i0 = 0; i0 < tile_y; i0 += nrows * nwarps) {
+        int i = i0 + (nrows == 1 ? threadIdx.y : threadIdx.y * nrows + threadIdx.x / threads_per_row);
+        if (need_check) {
+            i = min(i, i_max);
+        }
+        // qk is 128 for PQ2_0, so the kernel's k unit IS one 34-byte block and a
+        // tile row of 2*INT8_TILE_NE_K = 64 ints = 256 weights is two blocks.
+        // Thread txi owns int txi of a half = weights 4*txi..4*txi+3 = byte txi.
+        const uint8_t *blk = (const uint8_t *) x + (size_t) (kbx0 + i * stride) * 34u;
+#pragma unroll
+        for (int half = 0; half < 2; ++half) {
+            x_qs[i * INT8_MMA_TILE_X_K_Q8_0 + half * INT8_TILE_NE_K + txi] =
+                    (int) pq2Decode4(blk[half * 34u + 2u + txi]);
+        }
+    }
+
+    // scales: 8 slots per tile row (one per 32 weights), PQ2_0 has one per 128
+    constexpr int blocks_per_tile_x_row = 2 * INT8_TILE_NE_K / QI8_0;
+    constexpr int rows_per_warp = warp_size / blocks_per_tile_x_row;
+    const int kbxd = threadIdx.x % blocks_per_tile_x_row;
+#pragma unroll
+    for (int i0 = 0; i0 < tile_y; i0 += nwarps * rows_per_warp) {
+        int i = i0 + threadIdx.y * rows_per_warp + threadIdx.x / blocks_per_tile_x_row;
+        if (need_check) {
+            i = min(i, i_max);
+        }
+        // 8 slots per tile row = 2 blocks x 4 sub-blocks; one d per PQ2_0 block
+        const uint8_t *blk = (const uint8_t *) x +
+                             (size_t) (kbx0 + i * stride + kbxd / 4) * 34u;
+        x_df[i * INT8_MMA_TILE_X_K_Q8_0 + kbxd] =
+                __half2float(*reinterpret_cast<const __half *>(blk));
     }
 }
 
@@ -3392,6 +3553,22 @@ template<int tile_x, int tile_y, bool need_check>
 struct int8_type_traits<tile_x, tile_y, need_check, TC_TYPE_Q8_0> {
     static constexpr int vdr = VDR_Q8_0_Q8_1_GEMM;
     static constexpr load_tiles_int8_t load_tiles = load_tiles_q8_0<tile_y, need_check>;
+    static constexpr vec_dot_int8_t vec_dot_mma = vec_dot_q8_0_q8_1_mma<tile_x, tile_y, Q8_1_LAYOUT_D4>;
+    static constexpr vec_dot_int8_t vec_dot_dp4a = vec_dot_q8_0_q8_1_dp4a<tile_x, tile_y>;
+};
+
+template<int tile_x, int tile_y, bool need_check>
+struct int8_type_traits<tile_x, tile_y, need_check, TC_TYPE_PTQ1_0> {
+    static constexpr int vdr = VDR_Q8_0_Q8_1_GEMM;
+    static constexpr load_tiles_int8_t load_tiles = load_tiles_ptq1_0<tile_y, need_check>;
+    static constexpr vec_dot_int8_t vec_dot_mma = vec_dot_q8_0_q8_1_mma<tile_x, tile_y, Q8_1_LAYOUT_D4>;
+    static constexpr vec_dot_int8_t vec_dot_dp4a = vec_dot_q8_0_q8_1_dp4a<tile_x, tile_y>;
+};
+
+template<int tile_x, int tile_y, bool need_check>
+struct int8_type_traits<tile_x, tile_y, need_check, TC_TYPE_PQ2_0> {
+    static constexpr int vdr = VDR_Q8_0_Q8_1_GEMM;
+    static constexpr load_tiles_int8_t load_tiles = load_tiles_pq2_0<tile_y, need_check>;
     static constexpr vec_dot_int8_t vec_dot_mma = vec_dot_q8_0_q8_1_mma<tile_x, tile_y, Q8_1_LAYOUT_D4>;
     static constexpr vec_dot_int8_t vec_dot_dp4a = vec_dot_q8_0_q8_1_dp4a<tile_x, tile_y>;
 };

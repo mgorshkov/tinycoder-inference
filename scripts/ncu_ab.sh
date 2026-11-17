@@ -1,4 +1,9 @@
 #!/usr/bin/env bash
+# ncu_ab.sh — nsight-compute head-to-head: TinyCoder vs the reference engine on the same GPU and model, decode, eager.
+# Paths are relative to this checkout; override with TINYCODER_ROOT / LLAMA_DIR.
+ROOT="${TINYCODER_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+LLAMA_DIR="${LLAMA_DIR:-$ROOT/../llama.cpp}"
+PRISM_DIR="${PRISM_DIR:-$ROOT/../llama-prism}"
 # Apples-to-apples ncu head-to-head: TinyCoder vs the reference engine, EAGER
 # decode, same GPU, same model, SpeedOfLight + per-kernel summary on both sides.
 #
@@ -21,8 +26,8 @@ NCU="$(ls /opt/nvidia/nsight-compute/*/ncu 2>/dev/null | head -1)"
 [ -x "$NCU" ] || { echo "ERROR: ncu not found under /opt/nvidia/nsight-compute" >&2; exit 1; }
 
 MODEL=/data/models/qwen/qwen2.5-coder-1.5b-instruct-q2_k.gguf
-BENCH=/home/mike/git/llama.cpp/build-cuda/bin/llama-bench
-[ -x "$BENCH" ] || BENCH=/home/mike/git/llama.cpp/build/bin/llama-bench
+BENCH=${LLAMA_DIR}/build-cuda/bin/llama-bench
+[ -x "$BENCH" ] || BENCH=${LLAMA_DIR}/build/bin/llama-bench
 [ -x "$BENCH" ] || { echo "ERROR: reference benchmark not found" >&2; exit 1; }
 PROBE="$HERE/build-p1/unit_tests/tiny_logits_probe"
 [ -x "$PROBE" ] || { echo "ERROR: $PROBE not found (build build-p1)" >&2; exit 1; }

@@ -2,18 +2,23 @@
 
 ## GPU Comparison (TinyCoder vs llama.cpp / exllamav3)
 
-Columns follow the benchmark defaults: `tinycoder_bench --n-prompts 512 --n-gen 128 --threads 36` (**pp512 / tg128**). GGUF baselines are `llama-bench -p 512 -n 128 -t 36 -r 1`, run **interleaved** with the TinyCoder run (three alternating pairs, so clock drift affects both columns equally, means reported; the Ornith-35B row adds `-ncmoe 99`, the same expert-offload mode the TinyCoder column uses); the EXL3 baseline is a local exllamav3 1.6.6 run measured with the same pp512/tg128 protocol — see [How the exllamav3 EXL3 baseline was measured](#how-the-exllamav3-exl3-baseline-was-measured). Warm mean-of-reps, RTX 2080 Ti. Bold marks the faster engine in a column. **A TinyCoder figure is only printed if that checkpoint passes the text gate** (`./scripts/text_gate.sh`, which answers a factual question through the real forward and treats a skipped test as a failure): a throughput number from a path that cannot answer a question measures wasted work, not performance. Rows without a TinyCoder figure are withheld on exactly that basis and say so below the table.
+Columns follow the benchmark defaults: `tinycoder_bench --n-prompts 512 --n-gen 128 --threads 36` (**pp512 / tg128**). GGUF baselines are `llama-bench -p 512 -n 128 -t 36 -r 1`, run **interleaved** with the TinyCoder run (three alternating pairs, so clock drift affects both columns equally, means reported; the Ornith-35B row adds `-ncmoe 99`, the same expert-offload mode the TinyCoder column uses); the EXL3 baseline is a local exllamav3 1.6.6 run measured with the same pp512/tg128 protocol — see [How the exllamav3 EXL3 baseline was measured](#how-the-exllamav3-exl3-baseline-was-measured); the two Ternary-Bonsai rows instead use PrismML's llama.cpp fork, because stock llama.cpp cannot load either Bonsai packing — see [How the Prism Bonsai baseline was measured](#how-the-prism-bonsai-baseline-was-measured). Warm mean-of-reps, RTX 2080 Ti. Bold marks the faster engine in a column. Figures are the mean of three alternating interleaved pairs (spread = (max - min)/2); the
+dense-prefill attention path computes QK^T, causal softmax and PV in fp16 via cuBLAS, which moves the
+attention output by maxAbsDiff 0.0146 against the previous fp32 warp kernel -- a numerics change
+licensed by the gates, not a refactor, and measured as byte-identical greedy text on a 512-token prompt
+with the old and new path in the same binary.
 
 | Model | File size | GPU mode TinyCoder | **TinyCoder pp512** | **TinyCoder tg128** | Baseline engine | **Baseline pp512** | **Baseline tg128** |
 |---|---|---|---|---|---|---|---|
-| Qwen2.5-Coder-1.5B `q2_k` | 0.7 GB | full offload | **10,149.8 tok/s** | **327.91 tok/s** | llama.cpp | 7,769.8 tok/s | 323.19 tok/s |
-| Qwen2.5-Coder-1.5B `iq3_xxs` | 0.9 GB | full offload | **10,192.3 tok/s** | **276.77 tok/s** | llama.cpp | 10,143.5 tok/s | 261.47 tok/s |
-| Qwen2.5-Coder-7B `iq2_s` | 2.4 GB | full offload | **2,518.2 tok/s** | 87.40 tok/s | llama.cpp | 2,500.9 tok/s | **96.59 tok/s** |
-| Qwen2.5-Coder-7B `iq3_xxs` | 2.9 GB | full offload | 2,777.3 tok/s | 93.14 tok/s | llama.cpp | **2,929.1 tok/s** | **97.38 tok/s** |
-| Ternary-Bonsai-2-27B `pq2_0` (Prism) | 6.7 GB | full offload | 16.7 tok/s | 15.24 tok/s | llama.cpp | — | — |
-| Ornith-1.5-9B `q4_k_m` | 5.9 GB | full offload | 2,560.6 tok/s | 82.25 tok/s | llama.cpp | **2,671.7 tok/s** | **84.29 tok/s** |
-| Ornith-1.5-35B-A3B `q8_0` → `q4_k` experts | 34.4 GB | hybrid (layer arena, grouped int8) | **176.3 tok/s** | **53.67 tok/s** | llama.cpp `-ncmoe 99` | 130.7 tok/s | 16.42 tok/s |
-| Qwen3.8-27B EXL3 `1.60bpw` | 8.6 GB | full offload | **723.0 tok/s** | **23.26 tok/s** | exllamav3 1.6.6 | 707.5 tok/s | 22.9 tok/s |
+| Qwen2.5-Coder-1.5B `q2_k` | 0.7 GB | full offload | **12,239.8 tok/s** | **325.9 tok/s** | llama.cpp | 7,679.2 tok/s | 321.6 tok/s |
+| Qwen2.5-Coder-1.5B `iq3_xxs` | 0.9 GB | full offload | **12,243.4 tok/s** | **273.8 tok/s** | llama.cpp | 10,007.0 tok/s | 262.2 tok/s |
+| Qwen2.5-Coder-7B `iq2_s` | 2.4 GB | full offload | **2,765.7 tok/s** | 87.7 tok/s | llama.cpp | 2,482.0 tok/s | **96.5 tok/s** |
+| Qwen2.5-Coder-7B `iq3_xxs` | 2.9 GB | full offload | **3,060.5 tok/s** | 93.5 tok/s | llama.cpp | 2,938.0 tok/s | **97.4 tok/s** |
+| Ternary-Bonsai-2-27B `pq2_0` (Prism) | 6.7 GB | full offload | **880.6 tok/s** | **51.73 tok/s** | PrismML llama.cpp (fork) | 878.5 tok/s | 50.36 tok/s |
+| Ternary-Bonsai-2-27B `ptq1_0` (Prism) | 5.5 GB | full offload | **880.7 tok/s** | 51.73 tok/s | PrismML llama.cpp (fork) | 848.1 tok/s | **65.29 tok/s** |
+| Ornith-1.5-9B `q4_k_m` | 5.9 GB | full offload | 2,560.4 tok/s | 82.3 tok/s | llama.cpp | **2,666.4 tok/s** | **84.1 tok/s** |
+| Ornith-1.5-35B-A3B `q8_0` → `q4_k` experts | 34.4 GB | hybrid (layer arena, grouped int8) | **176.3 tok/s** | **53.6 tok/s** | llama.cpp `-ncmoe 99` | 132.2 tok/s | 17.1 tok/s |
+| Qwen3.8-27B EXL3 `1.60bpw` | 8.6 GB | full offload | **727.5 tok/s** | 23.60 tok/s | exllamav3 1.6.6 | 719.5 tok/s | **23.76 tok/s** |
 
 ## How the exllamav3 EXL3 baseline was measured
 
@@ -50,14 +55,64 @@ Measured over three runs:
 
 | run | pp512 | tg128 |
 |---|---:|---:|
-| 1 | 703.8 tok/s | 14.11 tok/s |
-| 2 | 711.5 tok/s | 22.90 tok/s |
-| 3 | 707.3 tok/s | 22.61 tok/s |
-| **mean** | **707.5 tok/s** | **22.9 tok/s** |
+| 1 | 720.3 tok/s | 23.79 tok/s |
+| 2 | 718.2 tok/s | 23.74 tok/s |
+| 3 | 720.1 tok/s | 23.75 tok/s |
+| **mean** | **719.5 tok/s** | **23.76 tok/s** |
 
-Run 1's tg128 is a cold-cache outlier; runs 2-3 are the steady state. The tg128 figure also includes
-Python per-token overhead (sampler call plus tensor concatenation), so it is a floor rather than a
-best case.
+The tg128 figure includes Python per-token overhead (sampler call plus tensor concatenation), so it
+is a floor rather than a best case. These runs are interleaved with the TinyCoder runs
+(`scripts/exl3_ab_bench.sh`, three alternating pairs), not measured engine-by-engine: separate passes
+let clock drift bias the comparison -- measuring each engine in its own pass moved the baseline by
+0.6% prefill and 0.3% decode here, which is larger than the difference being claimed.
+On the interleaved protocol TinyCoder leads prefill, 727.5 against 719.5 (+1.1%, both spreads 1.0),
+and **exllamav3 leads decode**, 23.76 against 23.60 (+0.7%, spreads 0.03-0.05). The decode lead is
+small but outside the noise, so it is not reported as a tie.
+
+
+## How the Prism Bonsai baseline was measured
+
+Stock llama.cpp cannot load either Bonsai packing: `PQ2_0` is PrismML's own ggml type 142 and
+`PTQ1_0` its type 143, and both need the model's Hadamard-activation runtime. The canonical runtime
+is PrismML's fork of llama.cpp, which carries both types and builds unmodified for sm_75. It was
+measured **here, on this card, on the same checkpoint**, interleaved with the TinyCoder run (three
+alternating pairs, means, spread = (max - min)/2, GPU verified empty before every run):
+
+```bash
+git clone --depth 1 https://github.com/PrismML-Eng/llama.cpp ~/llama-prism
+cmake -B ~/llama-prism/build -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=75 \
+      -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_CURL=OFF
+cmake --build ~/llama-prism/build --target llama-bench -j 36
+~/llama-prism/build/bin/llama-bench -m <file> -p 512 -n 128 -t 36 -r 1
+
+./scripts/bonsai_baseline_bench.sh          # both files, three interleaved pairs, raw logs per run
+```
+
+`-p 512 -n 128 -t 36 -r 1` mirrors every other row's `llama-bench` column, with the defaults
+(f16 KV cache, no speculative drafter). **The 96-100 tok/s figures published for this family are
+MTP-drafting numbers**; the fork's own plain-decode receipt is 68.3 tok/s on an RTX 4070 at ~90% of
+that card's bandwidth (`bonsai-ada-surgery`, `docs/speed/decode-efficiency.md`), and this card
+measures 50.36 on `pq2_0` = 345 GB/s of packed weight, 56% of the 616 GB/s roof. The gap to Ada is
+sm_75's missing async copy, not a kernel defect: the reference's own mat-vec is at 90% of peak there.
+TinyCoder's `pq2_0` decode is 2.7% ahead of that (51.73 against 50.36) on a q8_1 activation and
+`dp4a` over the same packed weight -- 6.42 GB of folded weight in 13.2 ms of GEMV, i.e. ~460 GB/s in
+the kernel -- and its remaining per-token cost is not the mat-vec: 4.4 ms of it is the GDN scan, the
+per-layer norms, the folds and the LM head. Prefill runs int8 tensor cores straight off the packed
+trits, as the fork does: the 2-bit codes are decoded inside the GEMM's tile loader, so no fp16 twin
+is materialised, and one fold serves each shared activation (gate/up, Q/K/V), so both prefill rows
+lead or match the fork: 880.7 against 848.1 on `ptq1_0`, and `pq2_0` leads by 2.1 tok/s (880.6
+against 878.5, a margin that is inside the spread rather than a win).
+
+`PTQ1_0` is 1.75 bpw against `PQ2_0`'s 2.125, so the reference decodes it faster (65.3 vs 51.7) on
+14% fewer bytes. TinyCoder's `ptq1_0` row reads the same ternary weights after a **lossless
+load-time transcode to the PQ2_0 block layout** (both packs hold identical trits and group scale --
+the transcoded file reproduces the native `pq2_0` file's top-5 logits to six decimals), so its
+per-token traffic equals the `pq2_0` row's and the two TinyCoder rows agree -- including prefill, which
+runs the same native int8 path on the transcoded blocks. The `ptq1_0` decode gap is therefore the
+transcode's own 1.19 GB/step: 5.66 GB native against 6.85 transcoded, which is 0.83, and the measured
+ratio is 0.79. A native 28 B/128 decode would land near 62 tok/s at the current per-byte rate; the
+first attempt at one measured 4.6x slower (a per-code map lookup in the inner loop) and was not
+shipped, so the transcode stays and is also why the `ptq1_0` column exists at all.
 
 ---
 

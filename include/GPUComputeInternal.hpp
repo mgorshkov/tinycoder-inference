@@ -139,6 +139,8 @@ namespace tinycoder::gpu {
         constexpr uint32_t kTypeEXL3 = 200;
         constexpr uint32_t kTypePQ2_0 = 142;
         constexpr uint32_t kPQ2_0_BYTES = 34;// d(fp16,2) + qs[32]
+        constexpr uint32_t kTypePTQ1_0 = 143;// Prism native ternary, 28 B/128
+        constexpr uint32_t kPTQ1_0_BYTES = 28;// qs[24] + qh[2] + d(fp16,2)
         // Prism Hadamard-fold block size (prism.hadamard.block_size).
         constexpr uint32_t kPrismBlock = 1024;
 
@@ -2762,24 +2764,108 @@ namespace tinycoder::gpu {
         // GGMLDequantize::dequantizePQ2_0Block / dotProductPQ2_0.
         // ==================================================================
 
-        // Row GEMV: one warp per output row; each of the 32 lanes reads ONE qs
-        // byte (4 two-bit codes) and owns the 4 columns [lane*4, lane*4+4) of
-        // the 128-wide block.  Mirrors kQGemvSmall32's warp-reduce epilogue.
-        __global__ void __launch_bounds__(32) kQGemvPQ2_0(
+        // ------------------------------------------------------------------
+        // Prism PQ2_0 (type 142) ternary GEMV.
+        //
+        // 2026-11-17, measured in situ (this is the whole Bonsai decode path):
+        // the original one-warp-per-row, one-block-at-a-time version ran the
+        // model at 15.28 tg128 = 105 GB/s of PACKED weight (6.85 GB/token), and
+        // every projection sat at 82-120 GB/s no matter its shape.  The weights
+        // were already 2 bits; the kernel was latency-bound, because a warp had
+        // exactly one 34-byte weight fetch in flight and the loop is serial.
+        //
+        // Fix, in two parts:
+        //   * PQ2_GEMV_UNROLL blocks are fetched into registers before any FMA
+        //     (8 independent 34 B fetches per warp in flight instead of 1) and a
+        //     block's four activation floats load as one float4 instead of four
+        //     scalar loads: 15.28 -> 27.3 tg128 in situ (1.78x).
+        //   * PQ2_ROWS rows per warp: all R rows share the one activation load.
+        //     The activation is fp32 (4 B) against 0.266 B of weight per column,
+        //     so a warp re-reads 15x the weight bytes it consumes; sharing x
+        //     across R rows divides that by R.  TINYCODER_PQ2_R selects the
+        //     (rows-per-warp, unroll) geometry for A/B: 1=1x8, 2=2x4, 4=4x2,
+        //     8=2x8 (default), 16=1x16, 32=4x4, 64=2x16.  Measured on this card
+        //     at n-gen 32: 1x8 33.7, 2x4 35.3, 4x2 32.7, 2x8 39.0, 1x16 25.6,
+        //     4x4 39.4, 2x16 31.0 tok/s -- in-flight bytes dominate up to ~550 B
+        //     per warp, past which register pressure (2x16) loses more than the
+        //     extra prefetch wins.
+        // Accumulation order per output is unchanged (b ascending, 4 FMAs in
+        // column order within a block), so the result is bit-identical to the
+        // pre-change kernel and to the CPU dotProductPQ2_0.
+        // ------------------------------------------------------------------
+        template <uint32_t R, uint32_t U>
+        __global__ void __launch_bounds__(128) kQGemvPQ2_0T(
                 const uint8_t *__restrict__ w, const float *__restrict__ x,
                 float *__restrict__ out, uint32_t rows, uint32_t cols,
                 uint32_t rowBytes, uint32_t blocksPerRow) {
-            const uint32_t row = blockIdx.x;
-            if (row >= rows) return;
-            const uint32_t lane = threadIdx.x;
-            const uint8_t *rp = w + static_cast<uint64_t>(row) * rowBytes;
-            float acc = 0.0f;
-            for (uint32_t b = 0; b < blocksPerRow; ++b) {
-                const uint8_t *blk =
-                        rp + static_cast<uint64_t>(b) * kPQ2_0_BYTES;
-                const float d =
-                        __half2float(*reinterpret_cast<const __half *>(blk));
-                const uint8_t qb = blk[2u + lane];
+            const uint32_t warp = blockIdx.x * 4u + (threadIdx.x >> 5);
+            const uint32_t lane = threadIdx.x & 31u;
+            const uint32_t row0 = warp * R;
+            if (row0 >= rows) return;
+            const uint32_t nr = (rows - row0 < R) ? (rows - row0) : R;
+            const uint8_t *rp[R];
+#pragma unroll
+            for (uint32_t r = 0; r < R; ++r) {
+                rp[r] = w + static_cast<uint64_t>(row0 + (r < nr ? r : nr - 1u)) *
+                                    rowBytes;
+            }
+            // A float4 activation load needs a 16-byte aligned pointer and four
+            // in-range columns; both tests are uniform across the warp.
+            const bool vec = ((reinterpret_cast<uintptr_t>(x) & 15u) == 0u);
+            float acc[R];
+#pragma unroll
+            for (uint32_t r = 0; r < R; ++r) acc[r] = 0.0f;
+            uint32_t b = 0;
+            for (; b + U <= blocksPerRow; b += U) {
+                uint8_t qb[R][U];
+                float ds[R][U];
+#pragma unroll
+                for (uint32_t u = 0; u < U; ++u) {
+#pragma unroll
+                    for (uint32_t r = 0; r < R; ++r) {
+                        const uint8_t *blk =
+                                rp[r] + static_cast<uint64_t>(b + u) * kPQ2_0_BYTES;
+                        qb[r][u] = blk[2u + lane];
+                        ds[r][u] = __half2float(
+                                *reinterpret_cast<const __half *>(blk));
+                    }
+                }
+#pragma unroll
+                for (uint32_t u = 0; u < U; ++u) {
+                    const uint32_t base = (b + u) * 128u + lane * 4u;
+                    float x0, x1, x2, x3;
+                    if (vec && base + 3u < cols) {
+                        const float4 v =
+                                *reinterpret_cast<const float4 *>(x + base);
+                        x0 = v.x;
+                        x1 = v.y;
+                        x2 = v.z;
+                        x3 = v.w;
+                    } else {
+                        x0 = (base + 0u < cols) ? x[base + 0u] : 0.0f;
+                        x1 = (base + 1u < cols) ? x[base + 1u] : 0.0f;
+                        x2 = (base + 2u < cols) ? x[base + 2u] : 0.0f;
+                        x3 = (base + 3u < cols) ? x[base + 3u] : 0.0f;
+                    }
+#pragma unroll
+                    for (uint32_t r = 0; r < R; ++r) {
+                        if (r >= nr) break;
+                        const uint32_t q = qb[r][u];
+                        const float d = ds[r][u];
+                        float a = acc[r];
+                        a = fmaf(d * (static_cast<float>((q >> 0u) & 3u) - 1.0f),
+                                 x0, a);
+                        a = fmaf(d * (static_cast<float>((q >> 2u) & 3u) - 1.0f),
+                                 x1, a);
+                        a = fmaf(d * (static_cast<float>((q >> 4u) & 3u) - 1.0f),
+                                 x2, a);
+                        a = fmaf(d * (static_cast<float>((q >> 6u) & 3u) - 1.0f),
+                                 x3, a);
+                        acc[r] = a;
+                    }
+                }
+            }
+            for (; b < blocksPerRow; ++b) {
                 const uint32_t base = b * 128u + lane * 4u;
                 const uint32_t c0 = base + 0u, c1 = base + 1u;
                 const uint32_t c2 = base + 2u, c3 = base + 3u;
@@ -2787,20 +2873,86 @@ namespace tinycoder::gpu {
                 const float x1 = (c1 < cols) ? x[c1] : 0.0f;
                 const float x2 = (c2 < cols) ? x[c2] : 0.0f;
                 const float x3 = (c3 < cols) ? x[c3] : 0.0f;
-                acc = fmaf(d * (static_cast<float>((qb >> 0u) & 3u) - 1.0f), x0,
-                           acc);
-                acc = fmaf(d * (static_cast<float>((qb >> 2u) & 3u) - 1.0f), x1,
-                           acc);
-                acc = fmaf(d * (static_cast<float>((qb >> 4u) & 3u) - 1.0f), x2,
-                           acc);
-                acc = fmaf(d * (static_cast<float>((qb >> 6u) & 3u) - 1.0f), x3,
-                           acc);
+#pragma unroll
+                for (uint32_t r = 0; r < R; ++r) {
+                    if (r >= nr) break;
+                    const uint8_t *blk =
+                            rp[r] + static_cast<uint64_t>(b) * kPQ2_0_BYTES;
+                    const float d =
+                            __half2float(*reinterpret_cast<const __half *>(blk));
+                    const uint8_t q = blk[2u + lane];
+                    float a = acc[r];
+                    a = fmaf(d * (static_cast<float>((q >> 0u) & 3u) - 1.0f), x0, a);
+                    a = fmaf(d * (static_cast<float>((q >> 2u) & 3u) - 1.0f), x1, a);
+                    a = fmaf(d * (static_cast<float>((q >> 4u) & 3u) - 1.0f), x2, a);
+                    a = fmaf(d * (static_cast<float>((q >> 6u) & 3u) - 1.0f), x3, a);
+                    acc[r] = a;
+                }
             }
 #pragma unroll
-            for (uint32_t off = 16; off > 0; off >>= 1) {
-                acc += __shfl_xor_sync(0xffffffffu, acc, off);
+            for (uint32_t r = 0; r < R; ++r) {
+                float a = acc[r];
+#pragma unroll
+                for (uint32_t off = 16; off > 0; off >>= 1) {
+                    a += __shfl_xor_sync(0xffffffffu, a, off);
+                }
+                if (lane == 0 && row0 + r < rows) out[row0 + r] = a;
             }
-            if (lane == 0) out[row] = acc;
+        }
+
+        // Host-side selection of the rows-per-warp geometry (A/B switch; set
+        // TINYCODER_PQ2_R=1 for the previous one-row-per-warp kernel).
+        inline uint32_t pq2GemvGeom() {
+            static const uint32_t r = [] {
+                const char *e = std::getenv("TINYCODER_PQ2_R");
+                const long v = e ? std::strtol(e, nullptr, 10) : 8;
+                return (v == 1 || v == 4 || v == 8 || v == 16 || v == 32 || v == 64)
+                               ? static_cast<uint32_t>(v)
+                               : static_cast<uint32_t>(8);
+            }();
+            return r;
+        }
+
+        inline void launchQGemvPQ2_0(const uint8_t *w, const float *x, float *out,
+                                     uint32_t rows, uint32_t cols,
+                                     uint32_t rowBytes, uint32_t blocksPerRow) {
+            // NOTE: every launch below must name g_stream explicitly.  Without
+            // it the kernel goes to the LEGACY DEFAULT stream, and g_stream was
+            // created with cudaStreamNonBlocking, so there is no implicit
+            // ordering between them: the GEMV would race with the fold that
+            // produces its activation and with the consumer of `out` (this was
+            // the state of the tree when the 36.4 tok/s baseline was measured;
+            // it also hid the GEMV from every event-based profile).
+            switch (pq2GemvGeom()) {
+                case 1u:
+                    kQGemvPQ2_0T<1u, 8u><<<(rows + 3u) / 4u, 128, 0, g_stream>>>(
+                            w, x, out, rows, cols, rowBytes, blocksPerRow);
+                    break;
+                case 4u:
+                    kQGemvPQ2_0T<4u, 2u><<<(rows + 15u) / 16u, 128, 0, g_stream>>>(
+                            w, x, out, rows, cols, rowBytes, blocksPerRow);
+                    break;
+                case 8u:
+                    kQGemvPQ2_0T<2u, 8u><<<(rows + 7u) / 8u, 128, 0, g_stream>>>(
+                            w, x, out, rows, cols, rowBytes, blocksPerRow);
+                    break;
+                case 16u:
+                    kQGemvPQ2_0T<1u, 16u><<<(rows + 3u) / 4u, 128, 0, g_stream>>>(
+                            w, x, out, rows, cols, rowBytes, blocksPerRow);
+                    break;
+                case 32u:
+                    kQGemvPQ2_0T<4u, 4u><<<(rows + 15u) / 16u, 128, 0, g_stream>>>(
+                            w, x, out, rows, cols, rowBytes, blocksPerRow);
+                    break;
+                case 64u:
+                    kQGemvPQ2_0T<2u, 16u><<<(rows + 7u) / 8u, 128, 0, g_stream>>>(
+                            w, x, out, rows, cols, rowBytes, blocksPerRow);
+                    break;
+                default:
+                    kQGemvPQ2_0T<2u, 4u><<<(rows + 7u) / 8u, 128, 0, g_stream>>>(
+                            w, x, out, rows, cols, rowBytes, blocksPerRow);
+                    break;
+            }
         }
 
         // GDN value-head permutation index (matches prism::permuteGdnValueGrouped):
@@ -2882,6 +3034,1970 @@ namespace tinycoder::gpu {
             }
         }
 
+        // Batched forward Prism activation transform for prefill: identical math
+        // to kPrismFold (sign flip, optional GDN value-head permutation, then the
+        // blockwise normalized Hadamard), one row per blockIdx.y, written
+        // straight out as fp16 so the fp16 tensor-core GEMM consumes it without a
+        // second pass.  grid = (ceil(n / kPrismBlock), seqLen); block = 256.
+        // `rowStride` is the activation row pitch in floats/halves.
+        __global__ void kPrismFoldToF16(const float *__restrict__ v,
+                                        __half *__restrict__ dst, uint32_t n,
+                                        const float *__restrict__ signs,
+                                        uint32_t gdnHeadV, uint32_t gdnNk,
+                                        uint32_t gdnRep, uint32_t rowStride) {
+            __shared__ float tile[kPrismBlock];
+            const uint32_t base = blockIdx.x * kPrismBlock;
+            const uint32_t s = blockIdx.y;
+            const uint32_t tid = threadIdx.x;
+            const uint32_t have = (base < n) ? ((n - base < kPrismBlock)
+                                                        ? (n - base)
+                                                        : kPrismBlock)
+                                             : 0u;
+            if (have == 0u) return;
+            const float *src = v + static_cast<size_t>(s) * rowStride;
+            __half *dp = dst + static_cast<size_t>(s) * rowStride;
+            const bool perm = (gdnRep > 1u && gdnHeadV > 0u && gdnNk > 0u);
+            for (uint32_t i = tid; i < kPrismBlock; i += blockDim.x) {
+                float val = 0.0f;
+                if (i < have) {
+                    const uint32_t g = base + i;
+                    const uint32_t si =
+                            perm ? prismGdnSrcIndex(g, gdnHeadV, gdnNk, gdnRep) : g;
+                    val = src[si];
+                    if (signs != nullptr) val *= signs[g];
+                }
+                tile[i] = val;
+            }
+            __syncthreads();
+            prismFwhtShared(tile, kPrismBlock, tid, blockDim.x);
+            for (uint32_t i = tid; i < have; i += blockDim.x) {
+                dp[base + i] = __float2half(tile[i]);
+            }
+        }
+
+        // Prism PQ2_0 q8_1 activation + dp4a decode GEMV (2026-11-17).
+        //
+        // Why: the fp32-activation GEMV above reads 4 B of activation per
+        // weight column (a float4 per 128-block per lane) against 0.25 B of
+        // packed weight, i.e. ~16 B of activation traffic per 4 weights.  That
+        // is what caps decode at ~233 GB/s of packed weight on this card (the
+        // same block of 128 weights costs 7 wavefronts of L1 traffic instead
+        // of 4).  llama.cpp's route -- and the route the PrismML fork takes for
+        // this exact format -- is to quantise the (folded) activation to int8
+        // once per projection and dot it against the packed 2-bit codes with
+        // `dp4a`, so each lane moves 4 B of activation per 16 weights.
+        //
+        // The arithmetic difference from the fp32 kernel is ONLY the int8
+        // quantisation of the activation: the weight codes are integers already,
+        // so sum((code-1)*x) is exact in int32 (|sum| <= 128*127*2 per block),
+        // and the per-128-block scale d2 and per-32-block scale d8 are applied
+        // once, in float, per block.  The per-output accumulation order (blocks
+        // ascending) is unchanged; what changes is that the four intra-block
+        // products are summed exactly in integer instead of in fp32, so the
+        // result differs from the fp32 path by the int8 quantisation error
+        // (~2^-8 relative on the activation) and not by an accumulation-order
+        // artefact.  TINYCODER_PQ2_Q8=0 restores the fp32-activation path.
+        // ==================================================================
+
+        // Fold + quantise to q8 (per 32 columns, symmetric).  Same transform as
+        // kPrismFold above (sign flip, optional GDN value-head permutation,
+        // blockwise normalized Hadamard), then
+        //   amax = max|x| over the 32-group, d8 = amax/127, q = round(x/d8).
+        // grid = ceil(n / kPrismBlock); block = 256.  qs is int8[n] and d8 is
+        // float[n/32]; both must be 16-byte aligned and n a multiple of 128.
+        // ------------------------------------------------------------------
+        // q8_1 activation quantiser for the PQ2_0 dp4a GEMV.
+        //
+        // The q8 layout is the PrismML fork's (ggml-cuda/quantize.cu,
+        // layout GGML_CUDA_Q8_1_PQ2): inside each 16-column group the quantised
+        // value of column e is stored at position
+        //     (e % 4) * 4 + (e % 16) / 4
+        // so that the four bytes of one 32-bit activation word hold columns
+        // {j, j+4, j+8, j+12}.  That is exactly the column order that
+        // `(code_word >> 2k) & 0x03030303` selects out of the packed 2-bit
+        // weights, so a lane can dot 16 weights with four `dp4a` and no
+        // unpacking table and no cross-lane shuffles (see kQGemvPQ2_0Q8F).
+        //
+        // Per 32-column group we also store the exact integer sum of the
+        // quantised values (the fork packs it into the half2's high half; an
+        // int32 here keeps it exact, which matters because it is the large
+        // cancellation term of sum((code-1)*x) = sum(code*x) - sum(x)).
+        //
+        // Same H S P transform as kPrismFold above (sign flip, optional GDN
+        // value-head permutation, blockwise normalized Hadamard), then the
+        // per-32 symmetric quantisation amax/127.  qs is int8[n] and xd is
+        // float[n/32] (scale) followed by int32[n/32] (integer sums).
+        // grid = ceil(n / kPrismBlock); block = 256.
+        // Column e -> position, and the inverse (position p -> column).  One
+        // thread owns the four consecutive POSITIONS 4t..4t+3 so its store is a
+        // single aligned 32-bit word; the four columns it needs are
+        // {j, j+4, j+8, j+12} of a 16-column group, i.e. scattered in natural
+        // order, which is why the gather below indexes the shared tile by
+        // prismQ8Pq2Col().
+        __device__ __forceinline__ uint32_t prismQ8Pq2Col(uint32_t p) {
+            const uint32_t b = p & 15u;
+            return (p & ~31u) + (((p >> 4) & 1u) << 4) + ((b & 3u) << 2) +
+                   (b >> 2);
+        }
+
+        __global__ void kPrismFoldToQ8(const float *__restrict__ v,
+                                       int8_t *__restrict__ qs,
+                                       float *__restrict__ xd, uint32_t n,
+                                       const float *__restrict__ signs,
+                                       uint32_t gdnHeadV, uint32_t gdnNk,
+                                       uint32_t gdnRep,
+                                       const float *__restrict__ mul,
+                                       int8_t *__restrict__ qsT) {
+            __shared__ float tile[kPrismBlock];
+            const uint32_t base = blockIdx.x * kPrismBlock;
+            const uint32_t tid = threadIdx.x;
+            const uint32_t have = (base < n) ? ((n - base < kPrismBlock)
+                                                        ? (n - base)
+                                                        : kPrismBlock)
+                                             : 0u;
+            if (have == 0u) return;
+            const bool perm = (gdnRep > 1u && gdnHeadV > 0u && gdnNk > 0u);
+            for (uint32_t i = tid; i < kPrismBlock; i += blockDim.x) {
+                float val = 0.0f;
+                if (i < have) {
+                    const uint32_t g = base + i;
+                    const uint32_t si =
+                            perm ? prismGdnSrcIndex(g, gdnHeadV, gdnNk, gdnRep) : g;
+                    val = v[si];
+                    // Optional silu(x)*mul fused into the fold: ffn_down would
+                    // otherwise launch kSiluMul over 17408 elements and then
+                    // read them back here.  Same expression order as kSiluMul
+                    // (`x / (1 + exp(-x)) * b`), so the elementwise result is
+                    // unchanged.
+                    if (mul != nullptr) {
+                        val = (val / (1.0f + __expf(-val))) * mul[si];
+                    }
+                    if (signs != nullptr) val *= signs[g];
+                }
+                tile[i] = val;
+            }
+            __syncthreads();
+            prismFwhtShared(tile, kPrismBlock, tid, blockDim.x);
+            // Thread t writes the 4 q8 bytes at positions 4t..4t+3 of the tile,
+            // i.e. columns {j, j+4, j+8, j+12} of a 16-column group (the q8
+            // permutation above), so the store is one 32-bit word.
+            const uint32_t e = tid * 4u;
+            float vv[4];
+#pragma unroll
+            for (uint32_t j = 0; j < 4u; ++j) {
+                const uint32_t col = prismQ8Pq2Col(e + j);
+                vv[j] = (col < have) ? tile[col] : 0.0f;
+            }
+            float amax = fmaxf(fmaxf(fabsf(vv[0]), fabsf(vv[1])),
+                               fmaxf(fabsf(vv[2]), fabsf(vv[3])));
+            amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 1));
+            amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 2));
+            amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 4));
+            const float d = amax * (1.0f / 127.0f);
+            const float inv = (amax > 0.0f) ? (127.0f / amax) : 0.0f;
+            int q[4];
+            int isum = 0;
+#pragma unroll
+            for (uint32_t j = 0; j < 4u; ++j) {
+                q[j] = __float2int_rn(vv[j] * inv);
+                q[j] = max(-127, min(127, q[j]));
+                isum += q[j];
+            }
+            isum += __shfl_xor_sync(0xffffffffu, isum, 1);
+            isum += __shfl_xor_sync(0xffffffffu, isum, 2);
+            isum += __shfl_xor_sync(0xffffffffu, isum, 4);
+            const uint32_t packed =
+                    (static_cast<uint32_t>(static_cast<uint8_t>(
+                             static_cast<int8_t>(q[0]))) |
+                     (static_cast<uint32_t>(static_cast<uint8_t>(
+                              static_cast<int8_t>(q[1])))
+                      << 8) |
+                     (static_cast<uint32_t>(static_cast<uint8_t>(
+                              static_cast<int8_t>(q[2])))
+                      << 16) |
+                     (static_cast<uint32_t>(static_cast<uint8_t>(
+                              static_cast<int8_t>(q[3])))
+                      << 24));
+            if (e + 3u < have) {
+                *reinterpret_cast<uint32_t *>(qs + base + e) = packed;
+            } else {
+#pragma unroll
+                for (uint32_t j = 0; j < 4u; ++j) {
+                    if (prismQ8Pq2Col(e + j) < have) {
+                        qs[base + e + j] = static_cast<int8_t>(q[j]);
+                    }
+                }
+            }
+            if (qsT != nullptr) {
+#pragma unroll
+                for (uint32_t j = 0; j < 4u; ++j) {
+                    const uint32_t col = base + prismQ8Pq2Col(e + j);
+                    if (col < n) {
+                        const uint32_t blk = col >> 7;
+                        qsT[static_cast<uint64_t>(blk >> 5) * 4096u +
+                            static_cast<uint64_t>((col >> 4) & 7u) * 512u +
+                            static_cast<uint64_t>(blk & 31u) * 16u + (col & 15u)] =
+                                static_cast<int8_t>(q[j]);
+                    }
+                }
+            }
+            // Global chunk index: the GEMV reads xd[c] for chunk c of the
+            // WHOLE activation, so the tile's base has to be added here (a
+            // tile-local index made every tile clobber the first 32 entries
+            // and left the rest reading uninitialised device memory).
+            const uint32_t blk = base / 32u + e / 32u;
+            if ((tid & 7u) == 0u) {
+                xd[blk] = d;
+                reinterpret_cast<int32_t *>(xd + (n + 31u) / 32u)[blk] = isum;
+            }
+        }
+
+        // ------------------------------------------------------------------
+        // PQ2_0 packed ternary x q8 activation GEMV with `dp4a`, ported from the
+        // PrismML fork's `mul_mat_vec_pq2_0_ordered` (ggml-cuda/ggml-cuda.cu).
+        //
+        // One warp owns R output rows.  Each lane owns whole 32-column chunks:
+        // for chunk c it reads 8 bytes of packed weight (32 codes, four aligned
+        // uint16 loads at qs + (c&3)*8, which is 2-byte aligned because QA2_0
+        // blocks are 34 bytes) and the 32 permuted q8 bytes of that chunk, and
+        // runs 8 `dp4a` against the four (w >> 2k) & 0x03030303 code words.  The
+        // -1 code bias is one integer subtraction per chunk: the quantiser
+        // stored sum(q) exactly, so sum((code-1)*x) = sum(code*x) - sum(q).
+        //
+        // The four `w` passes reproduce the fork's accumulation order: lane l
+        // accumulates chunks l, l+128, ... into v[w] for w = 0..3 and
+        // s = ((v0 + v1) + v2) + v3, then the warp butterfly sums the lanes.
+        // Weight bytes per lane per chunk are 8, so one warp-load instruction
+        // touches eight 32-byte weight sectors (the fork's key MLP property);
+        // the activation load is one 32-byte chunk shared by all R rows.
+        //
+        // Numerics differ from the fp32-activation path only by the int8
+        // quantisation of the activation (~2^-8 relative); the integer dots are
+        // exact and the per-32 float scale is applied once per chunk.
+        // TINYCODER_PQ2_Q8=0 restores the fp32-activation GEMV.
+        // ------------------------------------------------------------------
+        template <uint32_t R, uint32_t NW = 4u>
+        __global__ void __launch_bounds__(NW * 32u) kQGemvPQ2_0Q8F(
+                const uint8_t *__restrict__ w, const int8_t *__restrict__ xq,
+                const float *__restrict__ xd, float *__restrict__ out,
+                uint32_t rows, uint32_t cols, uint32_t rowBytes,
+                uint32_t blocksPerRow) {
+            const uint32_t warp = blockIdx.x * NW + (threadIdx.x >> 5);
+            const uint32_t lane = threadIdx.x & 31u;
+            const uint32_t row0 = warp * R;
+            if (row0 >= rows) return;
+            const uint32_t nr = (rows - row0 < R) ? (rows - row0) : R;
+            const uint8_t *rp[R];
+#pragma unroll
+            for (uint32_t r = 0; r < R; ++r) {
+                rp[r] = w + static_cast<uint64_t>(row0 + (r < nr ? r : nr - 1u)) *
+                                    rowBytes;
+            }
+            const uint32_t nchunk = cols / 32u;
+            const int32_t *xsum = reinterpret_cast<const int32_t *>(
+                    xd + ((cols + 31u) / 32u));
+            float s[R];
+#pragma unroll
+            for (uint32_t r = 0; r < R; ++r) s[r] = 0.0f;
+#pragma unroll
+            for (uint32_t wp = 0; wp < 4u; ++wp) {
+                float v[R];
+#pragma unroll
+                for (uint32_t r = 0; r < R; ++r) v[r] = 0.0f;
+                for (uint32_t c = 32u * wp + lane; c < nchunk; c += 128u) {
+                    uint32_t w0[R], w1[R];
+                    float d2[R];
+#pragma unroll
+                    for (uint32_t r = 0; r < R; ++r) {
+                        const uint8_t *blk = rp[r] +
+                                             static_cast<uint64_t>(c >> 2) *
+                                                     kPQ2_0_BYTES;
+                        const uint16_t *qp = reinterpret_cast<const uint16_t *>(
+                                blk + 2u + (c & 3u) * 8u);
+                        d2[r] = __half2float(
+                                *reinterpret_cast<const __half *>(blk));
+                        w0[r] = static_cast<uint32_t>(qp[0]) |
+                                (static_cast<uint32_t>(qp[1]) << 16);
+                        w1[r] = static_cast<uint32_t>(qp[2]) |
+                                (static_cast<uint32_t>(qp[3]) << 16);
+                    }
+                    const int4 a0 = *reinterpret_cast<const int4 *>(
+                            xq + static_cast<uint64_t>(c) * 32u);
+                    const int4 a1 = *reinterpret_cast<const int4 *>(
+                            xq + static_cast<uint64_t>(c) * 32u + 16u);
+                    const float d8 = xd[c];
+                    const int qsum = xsum[c];
+#pragma unroll
+                    for (uint32_t r = 0; r < R; ++r) {
+                        if (r >= nr) break;
+                        int sumi = 0;
+                        sumi = __dp4a(static_cast<int>((w0[r] >> 0) &
+                                                       0x03030303u),
+                                      a0.x, sumi);
+                        sumi = __dp4a(static_cast<int>((w0[r] >> 2) &
+                                                       0x03030303u),
+                                      a0.y, sumi);
+                        sumi = __dp4a(static_cast<int>((w0[r] >> 4) &
+                                                       0x03030303u),
+                                      a0.z, sumi);
+                        sumi = __dp4a(static_cast<int>((w0[r] >> 6) &
+                                                       0x03030303u),
+                                      a0.w, sumi);
+                        sumi = __dp4a(static_cast<int>((w1[r] >> 0) &
+                                                       0x03030303u),
+                                      a1.x, sumi);
+                        sumi = __dp4a(static_cast<int>((w1[r] >> 2) &
+                                                       0x03030303u),
+                                      a1.y, sumi);
+                        sumi = __dp4a(static_cast<int>((w1[r] >> 4) &
+                                                       0x03030303u),
+                                      a1.z, sumi);
+                        sumi = __dp4a(static_cast<int>((w1[r] >> 6) &
+                                                       0x03030303u),
+                                      a1.w, sumi);
+                        sumi -= qsum;
+                        v[r] = fmaf(d2[r] * d8, static_cast<float>(sumi), v[r]);
+                    }
+                }
+#pragma unroll
+                for (uint32_t r = 0; r < R; ++r) s[r] += v[r];
+            }
+#pragma unroll
+            for (uint32_t r = 0; r < R; ++r) {
+                float a = s[r];
+#pragma unroll
+                for (uint32_t off = 16; off > 0; off >>= 1) {
+                    a += __shfl_xor_sync(0xffffffffu, a, off);
+                }
+                if (lane == 0 && row0 + r < rows) out[row0 + r] = a;
+            }
+        }
+
+
+        // ==================================================================
+        // Native PTQ1_0 (type 143, 28 B / 128 ternary weights) decode.
+        //
+        // The native block is qs[24] (5 trits/byte, elements 16n+m at byte m,
+        // 80+8n+m at byte 16+m) + qh[2] (4 trits/byte, elements 120+2n+h) +
+        // one fp16 d.  It is the same ternary source as PQ2_0 with 17.6% fewer
+        // bytes; the transcode to the 34-byte PQ2 layout existed only because
+        // no PTQ1_0 reader existed.  Decode is the reference's incremental
+        // chain (ggml-cuda/mmvq-ptq1_0.cuh:ptq1_0_trit_step), 3 int ops per
+        // four codes, with the -1 code bias left as one `- qsum` per 32-chunk
+        // exactly as the PQ2_0 GEMV does it.
+        //
+        // The decode GEMV keeps the PQ2_0 kernel's exact partition and fp32
+        // order: a lane loads and unpacks a whole 128-weight block, then hands
+        // each 32-chunk integer dot to the lane that owns it in the PQ2_0
+        // partition through a warp-local shared exchange.  The receiver applies
+        // d2*d8 and accumulates into v[pass] with the identical expression, so
+        // switching the loader from transcoded to native does not move one bit
+        // of the output.
+        //
+        // The activation side gains one buffer: the q8 bytes in the 32-block
+        // group are stored piece-major (group g, 16-byte piece i, lane l at
+        // g*4096 + i*512 + l*16) so the eight int4 loads of a warp are each a
+        // contiguous 512 B, instead of touching 32 cache lines apiece.  The
+        // fold writes it alongside the PQ2 layout; PQ2 models leave it null.
+        // The L2-resident probe measured 306 -> 428 GB/s for this layout; at
+        // model scale the exchange path lands at 293 GB/s (see
+        // docs/specs/ptq1_0-native-decode.md).
+        // ==================================================================
+        __device__ __forceinline__ int ptq1Dp4aUs(unsigned int a, int b,
+                                                  int c) {
+            asm("dp4a.u32.s32 %0, %1, %2, %3;" : "=r"(c) : "r"(a), "r"(b), "r"(c));
+            return c;
+        }
+
+        __device__ __forceinline__ uint32_t ptq1TritStep(uint32_t &vlo,
+                                                         uint32_t &vhi) {
+            const uint32_t wlo = vlo * 3u;
+            const uint32_t whi = vhi * 3u;
+            vlo = wlo & 0x00FF00FFu;
+            vhi = whi & 0x00FF00FFu;
+            return __byte_perm(wlo, whi, 0x7531);
+        }
+
+        __device__ __forceinline__ int ptq1IntAt(const int4 &v, uint32_t k) {
+            return (k == 0u) ? v.x : (k == 1u) ? v.y : (k == 2u) ? v.z : v.w;
+        }
+
+        __device__ __forceinline__ int ptq1PlaneDot4(uint32_t (&vlo)[4],
+                                                     uint32_t (&vhi)[4],
+                                                     const int4 &a, int acc) {
+            const uint32_t q0 = ptq1TritStep(vlo[0], vhi[0]);
+            const uint32_t q1 = ptq1TritStep(vlo[1], vhi[1]);
+            const uint32_t q2 = ptq1TritStep(vlo[2], vhi[2]);
+            const uint32_t q3 = ptq1TritStep(vlo[3], vhi[3]);
+            acc = ptq1Dp4aUs(q0, a.x, acc);
+            acc = ptq1Dp4aUs(q1, a.y, acc);
+            acc = ptq1Dp4aUs(q2, a.z, acc);
+            acc = ptq1Dp4aUs(q3, a.w, acc);
+            return acc;
+        }
+
+        __device__ __forceinline__ int ptq1PlaneDot2(uint32_t (&vlo)[2],
+                                                     uint32_t (&vhi)[2],
+                                                     int a0, int a1, int acc) {
+            const uint32_t q0 = ptq1TritStep(vlo[0], vhi[0]);
+            const uint32_t q1 = ptq1TritStep(vlo[1], vhi[1]);
+            acc = ptq1Dp4aUs(q0, a0, acc);
+            acc = ptq1Dp4aUs(q1, a1, acc);
+            return acc;
+        }
+
+        // 128 natural-order activation bytes (piece-major group g) -> int4[8].
+        __device__ __forceinline__ void ptq1LoadActivation(
+                const int8_t *__restrict__ group, uint32_t lane, int4 (&a0)[4],
+                int4 (&a1)[4]) {
+#pragma unroll
+            for (uint32_t ci = 0; ci < 4u; ++ci) {
+                const int8_t *ap =
+                        group + static_cast<uint64_t>(2u * ci) * 512u + lane * 16u;
+                a0[ci] = *reinterpret_cast<const int4 *>(ap);
+                a1[ci] = *reinterpret_cast<const int4 *>(ap + 512);
+            }
+        }
+
+        // Unpack one native block and return its four raw (0..2 digit) 32-chunk
+        // integer dots plus the fp16 scale bits.
+        __device__ __forceinline__ void ptq1BlockDots(const uint8_t *blk,
+                                                      const int4 (&a0)[4],
+                                                      const int4 (&a1)[4],
+                                                      int sumi[4],
+                                                      uint32_t &d2bits) {
+            const uint32_t *wb = reinterpret_cast<const uint32_t *>(blk);
+            d2bits = wb[6] >> 16;// bytes 26,27 = fp16 d
+            uint32_t vlo[4], vhi[4], vlo2[2], vhi2[2];
+#pragma unroll
+            for (uint32_t g = 0; g < 4u; ++g) {
+                vlo[g] = __byte_perm(wb[g], 0u, 0x4140);
+                vhi[g] = __byte_perm(wb[g], 0u, 0x4342);
+            }
+#pragma unroll
+            for (uint32_t g = 0; g < 2u; ++g) {
+                vlo2[g] = __byte_perm(wb[4u + g], 0u, 0x4140);
+                vhi2[g] = __byte_perm(wb[4u + g], 0u, 0x4342);
+            }
+            int s0 = 0, s1 = 0, s2 = 0, s3 = 0;
+            s0 = ptq1PlaneDot4(vlo, vhi, a0[0], s0);// qs plane 0 -> j   0..15
+            s0 = ptq1PlaneDot4(vlo, vhi, a1[0], s0);// qs plane 1 -> j  16..31
+            s1 = ptq1PlaneDot4(vlo, vhi, a0[1], s1);// qs plane 2 -> j  32..47
+            s1 = ptq1PlaneDot4(vlo, vhi, a1[1], s1);// qs plane 3 -> j  48..63
+            s2 = ptq1PlaneDot4(vlo, vhi, a0[2], s2);// qs plane 4 -> j  64..79
+            s2 = ptq1PlaneDot2(vlo2, vhi2, a1[2].x, a1[2].y, s2);// j 80..87
+            s2 = ptq1PlaneDot2(vlo2, vhi2, a1[2].z, a1[2].w, s2);// j 88..95
+            s3 = ptq1PlaneDot2(vlo2, vhi2, a0[3].x, a0[3].y, s3);// j 96..103
+            s3 = ptq1PlaneDot2(vlo2, vhi2, a0[3].z, a0[3].w, s3);// j104..111
+            s3 = ptq1PlaneDot2(vlo2, vhi2, a1[3].x, a1[3].y, s3);// j112..119
+            uint32_t vq = (wb[6] & 0xFFu) | ((wb[6] & 0xFF00u) << 8);
+            const uint32_t q0 = vq * 3u;
+            vq = q0 & 0x00FF00FFu;
+            const uint32_t q1 = vq * 3u;
+            vq = q1 & 0x00FF00FFu;
+            const uint32_t qw0 = __byte_perm(q0, q1, 0x7531);// j120..123
+            const uint32_t q2 = vq * 3u;
+            vq = q2 & 0x00FF00FFu;
+            const uint32_t q3 = vq * 3u;
+            const uint32_t qw1 = __byte_perm(q2, q3, 0x7531);// j124..127
+            s3 = ptq1Dp4aUs(qw0, a1[3].z, s3);
+            s3 = ptq1Dp4aUs(qw1, a1[3].w, s3);
+            sumi[0] = s0;
+            sumi[1] = s1;
+            sumi[2] = s2;
+            sumi[3] = s3;
+        }
+
+        // One int (four columns 4p..4p+3) of a native block, biased -1,0,1.
+        // Used by the fp32 oracle, the embedding dequant and -- one int per
+        // thread -- the int8 prefill tile loader.
+        __device__ __forceinline__ uint32_t ptq1DecodeInt(
+                const uint8_t *__restrict__ blk, uint32_t p) {
+            if (p < 30u) {
+                uint32_t off, plane;
+                if (p < 20u) {
+                    plane = p >> 2;
+                    off = (p & 3u) * 4u;
+                } else {
+                    plane = (p - 20u) >> 1;
+                    off = 16u + ((p - 20u) & 1u) * 4u;
+                }
+                static const uint32_t pow3[5] = {1u, 3u, 9u, 27u, 81u};
+                const uint32_t packed =
+                        *reinterpret_cast<const uint32_t *>(blk + off);
+                uint32_t a = __byte_perm(packed, 0u, 0x4140) * pow3[plane];
+                uint32_t b = __byte_perm(packed, 0u, 0x4342) * pow3[plane];
+                a = (a & 0x00FF00FFu) * 3u;
+                b = (b & 0x00FF00FFu) * 3u;
+                return __vsub4(__byte_perm(a, b, 0x7531), 0x01010101u);
+            }
+            uint32_t v = static_cast<uint32_t>(blk[24]) |
+                         (static_cast<uint32_t>(blk[25]) << 16);
+            const uint32_t a = v * 3u;
+            v = a & 0x00FF00FFu;
+            const uint32_t b = v * 3u;
+            v = b & 0x00FF00FFu;
+            if (p == 30u)
+                return __vsub4(__byte_perm(a, b, 0x7531), 0x01010101u);
+            const uint32_t c = v * 3u;
+            v = c & 0x00FF00FFu;
+            const uint32_t d = v * 3u;
+            return __vsub4(__byte_perm(c, d, 0x7531), 0x01010101u);
+        }
+
+        template <uint32_t R>
+        __global__ void __launch_bounds__(128) kQGemvPTQ1_0Q8(
+                const uint8_t *__restrict__ w, const int8_t *__restrict__ xqT,
+                const float *__restrict__ xd, float *__restrict__ out,
+                uint32_t rows, uint32_t cols, uint32_t rowBytes,
+                uint32_t blocksPerRow) {
+            constexpr uint32_t kW = 4u;
+            const uint32_t wl = threadIdx.x >> 5;
+            const uint32_t lane = threadIdx.x & 31u;
+            const uint32_t warp = blockIdx.x * kW + wl;
+            const uint32_t row0 = warp * R;
+            if (row0 >= rows) return;
+            const uint32_t nr = (rows - row0 < R) ? (rows - row0) : R;
+            const uint8_t *rp[R];
+#pragma unroll
+            for (uint32_t r = 0; r < R; ++r)
+                rp[r] = w + static_cast<uint64_t>(row0 + (r < nr ? r : nr - 1u)) *
+                                    rowBytes;
+            const uint32_t nchunk = cols / 32u;
+            const int32_t *xsum =
+                    reinterpret_cast<const int32_t *>(xd + ((cols + 31u) / 32u));
+            __shared__ int shm[kW][4u * R][33];
+            float v[4][R];
+#pragma unroll
+            for (uint32_t k = 0; k < 4u; ++k)
+#pragma unroll
+                for (uint32_t r = 0; r < R; ++r) v[k][r] = 0.0f;
+            const uint32_t ngroups = (blocksPerRow + 31u) / 32u;
+            for (uint32_t g = 0; g < ngroups; ++g) {
+                const uint32_t b = 32u * g + lane;
+                if (b < blocksPerRow) {
+                    int4 a0[4], a1[4];
+                    ptq1LoadActivation(xqT + static_cast<uint64_t>(g) * 4096u,
+                                       lane, a0, a1);
+#pragma unroll
+                    for (uint32_t r = 0; r < R; ++r) {
+                        int sumi[4];
+                        uint32_t d2bits = 0;
+                        ptq1BlockDots(rp[r] + static_cast<uint64_t>(b) * kPTQ1_0_BYTES,
+                                      a0, a1, sumi, d2bits);
+#pragma unroll
+                        for (uint32_t ci = 0; ci < 4u; ++ci)
+                            shm[wl][ci * R + r][lane] =
+                                    static_cast<int>(
+                                            static_cast<uint32_t>(sumi[ci]) &
+                                            0xFFFFu) |
+                                    (static_cast<int>(d2bits) << 16);
+                    }
+                }
+                __syncwarp();
+                // Receiver role: pass wp, global chunk 128g+32wp+lane, loaded
+                // by lane 8wp+(lane>>2) of this group.
+#pragma unroll
+                for (uint32_t wp = 0; wp < 4u; ++wp) {
+                    const uint32_t c = 128u * g + 32u * wp + lane;
+                    if (c >= nchunk) continue;
+                    const uint32_t src = 8u * wp + (lane >> 2);
+                    const uint32_t k = lane & 3u;
+                    const float d8 = xd[c];
+                    const int qs = xsum[c];
+#pragma unroll
+                    for (uint32_t r = 0; r < R; ++r) {
+                        const int e = shm[wl][k * R + r][src];
+                        const __half d2 = __ushort_as_half(
+                                static_cast<unsigned short>((e >> 16) & 0xFFFFu));
+                        const int sumi = static_cast<int16_t>(e & 0xFFFF);
+                        v[wp][r] = fmaf(__half2float(d2) * d8,
+                                        static_cast<float>(sumi - qs),
+                                        v[wp][r]);
+                    }
+                }
+                __syncwarp();
+            }
+#pragma unroll
+            for (uint32_t r = 0; r < R; ++r) {
+                const float a = ((v[0][r] + v[1][r]) + v[2][r]) + v[3][r];
+                float s = a;
+#pragma unroll
+                for (uint32_t off = 16; off > 0; off >>= 1)
+                    s += __shfl_xor_sync(0xffffffffu, s, off);
+                if (lane == 0 && row0 + r < rows) out[row0 + r] = s;
+            }
+        }
+
+        // fp32-activation oracle: the A/B and LM-head path.  Same geometry as
+        // kQGemvPQ2_0T; one lane owns four weights and the block scale.
+        template <uint32_t R, uint32_t U>
+        __global__ void __launch_bounds__(128) kQGemvPTQ1_0T(
+                const uint8_t *__restrict__ w, const float *__restrict__ x,
+                float *__restrict__ out, uint32_t rows, uint32_t cols,
+                uint32_t rowBytes, uint32_t blocksPerRow) {
+            const uint32_t warp = blockIdx.x * 4u + (threadIdx.x >> 5);
+            const uint32_t lane = threadIdx.x & 31u;
+            const uint32_t row0 = warp * R;
+            if (row0 >= rows) return;
+            const uint32_t nr = (rows - row0 < R) ? (rows - row0) : R;
+            const uint8_t *rp[R];
+#pragma unroll
+            for (uint32_t r = 0; r < R; ++r)
+                rp[r] = w + static_cast<uint64_t>(row0 + (r < nr ? r : nr - 1u)) *
+                                    rowBytes;
+            const bool vec = ((reinterpret_cast<uintptr_t>(x) & 15u) == 0u);
+            float acc[R];
+#pragma unroll
+            for (uint32_t r = 0; r < R; ++r) acc[r] = 0.0f;
+            for (uint32_t b = 0; b < blocksPerRow; ++b) {
+                const uint32_t base = b * 128u + lane * 4u;
+                float x0, x1, x2, x3;
+                if (vec && base + 3u < cols) {
+                    const float4 v =
+                            *reinterpret_cast<const float4 *>(x + base);
+                    x0 = v.x;
+                    x1 = v.y;
+                    x2 = v.z;
+                    x3 = v.w;
+                } else {
+                    x0 = (base + 0u < cols) ? x[base + 0u] : 0.0f;
+                    x1 = (base + 1u < cols) ? x[base + 1u] : 0.0f;
+                    x2 = (base + 2u < cols) ? x[base + 2u] : 0.0f;
+                    x3 = (base + 3u < cols) ? x[base + 3u] : 0.0f;
+                }
+#pragma unroll
+                for (uint32_t r = 0; r < R; ++r) {
+                    if (r >= nr) break;
+                    const uint8_t *blk =
+                            rp[r] + static_cast<uint64_t>(b) * kPTQ1_0_BYTES;
+                    const uint32_t q = ptq1DecodeInt(blk, lane);
+                    const float d = __half2float(
+                            *reinterpret_cast<const __half *>(blk + 26u));
+                    float a = acc[r];
+                    a = fmaf(d * static_cast<float>(
+                                     static_cast<int8_t>(q & 0xFFu)),
+                             x0, a);
+                    a = fmaf(d * static_cast<float>(
+                                     static_cast<int8_t>((q >> 8u) & 0xFFu)),
+                             x1, a);
+                    a = fmaf(d * static_cast<float>(
+                                     static_cast<int8_t>((q >> 16u) & 0xFFu)),
+                             x2, a);
+                    a = fmaf(d * static_cast<float>(
+                                     static_cast<int8_t>((q >> 24u) & 0xFFu)),
+                             x3, a);
+                    acc[r] = a;
+                }
+            }
+#pragma unroll
+            for (uint32_t r = 0; r < R; ++r) {
+                float a = acc[r];
+#pragma unroll
+                for (uint32_t off = 16; off > 0; off >>= 1)
+                    a += __shfl_xor_sync(0xffffffffu, a, off);
+                if (lane == 0 && row0 + r < rows) out[row0 + r] = a;
+            }
+        }
+
+        // Split-K native PTQ1_0 GEMV: one warp per output row, one lane per
+        // 128-weight block, fp32 folded activation.  Thread kb reads the block
+        // as 28 contiguous bytes (7 words) and the matching 128 activation
+        // floats (float4-aligned groups), so the weight stream is a plain
+        // coalesced sweep with no transposed buffer and no warp exchange.
+        // Numerical order differs from the row-parallel oracle; the math is
+        // exact fp32 fma on the trits.
+        __device__ __forceinline__ void ptq1Trits5(const uint32_t P,
+                                                   uint32_t (&D)[5]) {
+            const uint32_t vlo = __byte_perm(P, 0, 0x4140);
+            const uint32_t vhi = __byte_perm(P, 0, 0x4342);
+            uint32_t Fp = 0u;
+            const uint32_t pow3[5] = {3u, 9u, 27u, 81u, 243u};
+#pragma unroll
+            for (uint32_t t = 0; t < 5u; ++t) {
+                const uint32_t Fn =
+                        __byte_perm(vlo * pow3[t], vhi * pow3[t], 0x7531);
+                D[t] = Fn - 3u * Fp;
+                Fp = Fn;
+            }
+        }
+
+        __device__ __forceinline__ float ptq1DigitDot4(const uint32_t d,
+                                                       const float4 xv) {
+            float s = static_cast<float>(static_cast<int>(d & 0xFFu) - 1) *
+                      xv.x;
+            s = fmaf(static_cast<float>(static_cast<int>((d >> 8) & 0xFFu) - 1),
+                     xv.y, s);
+            s = fmaf(
+                    static_cast<float>(static_cast<int>((d >> 16) & 0xFFu) - 1),
+                    xv.z, s);
+            s = fmaf(
+                    static_cast<float>(static_cast<int>((d >> 24) & 0xFFu) - 1),
+                    xv.w, s);
+            return s;
+        }
+
+        template <uint32_t NW>
+        __global__ void __launch_bounds__(NW * 32u) kQGemvPTQ1_0SplitK(
+                const uint8_t *__restrict__ w, const float *__restrict__ x,
+                float *__restrict__ out, uint32_t rows, uint32_t cols,
+                uint32_t rowBytes, uint32_t bpr) {
+            const uint32_t warp = threadIdx.x >> 5;
+            const uint32_t lane = threadIdx.x & 31u;
+            const uint32_t row = blockIdx.x * NW + warp;
+            if (row >= rows) return;
+            const uint8_t *rp =
+                    w + static_cast<uint64_t>(row) * rowBytes;
+            float acc = 0.0f;
+            for (uint32_t kb = lane; kb < bpr; kb += 32u) {
+                const uint32_t *p = reinterpret_cast<const uint32_t *>(
+                        rp + static_cast<uint64_t>(kb) * 28u);
+                const float *xb = x + static_cast<uint64_t>(kb) * 128u;
+                float a[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+#pragma unroll
+                for (uint32_t g = 0; g < 6u; ++g) {
+                    uint32_t D[5];
+                    ptq1Trits5(p[g], D);
+#pragma unroll
+                    for (uint32_t t = 0; t < 5u; ++t) {
+                        const uint32_t e = (g < 4u)
+                                                   ? (16u * t + 4u * g)
+                                                   : (80u + 8u * t + 4u * (g - 4u));
+                        a[e >> 5] += ptq1DigitDot4(
+                                D[t], *reinterpret_cast<const float4 *>(xb + e));
+                    }
+                }
+                uint32_t v = __byte_perm(p[6], 0, 0x4140);
+#pragma unroll
+                for (uint32_t t = 0; t < 4u; t += 2u) {
+                    const uint32_t w0 = v * 3u;
+                    v = w0 & 0x00FF00FFu;
+                    const uint32_t w1 = v * 3u;
+                    v = w1 & 0x00FF00FFu;
+                    const uint32_t q = __byte_perm(w0, w1, 0x7531);
+                    a[3] += ptq1DigitDot4(
+                            q, *reinterpret_cast<const float4 *>(xb + 120u + 2u * t));
+                }
+                const float d = __half2float(__ushort_as_half(
+                        static_cast<unsigned short>(p[6] >> 16)));
+                acc += d * (a[0] + a[1] + a[2] + a[3]);
+            }
+#pragma unroll
+            for (uint32_t off = 16u; off > 0u; off >>= 1u)
+                acc += __shfl_down_sync(0xFFFFFFFFu, acc, off);
+            if (lane == 0u) out[row] = acc;
+        }
+
+        // Lossless 28 B -> 34 B PTQ1_0 -> PQ2_0 repack on the device, used only
+        // by the prefill path: the PQ2 int8 tile loader is 1.75x faster than
+        // the native one, so prefill repacks one matrix at a time into scratch
+        // and runs the PQ2 GEMM.  Layout is column order (code j at byte 2 +
+        // j/4, two bits at 2*(j%4)); d is copied verbatim.
+        __global__ void __launch_bounds__(128) kPTQ1_0ToPQ2(
+                const uint8_t *__restrict__ src, uint8_t *__restrict__ dst,
+                uint32_t nblocks) {
+            const uint32_t nb = blockIdx.x * 4u + (threadIdx.x >> 5);
+            if (nb >= nblocks) return;
+            const uint32_t t = threadIdx.x & 31u;
+            const uint8_t *s = src + static_cast<uint64_t>(nb) * 28u;
+            uint8_t *o = dst + static_cast<uint64_t>(nb) * 34u;
+            if (t == 0u) {
+                o[0] = s[26];
+                o[1] = s[27];
+            }
+            const uint8_t pow3[5] = {1u, 3u, 9u, 27u, 81u};
+            uint8_t byte = 0u;
+#pragma unroll
+            for (uint32_t jj = 0; jj < 4u; ++jj) {
+                const uint32_t j = 4u * t + jj;
+                uint8_t q;
+                if (j < 80u) {
+                    q = static_cast<uint8_t>(s[j % 16u] * pow3[j / 16u]);
+                } else if (j < 120u) {
+                    q = static_cast<uint8_t>(s[16u + (j - 80u) % 8u] *
+                                             pow3[(j - 80u) / 8u]);
+                } else {
+                    q = static_cast<uint8_t>(s[24u + (j - 120u) % 2u] *
+                                             pow3[(j - 120u) / 2u]);
+                }
+                const uint8_t code = static_cast<uint8_t>(
+                        (static_cast<uint16_t>(q) * 3u) >> 8);
+                byte |= static_cast<uint8_t>((code & 3u) << (2u * jj));
+            }
+            o[2u + t] = byte;
+        }
+
+        // Per-32 q8_1 quantisation of the folded activation, for the split-K
+        // GEMV: one warp per 32-element chunk, scale = max/127, integer sum
+        // exact.  ds holds (d8, isum) per 32-chunk, eight floats per 128-block.
+        __global__ void __launch_bounds__(128) kQuantizeQ8Blocks(
+                const float *__restrict__ x, int8_t *__restrict__ q,
+                float *__restrict__ ds, uint32_t nblocks) {
+            const uint32_t b = blockIdx.x;
+            const uint32_t t = threadIdx.x;
+            const uint32_t ch = t >> 5;
+            const uint32_t lane = t & 31u;
+            const uint32_t base = b * 128u + ch * 32u;
+            const float v = x[base + lane];
+            float mx = fabsf(v);
+#pragma unroll
+            for (uint32_t o = 16u; o > 0u; o >>= 1u)
+                mx = fmaxf(mx, __shfl_xor_sync(0xFFFFFFFFu, mx, o));
+            const float d = mx > 0.0f ? mx / 127.0f : 0.0f;
+            int qi = d > 0.0f ? __float2int_rn(v / d) : 0;
+            qi = qi < -127 ? -127 : (qi > 127 ? 127 : qi);
+            q[base + lane] = static_cast<int8_t>(qi);
+            int is = qi;
+#pragma unroll
+            for (uint32_t o = 16u; o > 0u; o >>= 1u)
+                is += __shfl_xor_sync(0xFFFFFFFFu, is, o);
+            if (lane == 0u) {
+                ds[b * 8u + ch * 2u] = d;
+                ds[b * 8u + ch * 2u + 1u] = static_cast<float>(is);
+            }
+        }
+
+        // Split-K native PTQ1_0 GEMV, the fork's geometry: thread (row group,
+        // 128-block) loads one q8 activation block and RPT weight blocks,
+        // dp4a-decodes trits with ptq1Trits5, and writes a partial to shared;
+        // a second phase reduces the K blocks per row.  Weight reads are 28
+        // contiguous bytes per block and the activation is int8, so neither
+        // side wastes a transaction.
+        template <uint32_t G, uint32_t RPT>
+        __global__ void __launch_bounds__(512) kQGemvPTQ1_0SplitQ8(
+                const uint8_t *__restrict__ w, const int8_t *__restrict__ xq,
+                const float *__restrict__ xd, float *__restrict__ out,
+                uint32_t rows, uint32_t cols, uint32_t rowBytes, uint32_t bpr) {
+            constexpr uint32_t R = G * RPT;
+            extern __shared__ float part[]; // [R][bpr]
+            const uint32_t tid = threadIdx.x;
+            const uint32_t bprP = (bpr + 31u) & ~31u;
+            const uint32_t g = tid / bprP;
+            const uint32_t kb = tid - g * bprP;
+            const uint32_t row0 = blockIdx.x * R;
+            if (g < G && kb < bpr) {
+                int ua[32];
+                const int4 *q4 = reinterpret_cast<const int4 *>(
+                        xq + static_cast<uint64_t>(kb) * 128u);
+#pragma unroll
+                for (uint32_t i = 0; i < 8u; ++i) {
+                    const int4 v = q4[i];
+                    ua[i * 4u + 0u] = v.x;
+                    ua[i * 4u + 1u] = v.y;
+                    ua[i * 4u + 2u] = v.z;
+                    ua[i * 4u + 3u] = v.w;
+                }
+#pragma unroll
+                for (uint32_t i = 0; i < RPT; ++i) {
+                    const uint32_t r = g + G * i;
+                    const uint32_t row = row0 + r;
+                    if (row >= rows) continue;
+                    const uint32_t *p = reinterpret_cast<const uint32_t *>(
+                            w + static_cast<uint64_t>(row) * rowBytes +
+                            static_cast<uint64_t>(kb) * 28u);
+                    int sumi[4] = {0, 0, 0, 0};
+#pragma unroll
+                    for (uint32_t gg = 0; gg < 6u; ++gg) {
+                        uint32_t D[5];
+                        ptq1Trits5(p[gg], D);
+#pragma unroll
+                        for (uint32_t t = 0; t < 5u; ++t) {
+                            const uint32_t e =
+                                    (gg < 4u) ? (16u * t + 4u * gg)
+                                              : (80u + 8u * t + 4u * (gg - 4u));
+                            sumi[e >> 5] = __dp4a(
+                                    static_cast<int>(D[t]),
+                                    ua[(e >> 5) * 8u + ((e & 31u) >> 2u)],
+                                    sumi[e >> 5]);
+                        }
+                    }
+                    uint32_t v = __byte_perm(p[6], 0, 0x4140);
+#pragma unroll
+                    for (uint32_t t = 0; t < 4u; t += 2u) {
+                        const uint32_t w0 = v * 3u;
+                        v = w0 & 0x00FF00FFu;
+                        const uint32_t w1 = v * 3u;
+                        v = w1 & 0x00FF00FFu;
+                        const uint32_t qq = __byte_perm(w0, w1, 0x7531);
+                        sumi[3] = __dp4a(static_cast<int>(qq),
+                                         ua[3u * 8u + 6u + t / 2u], sumi[3]);
+                    }
+                    float aa = 0.0f;
+#pragma unroll
+                    for (uint32_t k = 0; k < 4u; ++k) {
+                        const float d8 = xd[kb * 8u + k * 2u];
+                        const float is = xd[kb * 8u + k * 2u + 1u];
+                        aa = fmaf(d8, static_cast<float>(sumi[k] -
+                                                         static_cast<int>(is)),
+                                  aa);
+                    }
+                    const float dd = __half2float(__ushort_as_half(
+                            static_cast<unsigned short>(p[6] >> 16)));
+                    part[r * bpr + kb] = dd * aa;
+                }
+            }
+            __syncthreads();
+            const uint32_t nw = blockDim.x >> 5;
+            const uint32_t warp = tid >> 5;
+            const uint32_t lane = tid & 31u;
+            for (uint32_t r = warp; r < R; r += nw) {
+                float sm = 0.0f;
+                for (uint32_t k = lane; k < bpr; k += 32u)
+                    sm += part[r * bpr + k];
+#pragma unroll
+                for (uint32_t o = 16u; o > 0u; o >>= 1u)
+                    sm += __shfl_down_sync(0xFFFFFFFFu, sm, o);
+                if (lane == 0u && row0 + r < rows) out[row0 + r] = sm;
+            }
+        }
+
+        inline void launchQGemvPTQ1_0SplitQ8(const uint8_t *w, const float *x,
+                                             int8_t *xq, float *xd, float *out,
+                                             uint32_t rows, uint32_t cols,
+                                             uint32_t rowBytes,
+                                             uint32_t blocksPerRow) {
+            const uint32_t nb = cols / 128u;
+            kQuantizeQ8Blocks<<<nb, 128, 0, g_stream>>>(x, xq, xd, nb);
+            static const uint32_t rptSel = [] {
+                const char *e = std::getenv("TINYCODER_PT_SPLITRPT");
+                return (e != nullptr && e[0] == '1') ? 1u
+                       : (e != nullptr && e[0] == '2') ? 2u
+                       : (e != nullptr && e[0] == '8') ? 8u
+                                                      : 4u;
+            }();
+            const bool rpt8 = rptSel == 8u;
+            const uint32_t G = blocksPerRow <= 42u ? 6u
+                               : blocksPerRow <= 48u ? 5u
+                                                     : 1u;
+            const uint32_t RPT = rptSel;
+            const uint32_t R = G * RPT;
+            const uint32_t threads = G * ((blocksPerRow + 31u) & ~31u);
+            const uint32_t shared = R * blocksPerRow * sizeof(float);
+            const uint32_t grid = (rows + R - 1u) / R;
+            if (rptSel == 1u) {
+                switch (G) {
+                    case 6u:
+                        kQGemvPTQ1_0SplitQ8<6u, 1u>
+                                <<<grid, threads, shared, g_stream>>>(
+                                        w, xq, xd, out, rows, cols, rowBytes,
+                                        blocksPerRow);
+                        return;
+                    case 5u:
+                        kQGemvPTQ1_0SplitQ8<5u, 1u>
+                                <<<grid, threads, shared, g_stream>>>(
+                                        w, xq, xd, out, rows, cols, rowBytes,
+                                        blocksPerRow);
+                        return;
+                    default:
+                        kQGemvPTQ1_0SplitQ8<1u, 1u>
+                                <<<grid, threads, shared, g_stream>>>(
+                                        w, xq, xd, out, rows, cols, rowBytes,
+                                        blocksPerRow);
+                        return;
+                }
+            }
+            if (rptSel == 2u) {
+                switch (G) {
+                    case 6u:
+                        kQGemvPTQ1_0SplitQ8<6u, 2u>
+                                <<<grid, threads, shared, g_stream>>>(
+                                        w, xq, xd, out, rows, cols, rowBytes,
+                                        blocksPerRow);
+                        return;
+                    case 5u:
+                        kQGemvPTQ1_0SplitQ8<5u, 2u>
+                                <<<grid, threads, shared, g_stream>>>(
+                                        w, xq, xd, out, rows, cols, rowBytes,
+                                        blocksPerRow);
+                        return;
+                    default:
+                        kQGemvPTQ1_0SplitQ8<1u, 2u>
+                                <<<grid, threads, shared, g_stream>>>(
+                                        w, xq, xd, out, rows, cols, rowBytes,
+                                        blocksPerRow);
+                        return;
+                }
+            }
+            if (rpt8) {
+                switch (G) {
+                    case 8u:
+                        kQGemvPTQ1_0SplitQ8<8u, 8u>
+                                <<<grid, threads, shared, g_stream>>>(
+                                        w, xq, xd, out, rows, cols, rowBytes,
+                                        blocksPerRow);
+                        return;
+                    case 3u:
+                        kQGemvPTQ1_0SplitQ8<3u, 8u>
+                                <<<grid, threads, shared, g_stream>>>(
+                                        w, xq, xd, out, rows, cols, rowBytes,
+                                        blocksPerRow);
+                        return;
+                    case 5u:
+                        kQGemvPTQ1_0SplitQ8<5u, 8u>
+                                <<<grid, threads, shared, g_stream>>>(
+                                        w, xq, xd, out, rows, cols, rowBytes,
+                                        blocksPerRow);
+                        return;
+                    case 6u:
+                        kQGemvPTQ1_0SplitQ8<6u, 8u>
+                                <<<grid, threads, shared, g_stream>>>(
+                                        w, xq, xd, out, rows, cols, rowBytes,
+                                        blocksPerRow);
+                        return;
+                    default:
+                        kQGemvPTQ1_0SplitQ8<1u, 8u>
+                                <<<grid, threads, shared, g_stream>>>(
+                                        w, xq, xd, out, rows, cols, rowBytes,
+                                        blocksPerRow);
+                        return;
+                }
+            }
+            switch (G) {
+                case 8u:
+                    kQGemvPTQ1_0SplitQ8<8u, 4u>
+                            <<<grid, threads, shared, g_stream>>>(
+                                    w, xq, xd, out, rows, cols, rowBytes,
+                                    blocksPerRow);
+                    break;
+                case 3u:
+                    kQGemvPTQ1_0SplitQ8<3u, 4u>
+                            <<<grid, threads, shared, g_stream>>>(
+                                    w, xq, xd, out, rows, cols, rowBytes,
+                                    blocksPerRow);
+                    break;
+                case 5u:
+                    kQGemvPTQ1_0SplitQ8<5u, 4u>
+                            <<<grid, threads, shared, g_stream>>>(
+                                    w, xq, xd, out, rows, cols, rowBytes,
+                                    blocksPerRow);
+                    break;
+                case 6u:
+                    kQGemvPTQ1_0SplitQ8<6u, 4u>
+                            <<<grid, threads, shared, g_stream>>>(
+                                    w, xq, xd, out, rows, cols, rowBytes,
+                                    blocksPerRow);
+                    break;
+                default:
+                    kQGemvPTQ1_0SplitQ8<1u, 4u>
+                            <<<grid, threads, shared, g_stream>>>(
+                                    w, xq, xd, out, rows, cols, rowBytes,
+                                    blocksPerRow);
+                    break;
+            }
+        }
+
+        inline void launchQGemvPTQ1_0SplitK(const uint8_t *w, const float *x,
+                                            float *out, uint32_t rows,
+                                            uint32_t cols, uint32_t rowBytes,
+                                            uint32_t blocksPerRow) {
+            kQGemvPTQ1_0SplitK<4u><<<(rows + 3u) / 4u, 128, 0, g_stream>>>(
+                    w, x, out, rows, cols, rowBytes, blocksPerRow);
+        }
+
+        // Native PTQ1_0 q8 GEMV: R=4 exchange kernel (probe best bit-exact
+        // variant, 428 GB/s on the 19.5 MB probe, vs 306 at R=4 contiguous).
+        inline void launchQGemvPTQ1_0Q8(const uint8_t *w, const int8_t *xqT,
+                                        const float *xd, float *out,
+                                        uint32_t rows, uint32_t cols,
+                                        uint32_t rowBytes,
+                                        uint32_t blocksPerRow) {
+            static const uint32_t R = [] {
+                const char *e = std::getenv("TINYCODER_PT_Q8R");
+                return (e != nullptr && e[0] == '1') ? 1u : 4u;
+            }();
+            if (R == 1u) {
+                kQGemvPTQ1_0Q8<1u><<<(rows + 3u) / 4u, 128, 0, g_stream>>>(
+                        w, xqT, xd, out, rows, cols, rowBytes, blocksPerRow);
+            } else {
+                kQGemvPTQ1_0Q8<4u><<<(rows + 15u) / 16u, 128, 0, g_stream>>>(
+                        w, xqT, xd, out, rows, cols, rowBytes, blocksPerRow);
+            }
+        }
+
+        inline void launchQGemvPTQ1_0(const uint8_t *w, const float *x,
+                                      float *out, uint32_t rows, uint32_t cols,
+                                      uint32_t rowBytes,
+                                      uint32_t blocksPerRow) {
+            const uint32_t blocks = (rows + 31u) / 32u;
+            kQGemvPTQ1_0T<8u, 4u><<<blocks, 128, 0, g_stream>>>(
+                    w, x, out, rows, cols, rowBytes, blocksPerRow);
+        }
+
+        // Diagnostic: read-only twin of the q8 GEMV's weight stream (same bytes,
+        // no math, garbage output).  TINYCODER_PQ2_TWIN=1 swaps it in to price
+        // the compute against the stream in situ.  Never enabled by default.
+        __global__ void __launch_bounds__(128) kQGemvPQ2_0Twin(
+                const uint8_t *__restrict__ w, float *__restrict__ out,
+                uint32_t rows, uint32_t rowBytes, uint32_t blocksPerRow) {
+            const uint32_t warp = blockIdx.x * 4u + (threadIdx.x >> 5);
+            const uint32_t lane = threadIdx.x & 31u;
+            const uint32_t row0 = warp * 4u;
+            if (row0 >= rows) return;
+            const uint32_t nr = (rows - row0 < 4u) ? (rows - row0) : 4u;
+            const uint8_t *rp[4];
+#pragma unroll
+            for (uint32_t r = 0; r < 4u; ++r)
+                rp[r] = w + (uint64_t)(row0 + (r < nr ? r : nr - 1u)) * rowBytes;
+            uint32_t s[4] = {0u, 0u, 0u, 0u};
+            for (uint32_t b = 0; b < blocksPerRow; ++b) {
+#pragma unroll
+                for (uint32_t r = 0; r < 4u; ++r) {
+                    if (r >= nr) break;
+                    const uint8_t *bp = rp[r] + (uint64_t) b * 34u;
+                    s[r] += (uint32_t) __ldg(reinterpret_cast<const uint16_t *>(
+                            bp + 2u + 2u * (lane & 15u)));
+                }
+            }
+            if (lane == 0) {
+#pragma unroll
+                for (uint32_t r = 0; r < 4u; ++r)
+                    if (row0 + r < rows) out[row0 + r] = (float) s[r];
+            }
+        }
+
+        // Rows per warp for the fork-style q8 GEMV.  The reference uses 4;
+        // TINYCODER_PQ2_Q8R selects the A/B geometry (1/2/4/8).
+        inline uint32_t pq2Q8Rows() {
+            static const uint32_t r = [] {
+                const char *e = std::getenv("TINYCODER_PQ2_Q8R");
+                const long v = e ? std::strtol(e, nullptr, 10) : 4;
+                return (v == 1 || v == 2 || v == 4 || v == 8)
+                               ? static_cast<uint32_t>(v)
+                               : static_cast<uint32_t>(4);
+            }();
+            return r;
+        }
+
+        // True when the q8 decode path should be used (default ON;
+        // TINYCODER_PQ2_Q8=0 restores the fp32-activation GEMV).
+        inline bool pq2Q8Enabled() {
+            static const bool on = [] {
+                const char *e = std::getenv("TINYCODER_PQ2_Q8");
+                return e == nullptr || e[0] == '\0' || e[0] != '0';
+            }();
+            return on;
+        }
+
+        // Native PTQ1_0 q8 decode is opt-in: the int8 activation path is
+        // approximate, while the validated native path is the fp32 oracle.
+        // TINYCODER_PT_Q8=1 enables the dp4a GEMV for PTQ1_0 weights.
+        // ------------------------------------------------------------------
+        // K-block-stationary PTQ1_0 GEMV, ported verbatim from the Prism
+        // fork's mul_mat_vec_ptq1_0_ks (ggml-cuda/mmvq-ptq1_0.cuh).  Each
+        // thread owns one (row group, 128-weight block) pair, holds the whole
+        // q8_1 activation block in registers, walks RPT weight blocks, writes
+        // (w, dot) partials to shared, and a second phase reduces the K blocks
+        // per row.  The activation uses the fork's SOA_ISUM grouped layout:
+        // 32 K-blocks per group, word w of the group contiguous, so a warp
+        // load of one word is 32 consecutive words (one wavefront).
+        // ------------------------------------------------------------------
+        constexpr uint32_t kPtq1KsGroupKb    = 32u;
+        constexpr uint32_t kPtq1KsWordsPerKb = 36u;
+        constexpr uint32_t kPtq1KsGroupWords = kPtq1KsGroupKb * kPtq1KsWordsPerKb;
+
+        // Word offset within one activation column of word w (0..7 qs words,
+        // 8 ds) of q8_1 block ib.
+        __host__ __device__ __forceinline__ uint32_t ptq1KsQ8Word(uint32_t ib,
+                                                                  uint32_t w) {
+            const uint32_t kBlock = ib >> 2;
+            const uint32_t sub = ib & 3u;
+            const uint32_t group = kBlock >> 5;
+            const uint32_t lane = kBlock & 31u;
+            const uint32_t ww = w < 8u ? sub * 8u + w : 32u + sub;
+            return group * kPtq1KsGroupWords + ww * kPtq1KsGroupKb + lane;
+        }
+
+        // PT ("piece of 16 bytes") activation layout, the fork's PTQ1_0
+        // planar-transposed SoA (ggml-cuda/mmvq-ptq1_0.cuh).  The 36 words of a
+        // 128-weight block are stored as nine 16-byte pieces, plane-major: piece
+        // t of block kb sits at (t*nblk + kb)*4 ints, so a warp whose lanes own
+        // consecutive blocks reads 32*16 contiguous bytes per load and a thread
+        // needs 9 int4 loads instead of 36 strided 4-byte ones.  Plane t of a
+        // block holds the 16 quants of columns t*16..t*16+15, which in the old
+        // SoA were words ww = 4t..4t+3; plane 8 holds the four (d, isum) words.
+        __host__ __device__ __forceinline__ uint32_t ptq1PtQ8Int(uint32_t chunk,
+                                                                uint32_t lane,
+                                                                uint32_t nblk) {
+            const uint32_t kBlock = chunk >> 2;
+            const uint32_t sub = chunk & 3u;
+            const uint32_t t = 2u * sub + (lane >> 4);
+            const uint32_t b = lane & 15u;
+            return t * (nblk * 4u) + kBlock * 4u + (b >> 2);
+        }
+        __host__ __device__ __forceinline__ uint32_t ptq1PtDsInt(uint32_t chunk,
+                                                                uint32_t nblk) {
+            return 8u * (nblk * 4u) + (chunk >> 2) * 4u + (chunk & 3u);
+        }
+
+        // PDL: the fork overlaps the preceding quantize kernel with this one on
+        // Hopper via cudaGridDependencySynchronize.  sm_75 has no PDL, so the
+        // call compiles out; the launch order on g_stream is the fallback.
+        __device__ __forceinline__ void ptq1KsPdlSync() {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+            cudaGridDependencySynchronize();
+#endif
+        }
+
+        // Quantize the folded activation into the SOA_ISUM grouped layout.  One
+        // warp per 32-column chunk; scale = max/127, exact integer sum stored
+        // in the high half of ds.  ncols must be a multiple of 32.
+        __global__ void __launch_bounds__(128) kQuantizePTQ1KsSoA(
+                const float *__restrict__ act, int32_t *__restrict__ words,
+                uint32_t nchunks) {
+            const uint32_t tid = threadIdx.x;
+            const uint32_t lane = tid & 31u;
+            const uint32_t warp = tid >> 5;
+            const uint32_t chunk = blockIdx.x * 4u + warp;
+            if (chunk >= nchunks) return;
+            const uint32_t col = chunk * 32u + lane;
+            const float xi = act[col];
+            float amax = fabsf(xi);
+#pragma unroll
+            for (uint32_t off = 16u; off > 0u; off >>= 1u)
+                amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFFu, amax, off));
+            const float scale = amax > 0.0f ? amax / 127.0f : 0.0f;
+            const int q = amax == 0.0f
+                                  ? 0
+                                  : static_cast<int>(roundf(xi / scale));
+            int isum = q;
+#pragma unroll
+            for (uint32_t off = 16u; off > 0u; off >>= 1u)
+                isum += __shfl_xor_sync(0xFFFFFFFFu, isum, off);
+            int32_t *dstWord = words + ptq1KsQ8Word(chunk, lane >> 2u);
+            reinterpret_cast<int8_t *>(dstWord)[lane & 3u] =
+                    static_cast<int8_t>(q);
+            if (lane == 0u) {
+                const half2 ds = make_half2(__float2half(scale),
+                                            __short_as_half((short) isum));
+                words[ptq1KsQ8Word(chunk, 8u)] =
+                        *reinterpret_cast<const int32_t *>(&ds);
+            }
+        }
+
+        // Fused Prism fold + SOA quantize for the native decode: one kernel
+        // per projection instead of kPrismFold + kQuantizePTQ1KsSoA.  The
+        // fold math is kPrismFoldToQ8's (GDN value-head permutation, per
+        // feature signs, optional silu*mul), then the SoA quantizer's
+        // amax/scale/isum per 32 columns, written through ptq1KsQ8Word.
+        __global__ void __launch_bounds__(1024) kPrismFoldQuantSoA(
+                const float *__restrict__ v, int32_t *__restrict__ words,
+                uint32_t n, const float *__restrict__ signs, uint32_t gdnHeadV,
+                uint32_t gdnNk, uint32_t gdnRep,
+                const float *__restrict__ mul, uint32_t ptLayout) {
+            __shared__ float tile[kPrismBlock];
+            const uint32_t base = blockIdx.x * kPrismBlock;
+            const uint32_t tid = threadIdx.x;
+            if (base >= n) return;
+            const uint32_t have =
+                    (n - base < kPrismBlock) ? (n - base) : kPrismBlock;
+            const bool perm = (gdnRep > 1u && gdnHeadV > 0u && gdnNk > 0u);
+            for (uint32_t i = tid; i < kPrismBlock; i += blockDim.x) {
+                float val = 0.0f;
+                if (i < have) {
+                    const uint32_t g = base + i;
+                    const uint32_t si =
+                            perm ? prismGdnSrcIndex(g, gdnHeadV, gdnNk, gdnRep)
+                                 : g;
+                    val = v[si];
+                    if (mul != nullptr)
+                        val = (val / (1.0f + __expf(-val))) * mul[si];
+                    if (signs != nullptr) val *= signs[g];
+                }
+                tile[i] = val;
+            }
+            __syncthreads();
+            prismFwhtShared(tile, kPrismBlock, tid, blockDim.x);
+            __syncthreads();
+            const uint32_t lane = tid & 31u;
+            const uint32_t warp = tid >> 5u;
+            const uint32_t warps = blockDim.x >> 5u;
+            const uint32_t chunks = n / 32u;
+            for (uint32_t c = warp; c < (kPrismBlock / 32u); c += warps) {
+                const uint32_t chunk =
+                        blockIdx.x * (kPrismBlock / 32u) + c;
+                if (chunk >= chunks) break;
+                const uint32_t colInTile = c * 32u + lane;
+                const float xi = (colInTile < have) ? tile[colInTile] : 0.0f;
+                float amax = fabsf(xi);
+#pragma unroll
+                for (uint32_t off = 16u; off > 0u; off >>= 1u)
+                    amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFFu, amax, off));
+                const float scale = amax > 0.0f ? amax / 127.0f : 0.0f;
+                const int q = amax == 0.0f
+                                      ? 0
+                                      : static_cast<int>(roundf(xi / scale));
+                int isum = q;
+#pragma unroll
+                for (uint32_t off = 16u; off > 0u; off >>= 1u)
+                    isum += __shfl_xor_sync(0xFFFFFFFFu, isum, off);
+                const uint32_t nblk = n / 128u;
+                int32_t *dstWord =
+                        words + (ptLayout != 0u
+                                         ? ptq1PtQ8Int(chunk, lane, nblk)
+                                         : ptq1KsQ8Word(chunk, lane >> 2u));
+                reinterpret_cast<int8_t *>(dstWord)[lane & 3u] =
+                        static_cast<int8_t>(q);
+                if (lane == 0u) {
+                    const half2 ds = make_half2(__float2half(scale),
+                                                __short_as_half((short) isum));
+                    words[ptLayout != 0u ? ptq1PtDsInt(chunk, nblk)
+                                         : ptq1KsQ8Word(chunk, 8u)] =
+                            *reinterpret_cast<const int32_t *>(&ds);
+                }
+            }
+        }
+
+        // Fork's ptq1_0_ks_trits5: five base-3 digits of each byte of P, digit
+        // t of all four bytes packed into trit[t].
+        __device__ __forceinline__ void ptq1KsTrits5(const uint32_t P,
+                                                     uint32_t (&trit)[5]) {
+            const uint32_t vlo = __byte_perm(P, 0, 0x4140);
+            const uint32_t vhi = __byte_perm(P, 0, 0x4342);
+            uint32_t carry = 0u;
+            const uint32_t pow3[5] = {3u, 9u, 27u, 81u, 243u};
+#pragma unroll
+            for (uint32_t t = 0; t < 5u; ++t) {
+                const uint32_t next =
+                        __byte_perm(vlo * pow3[t], vhi * pow3[t], 0x7531);
+                trit[t] = next - 3u * carry;
+                carry = next;
+            }
+        }
+
+        // Fork's ptq1_0_ks_block_dot: ROWS weight blocks (7 words each) against
+        // one activation block in registers (act[0..31] = q8 words, act[32..35]
+        // = (scale, isum) per 32-column chunk).  wScale = fp16 group scale,
+        // actDot = sum_k scale_k * (chunkDot_k - isum_k).
+        template <uint32_t ROWS>
+        __device__ __forceinline__ void ptq1KsBlockDot(
+                const uint32_t (&w)[ROWS][7], const int (&act)[36],
+                float (&wScale)[ROWS], float (&actDot)[ROWS]) {
+            int chunkDot[ROWS][4];
+#pragma unroll
+            for (uint32_t i = 0; i < ROWS; ++i)
+#pragma unroll
+                for (uint32_t k = 0; k < 4u; ++k) chunkDot[i][k] = 0;
+#pragma unroll
+            for (uint32_t grp = 0; grp < 6u; ++grp) {
+#pragma unroll
+                for (uint32_t i = 0; i < ROWS; ++i) {
+                    uint32_t trit[5];
+                    ptq1KsTrits5(w[i][grp], trit);
+#pragma unroll
+                    for (uint32_t t = 0; t < 5u; ++t) {
+                        const uint32_t e = grp < 4u
+                                                   ? 16u * t + 4u * grp
+                                                   : 80u + 8u * t + 4u * (grp - 4u);
+                        chunkDot[i][e >> 5] = __dp4a(
+                                static_cast<int>(trit[t]),
+                                act[(e >> 5) * 8u + ((e & 31u) >> 2u)],
+                                chunkDot[i][e >> 5]);
+                    }
+                }
+            }
+#pragma unroll
+            for (uint32_t i = 0; i < ROWS; ++i) {
+                uint32_t packed =
+                        __byte_perm(w[i][6], 0, 0x4140);
+#pragma unroll
+                for (uint32_t t = 0; t < 4u; t += 2u) {
+                    const uint32_t lo = packed * 3u;
+                    packed = lo & 0x00FF00FFu;
+                    const uint32_t hi = packed * 3u;
+                    packed = hi & 0x00FF00FFu;
+                    const uint32_t q = __byte_perm(lo, hi, 0x7531);
+                    chunkDot[i][3] = __dp4a(
+                            static_cast<int>(q), act[3u * 8u + 6u + t / 2u],
+                            chunkDot[i][3]);
+                }
+                float dot = 0.0f;
+#pragma unroll
+                for (uint32_t k = 0; k < 4u; ++k) {
+                    const int32_t dsBits = act[32u + k];
+                    const half2 ds =
+                            *reinterpret_cast<const half2 *>(&dsBits);
+                    const int isum = static_cast<int>(
+                            __half_as_short(__high2half(ds)));
+                    dot += __low2float(ds) *
+                           static_cast<float>(chunkDot[i][k] - isum);
+                }
+                wScale[i] = __half2float(__ushort_as_half(
+                        static_cast<unsigned short>(w[i][6] >> 16)));
+                actDot[i] = dot;
+            }
+        }
+
+        // Fork's mul_mat_vec_ptq1_0_ks, plain one-column path (no gate fusion,
+        // no biases, no scales -- the engine applies those outside the GEMV).
+        template <uint32_t G, uint32_t RPT, uint32_t ROWS, uint32_t LB,
+                  uint32_t MINB>
+        __global__ void __launch_bounds__(LB, MINB) kQGemvPTQ1_0Stationary(
+                const uint8_t *__restrict__ weights,
+                const int32_t *__restrict__ actWords, float *__restrict__ out,
+                uint32_t ncols, uint32_t nrows, uint32_t rowBytes,
+                uint32_t bpr, bool smallKOrder) {
+            constexpr uint32_t R = G * RPT;
+            extern __shared__ float2 partial[]; // [R][bpr]
+            const uint32_t row0 = R * blockIdx.x;
+            const uint32_t nr = min(R, nrows - row0);
+            const uint32_t rowGroup = threadIdx.x / bpr;
+            const uint32_t kBlock = threadIdx.x - rowGroup * bpr;
+            ptq1KsPdlSync();
+            if (rowGroup < G) {
+                int act[36];
+                const int32_t *actCol = actWords + (kBlock >> 5) *
+                                                       kPtq1KsGroupWords +
+                                        (kBlock & 31u);
+#pragma unroll
+                for (uint32_t k = 0; k < 36u; ++k)
+                    act[k] = actCol[k * kPtq1KsGroupKb];
+#pragma unroll
+                for (uint32_t j = 0; j < RPT; j += ROWS) {
+                    uint32_t w[ROWS][7];
+#pragma unroll
+                    for (uint32_t i = 0; i < ROWS; ++i) {
+                        const uint32_t r = min(rowGroup + G * (j + i), nr - 1u);
+                        const uint32_t *p = reinterpret_cast<const uint32_t *>(
+                                weights + static_cast<uint64_t>(row0 + r) *
+                                                  rowBytes +
+                                static_cast<uint64_t>(kBlock) * 28u);
+#pragma unroll
+                        for (uint32_t k = 0; k < 7u; ++k) w[i][k] = p[k];
+                    }
+                    float wScale[ROWS];
+                    float actDot[ROWS];
+                    ptq1KsBlockDot<ROWS>(w, act, wScale, actDot);
+#pragma unroll
+                    for (uint32_t i = 0; i < ROWS; ++i) {
+                        const uint32_t r = rowGroup + G * (j + i);
+                        if (r < nr)
+                            partial[r * bpr + kBlock] =
+                                    make_float2(wScale[i], actDot[i]);
+                    }
+                }
+            }
+            __syncthreads();
+            const uint32_t span = smallKOrder ? 32u : 128u;
+            const uint32_t warp = threadIdx.x / 32u;
+            const uint32_t lane = threadIdx.x & 31u;
+            for (uint32_t r = warp; r < nr; r += blockDim.x / 32u) {
+                float sum = 0.0f;
+                const float2 *p = partial + r * bpr;
+                for (uint32_t k0 = 0; k0 < span; k0 += 32u) {
+                    float a = 0.0f;
+                    for (uint32_t k = k0 + lane; k < bpr; k += span) {
+                        const float2 v = p[k];
+                        a += v.x * v.y;
+                    }
+                    sum = k0 == 0u ? a : sum + a;
+                }
+#pragma unroll
+                for (uint32_t off = 16u; off > 0u; off >>= 1u)
+                    sum += __shfl_down_sync(0xFFFFFFFFu, sum, off);
+                if (lane == 0u) out[row0 + r] = sum;
+            }
+        }
+
+        // ------------------------------------------------------------------
+        // Generic mul_mat_vec_q PTQ1_0 one-column path, ported from the
+        // Prism fork (ggml-cuda/mmvq.cu).  On sm_75 the fork runs this
+        // kernel, not the Hopper-only k-block-stationary one.  Two
+        // geometries, chosen by the fork's small-k rule
+        // (blocks_per_row < nwarps * 32, nwarps = 4):
+        //   bpr < 128  -> warp-per-row: warp w owns row row0+w, lanes stride
+        //                 the K blocks (no shared memory, shuffle reduce)
+        //   bpr >= 128 -> one row per CTA, 128 threads cover the blocks,
+        //                 shared tree reduce
+        // Both read the SOA_ISUM grouped activation written by
+        // kQuantizePTQ1KsSoA.
+        // ------------------------------------------------------------------
+        template <uint32_t NW>
+        __global__ void __launch_bounds__(NW * 32u) kQGemvPTQ1_0WarpRow(
+                const uint8_t *__restrict__ weights,
+                const int32_t *__restrict__ actWords, float *__restrict__ out,
+                uint32_t ncols, uint32_t nrows, uint32_t rowBytes,
+                uint32_t bpr) {
+            const uint32_t lane = threadIdx.x & 31u;
+            const uint32_t warp = threadIdx.x >> 5;
+            const uint32_t row = blockIdx.x * NW + warp;
+            if (row >= nrows) return;
+            float acc = 0.0f;
+            const uint8_t *rowBase = weights + static_cast<uint64_t>(row) * rowBytes;
+            for (uint32_t kb = lane; kb < bpr; kb += 32u) {
+                int act[36];
+                const int32_t *actCol = actWords + (kb >> 5) *
+                                                       kPtq1KsGroupWords +
+                                        (kb & 31u);
+#pragma unroll
+                for (uint32_t k = 0; k < 36u; ++k)
+                    act[k] = actCol[k * kPtq1KsGroupKb];
+                uint32_t wr[1][7];
+                const uint32_t *p = reinterpret_cast<const uint32_t *>(
+                        rowBase + static_cast<uint64_t>(kb) * 28u);
+#pragma unroll
+                for (uint32_t k = 0; k < 7u; ++k) wr[0][k] = p[k];
+                float wScale[1];
+                float actDot[1];
+                ptq1KsBlockDot<1u>(wr, act, wScale, actDot);
+                acc += wScale[0] * actDot[0];
+            }
+#pragma unroll
+            for (uint32_t off = 16u; off > 0u; off >>= 1u)
+                acc += __shfl_down_sync(0xFFFFFFFFu, acc, off);
+            if (lane == 0u) out[row] = acc;
+        }
+
+        __global__ void __launch_bounds__(128) kQGemvPTQ1_0CtaRow(
+                const uint8_t *__restrict__ weights,
+                const int32_t *__restrict__ actWords, float *__restrict__ out,
+                uint32_t ncols, uint32_t nrows, uint32_t rowBytes,
+                uint32_t bpr) {
+            __shared__ float partial[128];
+            const uint32_t tid = threadIdx.x;
+            const uint32_t row = blockIdx.x;
+            const uint8_t *rowBase = weights + static_cast<uint64_t>(row) * rowBytes;
+            float acc = 0.0f;
+            for (uint32_t kb = tid; kb < bpr; kb += 128u) {
+                int act[36];
+                const int32_t *actCol = actWords + (kb >> 5) *
+                                                       kPtq1KsGroupWords +
+                                        (kb & 31u);
+#pragma unroll
+                for (uint32_t k = 0; k < 36u; ++k)
+                    act[k] = actCol[k * kPtq1KsGroupKb];
+                uint32_t wr[1][7];
+                const uint32_t *p = reinterpret_cast<const uint32_t *>(
+                        rowBase + static_cast<uint64_t>(kb) * 28u);
+#pragma unroll
+                for (uint32_t k = 0; k < 7u; ++k) wr[0][k] = p[k];
+                float wScale[1];
+                float actDot[1];
+                ptq1KsBlockDot<1u>(wr, act, wScale, actDot);
+                acc += wScale[0] * actDot[0];
+            }
+            partial[tid] = acc;
+            __syncthreads();
+#pragma unroll
+            for (uint32_t span = 64u; span > 0u; span >>= 1u) {
+                if (tid < span) partial[tid] += partial[tid + span];
+                __syncthreads();
+            }
+            if (tid == 0u) out[row] = partial[0];
+        }
+
+        // Warp-per-row against the PT activation layout: nine int4 loads per
+        // 128-weight block instead of 36 strided 4-byte words, with the warp's
+        // 32 lanes covering 512 contiguous bytes per load.  Same dot product
+        // as kQGemvPTQ1_0WarpRow, only the activation fetch differs.
+        template <uint32_t NW>
+        __global__ void __launch_bounds__(NW * 32u) kQGemvPTQ1_0WarpRowPt(
+                const uint8_t *__restrict__ weights,
+                const int32_t *__restrict__ actWords, float *__restrict__ out,
+                uint32_t ncols, uint32_t nrows, uint32_t rowBytes,
+                uint32_t bpr) {
+            const uint32_t lane = threadIdx.x & 31u;
+            const uint32_t warp = threadIdx.x >> 5u;
+            const uint32_t row = blockIdx.x * NW + warp;
+            if (row >= nrows) return;
+            const uint8_t *rowBase =
+                    weights + static_cast<uint64_t>(row) * rowBytes;
+            const int4 *act4 = reinterpret_cast<const int4 *>(actWords);
+            float acc = 0.0f;
+            for (uint32_t kb = lane; kb < bpr; kb += 32u) {
+                int4 piece[9];
+#pragma unroll
+                for (uint32_t t = 0; t < 8u; ++t) piece[t] = act4[t * bpr + kb];
+                piece[8] = act4[8u * bpr + kb];
+                int act[36];
+#pragma unroll
+                for (uint32_t t = 0; t < 8u; ++t) {
+                    act[4u * t + 0u] = piece[t].x;
+                    act[4u * t + 1u] = piece[t].y;
+                    act[4u * t + 2u] = piece[t].z;
+                    act[4u * t + 3u] = piece[t].w;
+                }
+                act[32] = piece[8].x;
+                act[33] = piece[8].y;
+                act[34] = piece[8].z;
+                act[35] = piece[8].w;
+                uint32_t wr[1][7];
+                const uint32_t *p = reinterpret_cast<const uint32_t *>(
+                        rowBase + static_cast<uint64_t>(kb) * 28u);
+#pragma unroll
+                for (uint32_t k = 0; k < 7u; ++k) wr[0][k] = p[k];
+                float wScale[1];
+                float actDot[1];
+                ptq1KsBlockDot<1u>(wr, act, wScale, actDot);
+                acc += wScale[0] * actDot[0];
+            }
+#pragma unroll
+            for (uint32_t off = 16u; off > 0u; off >>= 1u)
+                acc += __shfl_down_sync(0xFFFFFFFFu, acc, off);
+            if (lane == 0u) out[row] = acc;
+        }
+
+        // Warp-per-row-group variant: one warp owns RPT rows and each lane        // Warp-per-row-group variant: one warp owns RPT rows and each lane
+        // strides the K blocks, so the 36 activation words are loaded once for
+        // RPT rows (the fork's warp-per-row reloads them per row) and the
+        // reduction stays a shuffle, with no shared memory.
+        template <uint32_t NW, uint32_t RPT>
+        __global__ void __launch_bounds__(NW * 32u) kQGemvPTQ1_0WarpRows(
+                const uint8_t *__restrict__ weights,
+                const int32_t *__restrict__ actWords, float *__restrict__ out,
+                uint32_t ncols, uint32_t nrows, uint32_t rowBytes,
+                uint32_t bpr) {
+            const uint32_t lane = threadIdx.x & 31u;
+            const uint32_t warp = threadIdx.x >> 5;
+            const uint32_t row0 = (blockIdx.x * NW + warp) * RPT;
+            float acc[RPT];
+#pragma unroll
+            for (uint32_t i = 0; i < RPT; ++i) acc[i] = 0.0f;
+            for (uint32_t kb = lane; kb < bpr; kb += 32u) {
+                int act[36];
+                const int32_t *actCol = actWords + (kb >> 5) *
+                                                       kPtq1KsGroupWords +
+                                        (kb & 31u);
+#pragma unroll
+                for (uint32_t k = 0; k < 36u; ++k)
+                    act[k] = actCol[k * kPtq1KsGroupKb];
+#pragma unroll
+                for (uint32_t i = 0; i < RPT; ++i) {
+                    const uint32_t row = row0 + i;
+                    if (row >= nrows) continue;
+                    uint32_t wr[1][7];
+                    const uint32_t *p = reinterpret_cast<const uint32_t *>(
+                            weights + static_cast<uint64_t>(row) * rowBytes +
+                            static_cast<uint64_t>(kb) * 28u);
+#pragma unroll
+                    for (uint32_t k = 0; k < 7u; ++k) wr[0][k] = p[k];
+                    float wScale[1];
+                    float actDot[1];
+                    ptq1KsBlockDot<1u>(wr, act, wScale, actDot);
+                    acc[i] += wScale[0] * actDot[0];
+                }
+            }
+#pragma unroll
+            for (uint32_t i = 0; i < RPT; ++i) {
+                float v = acc[i];
+#pragma unroll
+                for (uint32_t off = 16u; off > 0u; off >>= 1u)
+                    v += __shfl_down_sync(0xFFFFFFFFu, v, off);
+                if (lane == 0u && row0 + i < nrows) out[row0 + i] = v;
+            }
+        }
+
+        inline bool ptq1GenericEnabled() {
+            static const bool on = [] {
+                const char *e = std::getenv("TINYCODER_PT_GEN");
+                return e != nullptr && e[0] == '1';
+            }();
+            return on;
+        }
+
+        // Fork's one-column geometry: small-k (bpr < nwarps*32) takes the
+        // warp-per-row kernel with 4 warps; otherwise one row per CTA with
+        // 128 threads.  Returns false only for shapes this table cannot run.
+        inline bool launchQGemvPTQ1_0GenericWords(
+                const uint8_t *w, const int32_t *actWords, float *out,
+                uint32_t rows, uint32_t cols, uint32_t rowBytes, uint32_t bpr) {
+            if (bpr == 0u || (cols % 32u) != 0u || cols != bpr * 128u)
+                return false;
+            static const bool forceWarpRow = [] {
+                const char *e = std::getenv("TINYCODER_PT_GEN_ALL");
+                return e != nullptr && e[0] == '1';
+            }();
+            static const bool ptMode = [] {
+                const char *e = std::getenv("TINYCODER_PT_PT");
+                return e == nullptr || e[0] != '0';
+            }();
+            if (ptMode) {
+                const uint32_t grid = (rows + 3u) / 4u;
+                kQGemvPTQ1_0WarpRowPt<4u><<<grid, 128u, 0, g_stream>>>(
+                        w, actWords, out, cols, rows, rowBytes, bpr);
+                return true;
+            }
+            if (bpr < 128u || forceWarpRow) {
+                static const uint32_t rptSel = [] {
+                    const char *e = std::getenv("TINYCODER_PT_GEN_RPT");
+                    return e != nullptr && e[0] == '4' ? 4u
+                           : (e != nullptr && e[0] == '2') ? 2u
+                                                          : 1u;
+                }();
+                if (rptSel == 4u) {
+                    const uint32_t grid = (rows + 15u) / 16u;
+                    kQGemvPTQ1_0WarpRows<4u, 4u><<<grid, 128u, 0, g_stream>>>(
+                            w, actWords, out, cols, rows, rowBytes, bpr);
+                    return true;
+                }
+                if (rptSel == 2u) {
+                    const uint32_t grid = (rows + 7u) / 8u;
+                    kQGemvPTQ1_0WarpRows<4u, 2u><<<grid, 128u, 0, g_stream>>>(
+                            w, actWords, out, cols, rows, rowBytes, bpr);
+                    return true;
+                }
+                static const uint32_t nwSel = [] {
+                    const char *e = std::getenv("TINYCODER_PT_GEN_NW");
+                    return e != nullptr && e[0] == '8' ? 8u : 4u;
+                }();
+                if (nwSel == 8u) {
+                    const uint32_t grid = (rows + 7u) / 8u;
+                    kQGemvPTQ1_0WarpRow<8u><<<grid, 256u, 0, g_stream>>>(
+                            w, actWords, out, cols, rows, rowBytes, bpr);
+                } else {
+                    const uint32_t grid = (rows + 3u) / 4u;
+                    kQGemvPTQ1_0WarpRow<4u><<<grid, 128u, 0, g_stream>>>(
+                            w, actWords, out, cols, rows, rowBytes, bpr);
+                }
+            } else {
+                kQGemvPTQ1_0CtaRow<<<rows, 128, 0, g_stream>>>(
+                        w, actWords, out, cols, rows, rowBytes, bpr);
+            }
+            return true;
+        }
+
+        // Quantize + GEMV (the original entry point): callers that already
+        // produced the SoA words (the fused fold+quantize kernel) use
+        // launchQGemvPTQ1_0GenericWords directly.
+        inline bool launchQGemvPTQ1_0Generic(
+                const uint8_t *w, const float *act, int32_t *actWords,
+                float *out, uint32_t rows, uint32_t cols, uint32_t rowBytes,
+                uint32_t bpr) {
+            if (bpr == 0u || (cols % 32u) != 0u || cols != bpr * 128u)
+                return false;
+            const uint32_t chunks = cols / 32u;
+            kQuantizePTQ1KsSoA<<<(chunks + 3u) / 4u, 128, 0, g_stream>>>(
+                    act, actWords, chunks);
+            return launchQGemvPTQ1_0GenericWords(w, actWords, out, rows, cols,
+                                                 rowBytes, bpr);
+        }
+
+        inline bool ptq1KsEnabled() {
+            static const bool on = [] {
+                const char *e = std::getenv("TINYCODER_PT_KS");
+                return e != nullptr && e[0] == '1';
+            }();
+            return on;
+        }
+
+        // Fork's per-shape launch table (plain 2D one-column calls):
+        //   bpr 33..63   -> G=4 RPT=2 ROWS=2 LB=256 MINB=4 small-k order
+        //   bpr 129..160 -> G=1 RPT=8 ROWS=2 LB=160 MINB=6, 4-warp order
+        // Returns false outside the table so the caller can fall back.
+        inline bool launchQGemvPTQ1_0Stationary(
+                const uint8_t *w, const float *act, int32_t *actWords,
+                float *out, uint32_t rows, uint32_t cols, uint32_t rowBytes,
+                uint32_t bpr) {
+            if (rows < 4096u || (cols % 32u) != 0u || bpr == 0u) return false;
+            if (bpr <= 32u || bpr >= 64u) {
+                if (bpr <= 128u || bpr > 160u) return false;
+            }
+            const uint32_t chunks = cols / 32u;
+            kQuantizePTQ1KsSoA<<<(chunks + 3u) / 4u, 128, 0, g_stream>>>(
+                    act, actWords, chunks);
+            const uint32_t R = (bpr > 128u) ? 8u : 8u;
+            const uint32_t threads =
+                    (bpr > 128u) ? ((bpr + 31u) / 32u) * 32u
+                                 : ((4u * bpr + 31u) / 32u) * 32u;
+            const uint32_t grid = (rows + R - 1u) / R;
+            const size_t smem = static_cast<size_t>(R) * bpr * sizeof(float2);
+            if (bpr > 128u) {
+                kQGemvPTQ1_0Stationary<1u, 8u, 2u, 160u, 6u>
+                        <<<grid, threads, smem, g_stream>>>(
+                                w, actWords, out, cols, rows, rowBytes, bpr,
+                                false);
+            } else {
+                kQGemvPTQ1_0Stationary<4u, 2u, 2u, 256u, 4u>
+                        <<<grid, threads, smem, g_stream>>>(
+                                w, actWords, out, cols, rows, rowBytes, bpr,
+                                true);
+            }
+            return true;
+        }
+
+        inline bool ptq1SplitKEnabled() {
+            static const bool on = [] {
+                const char *e = std::getenv("TINYCODER_PT_SPLITK");
+                return e != nullptr && e[0] == '1';
+            }();
+            return on;
+        }
+
+        inline bool ptq1Q8Enabled() {
+            static const bool on = [] {
+                const char *e = std::getenv("TINYCODER_PT_Q8");
+                return e != nullptr && e[0] == '1';
+            }();
+            return on;
+        }
+
+        inline void launchQGemvPQ2_0Q8(const uint8_t *w, const int8_t *xq,
+                                       const float *xd, float *out,
+                                       uint32_t rows, uint32_t cols,
+                                       uint32_t rowBytes,
+                                       uint32_t blocksPerRow) {
+            switch (pq2Q8Rows()) {
+                case 1u:
+                    kQGemvPQ2_0Q8F<1u><<<(rows + 3u) / 4u, 128, 0, g_stream>>>(
+                            w, xq, xd, out, rows, cols, rowBytes, blocksPerRow);
+                    break;
+                case 2u:
+                    kQGemvPQ2_0Q8F<2u><<<(rows + 7u) / 8u, 128, 0, g_stream>>>(
+                            w, xq, xd, out, rows, cols, rowBytes, blocksPerRow);
+                    break;
+                case 8u:
+                    kQGemvPQ2_0Q8F<8u><<<(rows + 31u) / 32u, 128, 0, g_stream>>>(
+                            w, xq, xd, out, rows, cols, rowBytes, blocksPerRow);
+                    break;
+                default:
+                    kQGemvPQ2_0Q8F<4u><<<(rows + 15u) / 16u, 128, 0, g_stream>>>(
+                            w, xq, xd, out, rows, cols, rowBytes, blocksPerRow);
+                    break;
+            }
+        }
+
+        // Batched forward Prism transform, fp32 out: identical math to
+        // kPrismFold (sign flip, optional GDN value-head permutation, blockwise
+        // normalized Hadamard), one row per blockIdx.y.  Used by the int8
+        // tensor-core prefill spike, which quantises the activation itself.
+        __global__ void kPrismFoldB(const float *__restrict__ v,
+                                    float *__restrict__ dst, uint32_t n,
+                                    const float *__restrict__ signs,
+                                    uint32_t gdnHeadV, uint32_t gdnNk,
+                                    uint32_t gdnRep, uint32_t rowStride) {
+            __shared__ float tile[kPrismBlock];
+            const uint32_t base = blockIdx.x * kPrismBlock;
+            const uint32_t s = blockIdx.y;
+            const uint32_t tid = threadIdx.x;
+            const uint32_t have = (base < n) ? ((n - base < kPrismBlock)
+                                                        ? (n - base)
+                                                        : kPrismBlock)
+                                             : 0u;
+            if (have == 0u) return;
+            const float *src = v + static_cast<size_t>(s) * rowStride;
+            float *dp = dst + static_cast<size_t>(s) * rowStride;
+            const bool perm = (gdnRep > 1u && gdnHeadV > 0u && gdnNk > 0u);
+            for (uint32_t i = tid; i < kPrismBlock; i += blockDim.x) {
+                float val = 0.0f;
+                if (i < have) {
+                    const uint32_t g = base + i;
+                    const uint32_t si =
+                            perm ? prismGdnSrcIndex(g, gdnHeadV, gdnNk, gdnRep) : g;
+                    val = src[si];
+                    if (signs != nullptr) val *= signs[g];
+                }
+                tile[i] = val;
+            }
+            __syncthreads();
+            prismFwhtShared(tile, kPrismBlock, tid, blockDim.x);
+            for (uint32_t i = tid; i < have; i += blockDim.x) {
+                dp[base + i] = tile[i];
+            }
+        }
+
+        // PQ2_0 packed ternary -> fp16 twin, for the batched prefill GEMM.
+        // block = 256 (8 warps); each warp expands one 34-byte block: lane l owns
+        // columns [4l, 4l+4) of the 128-wide group, value = d * (code - 1), which
+        // is exact in fp16 (ternary times the fp16 group scale).  grid =
+        // (rows, ceil(blocksPerRow / 8)).
+        __global__ void kDequantPQ2_0ToF16(const uint8_t *__restrict__ w,
+                                           __half *__restrict__ out, uint32_t rows,
+                                           uint32_t cols, uint32_t rowBytes,
+                                           uint32_t blocksPerRow) {
+            const uint32_t row = blockIdx.x;
+            if (row >= rows) return;
+            const uint32_t warp = threadIdx.x >> 5;
+            const uint32_t lane = threadIdx.x & 31u;
+            const uint32_t warps = blockDim.x >> 5;
+            const uint8_t *rp = w + static_cast<uint64_t>(row) * rowBytes;
+            __half *op = out + static_cast<uint64_t>(row) * cols;
+            // One warp per 128-block, 8-byte (four half) stores.  The previous
+            // version launched one block per (row, 8 blocks) and had each warp
+            // expand exactly one block: 87,040 blocks of 256 threads for a
+            // 17408x5120 matrix, measured 150 GB/s of write+read traffic.  Here
+            // one block owns a whole row (all blocks of it), which is the same
+            // work with 1/5 the blocks and 8x the work per warp.
+            for (uint32_t b = warp; b < blocksPerRow; b += warps) {
+                const uint8_t *blk =
+                        rp + static_cast<uint64_t>(b) * kPQ2_0_BYTES;
+                const float d =
+                        __half2float(*reinterpret_cast<const __half *>(blk));
+                const uint8_t qb = blk[2u + lane];
+                const uint32_t base = b * 128u + lane * 4u;
+                const __half2 h01 = __floats2half2_rn(
+                        d * (static_cast<float>(qb & 3u) - 1.0f),
+                        d * (static_cast<float>((qb >> 2u) & 3u) - 1.0f));
+                const __half2 h23 = __floats2half2_rn(
+                        d * (static_cast<float>((qb >> 4u) & 3u) - 1.0f),
+                        d * (static_cast<float>((qb >> 6u) & 3u) - 1.0f));
+                if (base + 3u < cols) {
+                    uint2 v;
+                    v.x = *reinterpret_cast<const uint32_t *>(&h01);
+                    v.y = *reinterpret_cast<const uint32_t *>(&h23);
+                    *reinterpret_cast<uint2 *>(op + base) = v;
+                } else {
+                    const float vv[4] = {d * (static_cast<float>(qb & 3u) - 1.0f),
+                                         d * (static_cast<float>((qb >> 2u) & 3u) -
+                                              1.0f),
+                                         d * (static_cast<float>((qb >> 4u) & 3u) -
+                                              1.0f),
+                                         d * (static_cast<float>((qb >> 6u) & 3u) -
+                                              1.0f)};
+                    for (uint32_t j = 0; j < 4u; ++j) {
+                        if (base + j < cols) {
+                            op[base + j] = __float2half(vv[j]);
+                        }
+                    }
+                }
+            }
+        }
+
+        // PQ2_0 packed ternary -> GGML Q8_0 block layout (34 B per 32 weights:
+        // fp16 d + 32 int8).  Each PQ2_0 128-weight block becomes four Q8_0
+        // blocks that all carry the block's fp16 scale, and the int8 payload is
+        // the code itself minus one -- i.e. exactly the value the ternary block
+        // represents, so d32 * q8 == d * (code - 1) is exact.  This is the
+        // weight side of the P1 spike: it lets the engine's existing int8
+        // tensor-core GEMM (mma.s8.m8n8k16, stream-k) consume PQ2_0 weights, so
+        // the IMMA rate can be measured on the real shapes in situ.
+        // grid = rows, block = 256; one warp per 128-weight block.
+        __global__ void kDequantPQ2_0ToQ8_0(const uint8_t *__restrict__ w,
+                                            uint8_t *__restrict__ out,
+                                            uint32_t rows, uint32_t cols,
+                                            uint32_t rowBytes,
+                                            uint32_t blocksPerRow) {
+            const uint32_t row = blockIdx.x;
+            if (row >= rows) return;
+            const uint32_t warp = threadIdx.x >> 5;
+            const uint32_t lane = threadIdx.x & 31u;
+            const uint32_t warps = blockDim.x >> 5;
+            const uint8_t *rp = w + static_cast<uint64_t>(row) * rowBytes;
+            // one Q8_0 block per 32 columns
+            uint8_t *op = out + static_cast<uint64_t>(row) *
+                                         (static_cast<uint64_t>(cols / 32u) * 34u);
+            for (uint32_t b = warp; b < blocksPerRow; b += warps) {
+                const uint8_t *blk =
+                        rp + static_cast<uint64_t>(b) * kPQ2_0_BYTES;
+                const uint16_t d = *reinterpret_cast<const uint16_t *>(blk);
+                const uint8_t qb = blk[2u + lane];
+                // this lane's four codes are columns 4*lane..4*lane+3 of the
+                // 128-column block, hence Q8_0 block (lane >> 3) at offset
+                // (4*lane) & 31
+                uint8_t *dst = op + static_cast<uint64_t>(b * 4u + (lane >> 3)) *
+                                              34u;
+                dst[0] = static_cast<uint8_t>(d & 0xFFu);
+                dst[1] = static_cast<uint8_t>(d >> 8);
+                int8_t *qs = reinterpret_cast<int8_t *>(dst + 2u);
+                const uint32_t off = (lane & 7u) * 4u;
+                qs[off + 0] = static_cast<int8_t>(static_cast<int>(qb & 3u) - 1);
+                qs[off + 1] =
+                        static_cast<int8_t>(static_cast<int>((qb >> 2u) & 3u) - 1);
+                qs[off + 2] =
+                        static_cast<int8_t>(static_cast<int>((qb >> 4u) & 3u) - 1);
+                qs[off + 3] =
+                        static_cast<int8_t>(static_cast<int>((qb >> 6u) & 3u) - 1);
+            }
+        }
+
         // PQ2_0 token-embedding dequant + INVERSE fold (S then H -> rotate then
         // sign).  grid = seqLen tokens; block = 256.  Dequantizes the ternary
         // row into `hidden`, then applies the blockwise FWHT + signs in place so
@@ -2913,6 +5029,56 @@ namespace tinycoder::gpu {
                     if (c < hiddenSize)
                         h[c] = d * (static_cast<float>((qb >> (j * 2u)) & 3u) -
                                     1.0f);
+                }
+            }
+            __syncthreads();
+            for (uint32_t base = 0; base + kPrismBlock <= hiddenSize;
+                 base += kPrismBlock) {
+                for (uint32_t i = tid; i < kPrismBlock; i += blockDim.x)
+                    tile[i] = h[base + i];
+                __syncthreads();
+                prismFwhtShared(tile, kPrismBlock, tid, blockDim.x);
+                for (uint32_t i = tid; i < kPrismBlock; i += blockDim.x) {
+                    float val = tile[i];
+                    if (signs != nullptr) val *= signs[base + i];
+                    h[base + i] = val;
+                }
+                __syncthreads();
+            }
+        }
+
+        // Native PTQ1_0 token-embedding dequant + inverse fold.  Lane p owns
+        // the four columns 4p..4p+3 of one 128-weight block, exactly the int
+        // that ptq1DecodeInt returns; the rest (FWHT, signs) is identical.
+        __global__ void kEmbedDequantPTQ1_0(
+                const uint8_t *__restrict__ embed,
+                const int32_t *__restrict__ tokens, float *__restrict__ hidden,
+                uint32_t seqLen, uint32_t hiddenSize, uint32_t blocksPerRow,
+                uint32_t rowBytes, uint32_t vocabSize,
+                const float *__restrict__ signs) {
+            const uint32_t s = blockIdx.x;
+            if (s >= seqLen) return;
+            const int32_t t = tokens[s];
+            if (t < 0 || static_cast<uint32_t>(t) >= vocabSize) return;
+            const uint8_t *row = embed + static_cast<uint64_t>(t) * rowBytes;
+            float *h = hidden + static_cast<size_t>(s) * hiddenSize;
+            __shared__ float tile[kPrismBlock];
+            const uint32_t tid = threadIdx.x;
+            const uint32_t lane = tid & 31u, warp = tid >> 5;
+            const uint32_t warps = blockDim.x >> 5;
+            for (uint32_t b = warp; b < blocksPerRow; b += warps) {
+                const uint8_t *blk =
+                        row + static_cast<uint64_t>(b) * kPTQ1_0_BYTES;
+                const float d =
+                        __half2float(*reinterpret_cast<const __half *>(blk + 26u));
+                const uint32_t q = ptq1DecodeInt(blk, lane);
+                const uint32_t base = b * 128u + lane * 4u;
+#pragma unroll
+                for (uint32_t j = 0; j < 4u; ++j) {
+                    const uint32_t c = base + j;
+                    if (c < hiddenSize)
+                        h[c] = d * static_cast<float>(static_cast<int8_t>(
+                                             (q >> (j * 8u)) & 0xFFu));
                 }
             }
             __syncthreads();
@@ -10343,14 +12509,19 @@ namespace tinycoder::gpu {
                 kQGemvSmall32<kTypeIQ4NL><<<nBlocks, block, 0, g_stream>>>(
                         static_cast<const uint8_t *>(wq), x, out, rows, cols,
                         rowBytes, blocksPerRow);
+            } else if (type == kTypePTQ1_0) {
+                launchQGemvPTQ1_0(static_cast<const uint8_t *>(wq), x, out, rows,
+                                  cols, rowBytes, blocksPerRow);
             } else if (type == kTypePQ2_0) {
-                // Prism PQ2_0 (Bonsai) ternary GEMV: 128-wide blocks (34 B), one
-                // warp per output row (grid = rows, NOT nBlocks).  The `x` here
-                // is already the folded activation H S P x (the caller applies
-                // kPrismFold first).
-                kQGemvPQ2_0<<<rows, 32, 0, g_stream>>>(
-                        static_cast<const uint8_t *>(wq), x, out, rows, cols,
-                        rowBytes, blocksPerRow);
+                // Prism PQ2_0 (Bonsai) ternary GEMV: 128-wide blocks (34 B), four
+                // output rows per 128-thread block.  The `x` here is already the
+                // folded activation H S P x (the caller applies kPrismFold first).
+                // The float4 activation load needs cols % 4 == 0 and a 16-byte
+                // aligned x; every Prism width is a multiple of 128 and every
+                // activation buffer comes from cudaMalloc, so this is the normal
+                // path (the kernel still guards each access).
+                launchQGemvPQ2_0(static_cast<const uint8_t *>(wq), x, out, rows,
+                                 cols, rowBytes, blocksPerRow);
             } else if (type == kTypeQ8_0) {
                 // Q8_0: integer Q8_32 activation GEMV, bit-exact with the CPU
                 // matMulVecBatchQ8_0_Q8K_AVX2 (quantize x per 32-block, exact
@@ -11152,8 +13323,8 @@ namespace tinycoder::gpu {
                 type == kTypeIQ4NL) {
                 return (cols + 31) / 32;// 32-wide legacy blocks
             }
-            if (type == kTypePQ2_0) {
-                return (cols + 127) / 128;// PQ2_0 (Prism ternary) 128-wide blocks
+            if (type == kTypePQ2_0 || type == kTypePTQ1_0) {
+                return (cols + 127) / 128;// Prism ternary 128-wide blocks
             }
             return (cols + 255) / 256;// K-quant blocks (256 wide)
         }
@@ -11841,6 +14012,152 @@ namespace tinycoder::gpu {
             }
         }
 
+        // Decode-only fusion of the two 48-row F32 GDN projections
+        // (ssm_alpha, ssm_beta) with their per-head epilogue.  One launch
+        // instead of three: blockIdx < rows computes alpha's row (=head) and
+        // applies gateV = softplus(alpha + dt_bias) * ssm_a; the rest compute
+        // beta's row and apply beta = sigmoid(beta).  The per-row dot is the
+        // SAME per-thread strided accumulation plus warp/shared reduction as
+        // kQ35F32Gemv (bit-identical), and the epilogue is the same expression
+        // as kQ35BetaGate, so this is a pure launch fusion.
+        __global__ void kQ35F32GemvDualBeta(
+                const float *__restrict__ x, const float *__restrict__ wAlpha,
+                const float *__restrict__ wBeta, float *__restrict__ outAlpha,
+                float *__restrict__ outBeta,
+                const float *__restrict__ dtBias,
+                const float *__restrict__ aBroadcast, uint32_t rows,
+                uint32_t cols) {
+            const uint32_t bi = blockIdx.x;
+            const bool isBeta = bi >= rows;
+            const uint32_t row = isBeta ? (bi - rows) : bi;
+            if (row >= rows) return;
+            const float *w = (isBeta ? wBeta : wAlpha) +
+                             static_cast<size_t>(row) * cols;
+            float acc = 0.0f;
+            for (uint32_t i = threadIdx.x; i < cols; i += blockDim.x) {
+                acc = fmaf(x[i], w[i], acc);
+            }
+            for (uint32_t off = 16; off; off >>= 1) {
+                acc += __shfl_down_sync(0xffffffffu, acc, off);
+            }
+            __shared__ float srow[32];
+            if (threadIdx.x % 32 == 0) srow[threadIdx.x / 32] = acc;
+            __syncthreads();
+            if (threadIdx.x == 0) {
+                float sum = 0.0f;
+                for (uint32_t wq = 0; wq < blockDim.x / 32; ++wq)
+                    sum += srow[wq];
+                if (isBeta) {
+                    outBeta[row] = q35Sigmoid(sum);
+                } else {
+                    const float a = q35Softplus(sum + dtBias[row]);
+                    outAlpha[row] = a * aBroadcast[row];
+                }
+            }
+        }
+
+        // Decode-step fusion of kQ35L2NormHeads and the beta/alpha GEMV.
+        // Both are per (token, head) and both must finish before the scan, so
+        // they were two launches back to back for no reason: the norm's 128
+        // values and the two 5120-dots are microseconds of work each and the
+        // trace put four GDN launches at 26 us/layer.  One 256-thread block per
+        // head: lanes 0..127 normalise q, 128..255 normalise k (and copy v), then
+        // all 256 threads run the beta dot, then the alpha dot, with the same
+        // warp-shfl + smem reduce and the same epilogue as kQ35F32GemvDualBeta.
+        // The norm keeps its double accumulation and 1e-6 floor verbatim.
+        __global__ void kQ35NormBetaAlpha(
+                const float *__restrict__ convOut, float *__restrict__ qN,
+                float *__restrict__ kN, float *__restrict__ vN,
+                const float *__restrict__ x, const float *__restrict__ wAlpha,
+                const float *__restrict__ wBeta, float *__restrict__ outAlpha,
+                float *__restrict__ outBeta, const float *__restrict__ dtBias,
+                const float *__restrict__ aBroadcast, uint32_t headK,
+                uint32_t headV, uint32_t nKHeads, uint32_t nVHeads,
+                uint32_t keyDim, uint32_t valueDim, uint32_t vHeadsTiled,
+                uint32_t cols) {
+            const uint32_t s = blockIdx.x;
+            const uint32_t hv = blockIdx.y;
+            if (s >= 1u || hv >= nVHeads) return;
+            const uint32_t nk = nKHeads > 0u ? nKHeads : 1u;
+            const uint32_t hk = vHeadsTiled != 0u ? hv % nk : hv / (nVHeads / nk);
+            const float *conv = convOut + static_cast<size_t>(s) *
+                                                  (2 * keyDim + valueDim);
+            const float *qSrc = conv + static_cast<size_t>(hk) * headK;
+            const float *kSrc = conv + keyDim + static_cast<size_t>(hk) * headK;
+            const float *vSrc = conv + 2 * keyDim +
+                                static_cast<size_t>(hv) * headV;
+            const uint32_t t = threadIdx.x;
+            __shared__ float siq, sik;
+            __shared__ float red[32];
+            // ---- phase 1: per-head L2 norms (double accumulate, 1e-6 floor)
+            if (t < 128u) {
+                const bool isK = t >= 64u;
+                const uint32_t lane = t & 63u;
+                const float *src = isK ? kSrc : qSrc;
+                double acc = 0.0;
+                for (uint32_t j = lane; j < headK; j += 64u) {
+                    const double v = src[j];
+                    acc += v * v;
+                }
+                for (uint32_t off = 16u; off; off >>= 1u)
+                    acc += __shfl_down_sync(0xffffffffu, acc, off);
+                if ((t & 31u) == 0u) red[t >> 5] = static_cast<float>(acc);
+            }
+            __syncthreads();
+            if (t == 0) {
+                float sq = 0.0f, sk = 0.0f;
+                for (uint32_t g = 0; g < 2u; ++g) sq += red[g];
+                for (uint32_t g = 2u; g < 4u; ++g) sk += red[g];
+                siq = rsqrtf(sq > 1e-6f ? sq : 1e-6f);
+                sik = rsqrtf(sk > 1e-6f ? sk : 1e-6f);
+            }
+            __syncthreads();
+            // ---- phase 2: write qN/kN/vN (no reduction needed)
+            // Destination heads are indexed by VALUE head, not key head: the
+            // source (convOut) is indexed by hk.  Getting this wrong silently
+            // mixes q/k heads and still answers short questions.
+            const size_t qBase = static_cast<size_t>(s * nVHeads + hv) * headK;
+            const size_t vBase = static_cast<size_t>(s * nVHeads + hv) * headV;
+            for (uint32_t j = t; j < headK; j += blockDim.x) {
+                qN[qBase + j] = qSrc[j] * siq;
+                kN[qBase + j] = kSrc[j] * sik;
+            }
+            for (uint32_t j = t; j < headV; j += blockDim.x)
+                vN[vBase + j] = vSrc[j];
+            // ---- phase 3: beta and alpha dots (same math as the dual GEMV)
+            const uint32_t bi = hv;
+            float acc = 0.0f;
+            const float *wb = wBeta + static_cast<size_t>(bi) * cols;
+            for (uint32_t i = t; i < cols; i += blockDim.x)
+                acc = fmaf(x[i], wb[i], acc);
+            for (uint32_t off = 16u; off; off >>= 1u)
+                acc += __shfl_down_sync(0xffffffffu, acc, off);
+            __syncthreads();
+            if ((t & 31u) == 0u) red[t >> 5] = acc;
+            __syncthreads();
+            if (t == 0) {
+                float sum = 0.0f;
+                for (uint32_t g = 0; g < blockDim.x / 32u; ++g) sum += red[g];
+                outBeta[bi] = q35Sigmoid(sum);
+            }
+            __syncthreads();
+            const float *wa = wAlpha + static_cast<size_t>(bi) * cols;
+            acc = 0.0f;
+            for (uint32_t i = t; i < cols; i += blockDim.x)
+                acc = fmaf(x[i], wa[i], acc);
+            for (uint32_t off = 16u; off; off >>= 1u)
+                acc += __shfl_down_sync(0xffffffffu, acc, off);
+            __syncthreads();
+            if ((t & 31u) == 0u) red[t >> 5] = acc;
+            __syncthreads();
+            if (t == 0) {
+                float sum = 0.0f;
+                for (uint32_t g = 0; g < blockDim.x / 32u; ++g) sum += red[g];
+                const float a = q35Softplus(sum + dtBias[bi]);
+                outAlpha[bi] = a * aBroadcast[bi];
+            }
+        }
+
         // Batched F32 projection: one block per (row, token) running the SAME
         // per-thread strided dot + warp/shared reduction as kQ35F32Gemv, so
         // every element is bit-identical to the per-token decode GEMV.  The
@@ -12133,6 +14450,39 @@ namespace tinycoder::gpu {
                 convState[i * channels + c] = convState[(i + 1) * channels + c];
             }
             if (K >= 2) convState[(K - 2) * channels + c] = qkv[c];
+        }
+
+        // kQ35ConvStep with the K taps spread over K threads instead of one.
+        // The per-thread form was 3.1 us/layer at 60 blocks x 256 = 15360
+        // threads (480 warps, ~7 per SM) with SEVEN dependent global accesses
+        // per thread, so it is latency-bound with a ninth of the machine's warp
+        // slots used.  Here one thread owns (channel, tap): 61K threads over 240
+        // blocks, one load and one fma each, then a 4-lane shuffle reduction.
+        // The state shift stays on the tap-0 thread; it is inherent to the
+        // shift-register layout.  Fixed at K == 4 (the qwen35 GDN conv).
+        __global__ void kQ35ConvStep4(const float *__restrict__ convWeight,
+                                      const float *__restrict__ qkv,
+                                      float *__restrict__ convIn,
+                                      float *__restrict__ convOut,
+                                      float *__restrict__ convState,
+                                      uint32_t channels) {
+            const uint32_t t = blockIdx.x * blockDim.x + threadIdx.x;
+            const uint32_t c = t >> 2;
+            const uint32_t i = t & 3u;
+            if (c >= channels) return;
+            // window: convIn[0..2] = state[0..2], convIn[3] = qkv
+            const float xin = i < 3u ? convState[i * channels + c] : qkv[c];
+            convIn[i * channels + c] = xin;
+            const float wv = convWeight[static_cast<size_t>(c) * 4u + i];
+            float sum = wv * xin;
+            sum += __shfl_xor_sync(0xffffffffu, sum, 1);
+            sum += __shfl_xor_sync(0xffffffffu, sum, 2);
+            if (i == 0u) {
+                convOut[c] = sum * q35Sigmoid(sum);
+                convState[0 * channels + c] = convState[1 * channels + c];
+                convState[1 * channels + c] = convState[2 * channels + c];
+                convState[2 * channels + c] = qkv[c];
+            }
         }
 
         // Gated-delta-net state update + output for ONE token, ONE value head.

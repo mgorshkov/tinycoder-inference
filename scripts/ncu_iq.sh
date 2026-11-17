@@ -1,4 +1,5 @@
 #!/usr/bin/env sh
+# ncu_iq.sh — nsight-compute profile of the IQ decode path: per-launch SpeedOfLight plus stall/occupancy on the dominant GEMVs.
 # Full nsight-compute profile of the IQ decode path, mirroring the q2_k
 # ncu_ab census: per-launch SpeedOfLight census + per-launch stall/occupancy
 # (WarpStateStats/SchedulerStats/Occupancy) on the dominant GEMV kernels.

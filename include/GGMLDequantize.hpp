@@ -1371,6 +1371,58 @@ namespace tinycoder {
             }
         }
 
+        // Native Prism PTQ1_0 (28 B / 128): qs[24] 5 trits/byte, qh[2]
+        // 4 trits/byte, fp16 d at 26.  Same element map as the GPU kernel.
+        static void dequantizePTQ1_0Block(const uint8_t *b, float *out) {
+            static const uint8_t pow3[5] = {1, 3, 9, 27, 81};
+            const float d =
+                    halfToFloat(*reinterpret_cast<const uint16_t *>(b + 26u));
+            for (uint32_t j = 0; j < 128u; ++j) {
+                uint32_t byte, plane;
+                if (j < 80u) {
+                    byte = b[j % 16u];
+                    plane = j / 16u;
+                } else if (j < 120u) {
+                    byte = b[16u + (j - 80u) % 8u];
+                    plane = (j - 80u) / 8u;
+                } else {
+                    byte = b[24u + (j - 120u) % 2u];
+                    plane = (j - 120u) / 2u;
+                }
+                const uint32_t q = static_cast<uint8_t>(byte * pow3[plane]);
+                const uint32_t digit = (static_cast<uint16_t>(q) * 3u) >> 8;
+                out[j] = d * static_cast<float>(static_cast<int>(digit) - 1);
+            }
+        }
+
+        static std::vector<float> dequantizePTQ1_0(const uint8_t *data,
+                                                   uint64_t numElements) {
+            std::vector<float> out(numElements);
+            const uint64_t blocks = (numElements + 127u) / 128u;
+            for (uint64_t b = 0; b < blocks; ++b) {
+                const uint64_t start = b * 128u;
+                const uint32_t n = static_cast<uint32_t>(
+                        std::min<uint64_t>(128u, numElements - start));
+                if (n == 128u) {
+                    dequantizePTQ1_0Block(data + b * 28u, out.data() + start);
+                } else {
+                    float buf[128];
+                    dequantizePTQ1_0Block(data + b * 28u, buf);
+                    for (uint32_t i = 0; i < n; ++i) out[start + i] = buf[i];
+                }
+            }
+            return out;
+        }
+
+        static float dotProductPTQ1_0(const uint8_t *b, const float *x) {
+            float w[128];
+            dequantizePTQ1_0Block(b, w);
+            float s = 0.0f;
+            for (uint32_t i = 0; i < 128u; ++i) s = std::fma(x[i], w[i], s);
+            return s;
+        }
+
+
         static std::vector<float> dequantizePQ2_0(const uint8_t *data,
                                                   uint64_t numElements) {
             constexpr uint32_t QK = 128;
@@ -1469,6 +1521,9 @@ namespace tinycoder {
                     break;
                 case GGML_TYPE_PQ2_0:
                     dequantizePQ2_0Block(blockData, out);
+                    break;
+                case GGML_TYPE_PTQ1_0:
+                    dequantizePTQ1_0Block(blockData, out);
                     break;
                 case GGML_TYPE_BF16:
                     out[0] = bf16ToFloat(
@@ -2264,6 +2319,8 @@ namespace tinycoder {
                     return dotProductIQ3_S(blockData, x);
                 case GGML_TYPE_PQ2_0:
                     return dotProductPQ2_0(blockData, x);
+                case GGML_TYPE_PTQ1_0:
+                    return dotProductPTQ1_0(blockData, x);
                 default: {
                     // Fallback: dequantize then dot product
                     float blockOut[256];
@@ -2311,6 +2368,8 @@ namespace tinycoder {
                     return dotProductIQ3_S;
                 case GGML_TYPE_PQ2_0:
                     return dotProductPQ2_0;
+                case GGML_TYPE_PTQ1_0:
+                    return dotProductPTQ1_0;
                 default:
                     return nullptr;
             }
@@ -2515,6 +2574,8 @@ namespace tinycoder {
                     return dequantizeIQ4_XS(data, numElements);
                 case GGML_TYPE_PQ2_0:
                     return dequantizePQ2_0(data, numElements);
+                case GGML_TYPE_PTQ1_0:
+                    return dequantizePTQ1_0(data, numElements);
                 default:
                     return {};// Unsupported
             }

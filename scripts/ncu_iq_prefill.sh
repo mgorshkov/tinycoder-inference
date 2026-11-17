@@ -1,4 +1,5 @@
 #!/usr/bin/env sh
+# ncu_iq_prefill.sh — nsight-compute profile of the IQ prefill path (seqLen=512); needs root for GPU counters.
 # nsight-compute profile of the IQ PREFILL path (seqLen=512), mirroring the
 # decode census.  Requires root:
 #

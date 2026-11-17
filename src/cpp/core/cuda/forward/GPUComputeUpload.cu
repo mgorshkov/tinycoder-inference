@@ -1045,6 +1045,28 @@ namespace tinycoder::gpu {
                               "prismFoldBuf"))
                     return false;
                 prismFoldBufBytes_ = fbBytes;
+                // q8_1 scratch for the dp4a decode GEMV (one int8 per column,
+                // plus one float scale per 32 columns).
+                if (!allocRaw(reinterpret_cast<void **>(&prismXq_),
+                              static_cast<uint64_t>(widest), "prismXq"))
+                    return false;
+                // One 4 KiB group per 32 blocks of 128 columns; the last group
+                // is padded up to the full 4 KiB.
+                const uint64_t xqTBytes =
+                        ((static_cast<uint64_t>(widest) / 128u + 31u) / 32u) *
+                        4096u;
+                if (!allocRaw(reinterpret_cast<void **>(&prismXqT_), xqTBytes,
+                              "prismXqT"))
+                    return false;
+                prismXqTBytes_ = xqTBytes;
+                // xd holds the per-32-column scale (float) followed by the
+                // exact integer sum of the quantised values (int32), so two
+                // 32-bit slots per 32-column group.
+                if (!allocRaw(reinterpret_cast<void **>(&prismXd_),
+                              2u * sizeof(float) * ((widest + 31u) / 32u),
+                              "prismXd"))
+                    return false;
+                prismXqBytes_ = widest;
             }
             std::fprintf(stderr,
                          "[gpu] prism fold enabled: block=%u gdnVGrouped=%d "

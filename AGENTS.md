@@ -252,6 +252,16 @@ PATH=/tmp/exl3venv/bin:$PATH /tmp/exl3venv/bin/python scripts/exl3_ask.py <check
 - One session at a time on the GPU, and one editor at a time per file. Two agents editing the same
   `.cu` produce builds and measurements of unknown provenance.
 
+## Versioning and commits
+
+- A feature is developed as **one commit** on a branch whose name is the new tinycoder version
+  number (for example `1.0.4`).
+- Squash all changes for that feature into that single commit; do not leave a chain of WIP commits.
+- While the feature is unreleased, new changes are **amended** to the existing commit
+  (`git commit --amend`) rather than added as a second commit.
+- Every release is one commit with a meaningful message describing the feature and its verified
+  numbers.
+
 ## Evidence ledger
 
 `.superpowers/sdd/2026-11-11-prefill-parity/progress.md` records what was measured, what was tried

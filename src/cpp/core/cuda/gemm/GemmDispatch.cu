@@ -81,6 +81,24 @@ extern "C" {
             float *dst, const float *tmp_fixup, const int ncols_x,               \
             const int nrows_x, const int ncols_dst, const int stride_col_dst,    \
             const int ncols_max);                                                \
+    __global__ void int8GemmStreamKPQ20Tile##N(                                  \
+            const char *x, const int *y, float *dst, float *tmp_fixup,           \
+            const int ncols_x, const int nrows_x, const int ncols_dst,           \
+            const int stride_row_x, const int ncols_y, const int stride_col_dst, \
+            const int ncols_max);                                                \
+    __global__ void int8GemmStreamKPTQ10Tile##N(                                 \
+            const char *x, const int *y, float *dst, float *tmp_fixup,           \
+            const int ncols_x, const int nrows_x, const int ncols_dst,           \
+            const int stride_row_x, const int ncols_y, const int stride_col_dst, \
+            const int ncols_max);                                                \
+    __global__ void int8GemmFixupPTQ10Tile##N(                                   \
+            float *dst, const float *tmp_fixup, const int ncols_x,               \
+            const int nrows_x, const int ncols_dst, const int stride_col_dst,    \
+            const int ncols_max);                                                \
+    __global__ void int8GemmFixupPQ20Tile##N(                                    \
+            float *dst, const float *tmp_fixup, const int ncols_x,               \
+            const int nrows_x, const int ncols_dst, const int stride_col_dst,    \
+            const int ncols_max);                                                \
     __global__ void int8GemmFixupQ80Tile##N(                                     \
             float *dst, const float *tmp_fixup, const int ncols_x,               \
             const int nrows_x, const int ncols_dst, const int stride_col_dst,    \
@@ -170,6 +188,8 @@ namespace tinycoder::gpu {
         constexpr int kTypeQ5K_ = 13;
         constexpr int kTypeQ6K_ = 14;
         constexpr int kTypeQ8_0_ = 8;
+        constexpr int kTypePQ2_0_ = 142;// Prism PQ2_0 ternary
+        constexpr int kTypePTQ1_0_ = 143;// Prism native ternary, 28 B/128
         constexpr int kTypeQ2K_ = 10;
         constexpr int kTypeQ3K_ = 11;
         constexpr int kTypeIQ2S_ = 22;
@@ -238,7 +258,8 @@ namespace tinycoder::gpu {
             // IQ3_S shares the IQ3_XXS/IQ8_0 activation-tile stride
             // (INT8_MMA_TILE_X_K_Q8_0); 76 ints/row covers it.
             const bool q8Tile = type == kTypeQ6K_ || type == kTypeQ8_0_ ||
-                                type == kTypeIQ3XXS_ || type == kTypeIQ3S_;
+                                type == kTypeIQ3XXS_ || type == kTypeIQ3S_ ||
+                                type == kTypePQ2_0_ || type == kTypePTQ1_0_;
             const size_t tileXK = q8Tile ? 76u : 84u;
             const size_t nbsIds = static_cast<size_t>(tileX) * sizeof(int);
             const size_t nbsX =
@@ -282,6 +303,22 @@ namespace tinycoder::gpu {
                     setSmemAttrImpl(int8GemmStreamKQ80Tile64, bytes);
                 else
                     setSmemAttrImpl(int8GemmStreamKQ80Tile32, bytes);
+            }
+            if (type == kTypePQ2_0_) {
+                if (tileX == 128)
+                    setSmemAttrImpl(int8GemmStreamKPQ20Tile128, bytes);
+                else if (tileX == 64)
+                    setSmemAttrImpl(int8GemmStreamKPQ20Tile64, bytes);
+                else
+                    setSmemAttrImpl(int8GemmStreamKPQ20Tile32, bytes);
+            }
+            if (type == kTypePTQ1_0_) {
+                if (tileX == 128)
+                    setSmemAttrImpl(int8GemmStreamKPTQ10Tile128, bytes);
+                else if (tileX == 64)
+                    setSmemAttrImpl(int8GemmStreamKPTQ10Tile64, bytes);
+                else
+                    setSmemAttrImpl(int8GemmStreamKPTQ10Tile32, bytes);
             }
             if (type == kTypeIQ2S_) {
                 if (tileX == 128)
@@ -348,6 +385,26 @@ namespace tinycoder::gpu {
                             wc, yq, out, fixup, k, n, m, strideRowX, m, n, m);
                 else
                     int8GemmStreamKQ80Tile32<<<grid, block, smem, s>>>(
+                            wc, yq, out, fixup, k, n, m, strideRowX, m, n, m);
+            } else if (type == kTypePQ2_0_) {
+                if (tileX == 128)
+                    int8GemmStreamKPQ20Tile128<<<grid, block, smem, s>>>(
+                            wc, yq, out, fixup, k, n, m, strideRowX, m, n, m);
+                else if (tileX == 64)
+                    int8GemmStreamKPQ20Tile64<<<grid, block, smem, s>>>(
+                            wc, yq, out, fixup, k, n, m, strideRowX, m, n, m);
+                else
+                    int8GemmStreamKPQ20Tile32<<<grid, block, smem, s>>>(
+                            wc, yq, out, fixup, k, n, m, strideRowX, m, n, m);
+            } else if (type == kTypePTQ1_0_) {
+                if (tileX == 128)
+                    int8GemmStreamKPTQ10Tile128<<<grid, block, smem, s>>>(
+                            wc, yq, out, fixup, k, n, m, strideRowX, m, n, m);
+                else if (tileX == 64)
+                    int8GemmStreamKPTQ10Tile64<<<grid, block, smem, s>>>(
+                            wc, yq, out, fixup, k, n, m, strideRowX, m, n, m);
+                else
+                    int8GemmStreamKPTQ10Tile32<<<grid, block, smem, s>>>(
                             wc, yq, out, fixup, k, n, m, strideRowX, m, n, m);
             } else if (type == kTypeIQ2S_) {
                 if (tileX == 128)
@@ -541,7 +598,8 @@ namespace tinycoder::gpu {
         if (!int8GemmAvailable()) return false;
         if (type != kTypeQ4K_ && type != kTypeQ5K_ && type != kTypeQ6K_ &&
             type != kTypeQ8_0_ && type != kTypeIQ2S_ && type != kTypeIQ3XXS_ &&
-            type != kTypeIQ3S_)
+            type != kTypeIQ3S_ && type != kTypePQ2_0_ &&
+            type != kTypePTQ1_0_)
             return false;
         // Q8-dominant checkpoints hit the broken sm_75 Q80 tile loader; the
         // adapter disables it for those models only.
@@ -559,7 +617,8 @@ namespace tinycoder::gpu {
 
         cudaStream_t s = reinterpret_cast<cudaStream_t>(stream);
         if (type == kTypeQ6K_ || type == kTypeQ8_0_ || type == kTypeIQ2S_ ||
-            type == kTypeIQ3XXS_ || type == kTypeIQ3S_) {
+            type == kTypeIQ3XXS_ || type == kTypeIQ3S_ ||
+            type == kTypePQ2_0_ || type == kTypePTQ1_0_) {
             int8QuantizeQ8D4(
                     x, nullptr, g_yq, type, static_cast<int64_t>(cols),
                     static_cast<int64_t>(cols), 0, 0, static_cast<int64_t>(cols),
@@ -594,7 +653,11 @@ namespace tinycoder::gpu {
         // round-trip and measured 2,497 -> 2,828 pp512 (9B q8_0) when the block
         // count reaches ntiles.  The K-quant and IQ kernels are unaffected or
         // regress (iq3_xxs 2,745 -> 2,552), so this stays Q8_0-only.
-        int blocksPerSm = (type == kTypeQ8_0_) ? 8 : 1;
+        // PQ2_0 wants ONE block per SM: with the cheap byte_perm decode the
+        // stream-k k-split only adds the fixup round-trip.  Measured pp512:
+        // B=1 823.4, B=2 787.7, B=4 770.6, B=8 756.6, B=16 707.1, B=32 631.4.
+        // (Q8_0 separately wants 8; the two types disagree.)
+        int blocksPerSm = type == kTypeQ8_0_ ? 8 : 1;
         if (const char *bm = std::getenv("TINYCODER_INT8_GEMM_BLOCKS")) {
             const int v = std::atoi(bm);
             // Raised from 4: with blocksPerSm >= ceil(ntiles/nSM) the block count

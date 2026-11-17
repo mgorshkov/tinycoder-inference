@@ -119,6 +119,8 @@ namespace tinycoder {
                 return 136;// 256 weights: d(fp16,2) + scales_h(2) + scales_l(4) + qs(128) = 136 bytes (block_iq4_xs)
             case GGML_TYPE_PQ2_0:
                 return 34;// 128 weights: d(fp16,2) + qs(32) = 34 bytes (block_pq2_0)
+            case GGML_TYPE_PTQ1_0:
+                return 28;// 128 weights: qs(24) + qh(2) + d(fp16,2)
             default:
                 return 0;
         }
@@ -152,6 +154,8 @@ namespace tinycoder {
                 return 256;
             case GGML_TYPE_PQ2_0:
                 return 128;// 128 weights per block (block_pq2_0, Prism-private)
+            case GGML_TYPE_PTQ1_0:
+                return 128;// 128 weights per block (block_ptq1_0, Prism-private)
             default:
                 return 1;
         }
