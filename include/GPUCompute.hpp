@@ -1000,6 +1000,32 @@ namespace tinycoder::gpu {
         // happens during forward / CUDA-graph capture).
         float *prismFoldBuf_ = nullptr;
         uint64_t prismFoldBufBytes_ = 0;
+        // q8_1 activation scratch for the dp4a PQ2_0 decode GEMV (see
+        // kPrismFoldToQ8 / kQGemvPQ2_0Q8T): the folded activation quantised to
+        // int8[widest] with a float scale per 32 columns.  Same lifetime and
+        // sizing rule as prismFoldBuf_ (allocated in uploadWithPrism, never
+        // during forward).  Consumed immediately by the GEMV on the same
+        // stream, so one buffer per model is enough.
+        int8_t *prismXq_ = nullptr;
+        // Piece-major natural-order copy of the same q8 bytes for the native
+        // PTQ1_0 GEMV (group g, piece i, lane l at g*4096 + i*512 + l*16).
+        int8_t *prismXqT_ = nullptr;
+        // Bumped once per layer by the qwen35 decode loop; the fold+quantize
+        // reuse cache in the projection path is keyed on it.
+        uint32_t foldEpoch_ = 0;
+        // Native PTQ1_0 decode: activation words shared by the producer kernel
+        // (norm+fold+quantize) and the projection GEMV, plus the cache key that
+        // says which activation they hold.
+        int32_t *ptq1Words_ = nullptr;
+        size_t ptq1WordBytes_ = 0;
+        const float *foldCacheSrc_ = nullptr;
+        uint32_t foldCacheCols_ = 0;
+        uint32_t foldCacheEpoch_ = 0xFFFFFFFFu;
+        bool foldCachePerm_ = false;
+        bool foldCacheSilu_ = false;
+        uint64_t prismXqTBytes_ = 0;
+        float *prismXd_ = nullptr;
+        uint64_t prismXqBytes_ = 0;
         // Host mirror of the MoE router's top-k expert selection (qwen35moe).
         // The per-expert GEMVs need the SELECTED expert ids per token; the GPU
         // router kernel writes moeIdx on the device, so the driver copies the
@@ -1205,6 +1231,40 @@ namespace tinycoder::gpu {
         bool gemmQ8Cublas(const DeviceMatrix &m, const float *x, float *y,
                           uint32_t seqLen, std::string &errMsg);
 
+        /// @brief Prism PQ2_0 (Bonsai) batched prefill: fold the whole activation
+        /// batch into fp16 (signs + blockwise Hadamard, plus the GDN value-head
+        /// permutation for ssm_out), expand the packed ternary weights into an
+        /// fp16 twin ONCE per matrix (the ternary times an fp16 group scale is
+        /// exact in fp16), then one fp16 tensor-core GEMM.  Without this the
+        /// prefill takes the per-token GEMV loop and re-reads all 6.85 GB of
+        /// packed weights for every prompt token (measured 16.8 pp512 against
+        /// the reference runtime's 880 on the same file).
+        /// Returns false without touching anything if the shape or a scratch
+        /// allocation is unavailable; the caller then falls back to the
+        /// validated per-token loop.
+        bool gemmPQ2Cublas(const DeviceMatrix &m, const float *x, float *y,
+                           uint32_t seqLen, bool gdnPerm, std::string &errMsg);
+        void *pq2W16_ = nullptr;
+        uint64_t pq2W16Bytes_ = 0;
+        void *pq2X16_ = nullptr;
+        uint64_t pq2X16Bytes_ = 0;
+        /// @brief P1/P2 spike scratch: the packed ternary expanded to the GGML
+        /// Q8_0 block layout (4x the packed size) and the folded activation
+        /// batch in fp32, consumed by the engine's int8 tensor-core GEMM.
+        void *pq2Wq8_ = nullptr;
+        uint64_t pq2Wq8Bytes_ = 0;
+        float *pq2Xf_ = nullptr;
+        uint64_t pq2XfBytes_ = 0;
+        /// @brief Batched PQ2_0 prefill through the int8 tensor-core engine.
+        /// Returns false (leaving `y` untouched) when the shape or a scratch
+        /// allocation is unavailable, so the caller falls back to the fp16-twin
+        /// cuBLAS path.
+        /// @param preFolded the caller already folded this activation batch into
+        ///        the fp32 scratch (pq2PreFold), so the fold is not repeated.
+        bool gemmPQ2Int8(const DeviceMatrix &m, const float *x, float *y,
+                         uint32_t seqLen, bool gdnPerm, std::string &errMsg,
+                         bool preFolded = false);
+
         /// @brief F32 prefill GEMM via cuBLAS (ssm alpha/beta projections).
         bool gemmF32Cublas(const DeviceMatrix &m, const float *x, float *y,
                            uint32_t seqLen, std::string &errMsg);
@@ -1222,6 +1282,16 @@ namespace tinycoder::gpu {
         /// @param gdnPerm true for the ssm_out projection (applies the GDN
         ///        value-head permutation first).
         const float *prismFoldForward(const float *x, uint32_t cols, bool gdnPerm);
+
+        /// @brief q8_1 quantised variant of prismFoldForward: same H S P
+        /// transform, written to prismXq_ (int8) + prismXd_ (float per 32
+        /// columns) instead of the fp32 scratch.  No-op if the model is not
+        /// folded or the width is not a multiple of kPrismBlock-free 128.
+        /// @param mul optional per-element multiplier applied as
+        ///        silu(x[i])*mul[i] while folding (fuses kSiluMul into the
+        ///        ffn_down fold).
+        void prismFoldToQ8(const float *x, uint32_t cols, bool gdnPerm,
+                           const float *mul = nullptr);
 
         /// @brief device sign vector matching a width (5120/6144/17408) or null.
         const float *prismSignsFor(uint32_t cols) const {

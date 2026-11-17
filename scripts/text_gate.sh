@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# text_gate.sh — Text gate: every checkpoint with a BENCHMARKS.md row must answer a factual question, or the row cannot be published.
 # Text gate for every checkpoint that has a row in BENCHMARKS.md.
 #
 # A throughput number only exists if the engine can answer a question on that
@@ -26,6 +27,15 @@ MODELS=(
   "/data/models/qwen/qwen2.5/Qwen2.5-Coder-7B-Instruct-IQ2_S.gguf|Paris|7B iq2_s"
   "/data/models/ornith/Ornith-1.5-9B-Q4_K_M.gguf|Paris|9B q4_k_m"
   "/data/models/ornith/Ornith-1.5-35B-A3B-Q8_0.gguf|Paris|35B-A3B"
+  # Prism Ternary-Bonsai-2-27B: PQ2_0 (2-bit slots) and PTQ1_0 (base-3 trits,
+  # transcoded to the PQ2_0 block layout at load).  Both are in BENCHMARKS.md.
+  "/data/models/bonsai/Ternary-Bonsai-2-27B-PQ2_0.gguf|Paris|bonsai pq2_0"
+  "/data/models/bonsai/Ternary-Bonsai-2-27B-PTQ1_0.gguf|Paris|bonsai ptq1_0"
+  # Qwen3.8-27B EXL3 (qwen35 dense hybrid, hidden 5120, 65 layers).  It has a
+  # BENCHMARKS.md row, so by the rule at the top of this script it needs a gate;
+  # without one the row is exactly the 9B case that was published for weeks from
+  # a path that emitted noise.  ExLL3 checkpoints load from a directory.
+  "/data/models/qwen/qwen3.8-27b/qwen3.8-27B-exl3-1.60bpw|Paris|qwen3.8-27b exl3"
 )
 
 fail=0
@@ -35,7 +45,7 @@ for entry in "${MODELS[@]}"; do
   if [ -n "$FILTER" ] && [[ "$model" != *"$FILTER"* ]]; then
     continue
   fi
-  if [ ! -f "$model" ]; then
+  if [ ! -e "$model" ]; then
     printf '%-14s SKIP (missing file: %s)\n' "$label" "$model"
     fail=1
     continue

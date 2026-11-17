@@ -1,4 +1,9 @@
 #!/usr/bin/env sh
+# prefill_iq3_ab.sh — Interleaved prefill A/B of TinyCoder vs llama.cpp on IQ3 checkpoints, one pair at a time.
+# Paths are relative to this checkout; override with TINYCODER_ROOT / LLAMA_DIR.
+ROOT="${TINYCODER_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+LLAMA_DIR="${LLAMA_DIR:-$ROOT/../llama.cpp}"
+PRISM_DIR="${PRISM_DIR:-$ROOT/../llama-prism}"
 # Interleaved prefill A/B: TinyCoder vs llama.cpp, one pair at a time.
 #
 #   sh scripts/prefill_iq3_ab.sh <model.gguf> [pairs]
@@ -30,7 +35,7 @@ cd "$HERE" || exit 1
 
 MODEL="${1:?usage: $0 <model.gguf> [pairs]}"
 PAIRS="${2:-3}"
-LLAMA="${LLAMA_BENCH:-/home/mike/git/llama.cpp/build-cuda/bin/llama-bench}"
+LLAMA="${LLAMA_BENCH:-${LLAMA_DIR}/build-cuda/bin/llama-bench}"
 LLAMA_EXTRA="${LLAMA_EXTRA-}"
 BENCH="$HERE/build-1.0/benchmarks/tinycoder_bench"
 

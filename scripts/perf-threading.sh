@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# perf-threading.sh — Thread-count sweep and performance-counter harness.
 # -----------------------------------------------------------------------------
 # Thread-count + perf counter measurement harness (2026-08-29).
 #

@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# ncu_tiny.sh — nsight-compute profile of the TinyCoder decode kernels; needs root for GPU counters.
 # Profile the TinyCoder decode kernels with ncu (requires root for GPU counters).
 # Usage:  sudo bash scripts/ncu_tiny.sh
 # Output: /tmp/ncu_tiny.txt

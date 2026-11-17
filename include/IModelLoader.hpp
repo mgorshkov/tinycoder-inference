@@ -73,6 +73,14 @@ namespace tinycoder {
         // Prism-private 2-bit type (Ternary-Bonsai PQ2_0 export): identical 2-bit
         // codec to Q2_0 but with one fp16 scale per 128 weights (34-byte block).
         GGML_TYPE_PQ2_0 = 142,
+        // Prism-private base-3 ternary type (Ternary-Bonsai PTQ1_0 export):
+        // 5 trits per byte, 24 + 2 bytes + one fp16 scale per 128 weights
+        // (28-byte block, 1.75 bpw).  It holds the SAME ternary values and the
+        // same group scale as PQ2_0 -- the two packs are lossless transcodes of
+        // each other -- so the loader transcodes it to the PQ2_0 block layout at
+        // load time and every kernel, the Hadamard fold, the latent embedding and
+        // the batched prefill are shared.  See transcodePTQ1_0ToPQ2_0().
+        GGML_TYPE_PTQ1_0 = 143,
         // Native EXL3 trellis linear (not a GGML block format): used only as the
         // GPU DeviceMatrix tag so launchQGemv dispatches the fused EXL3 kernel.
         // The host QuantizedMatrix keeps its materialized F16 data for the CPU

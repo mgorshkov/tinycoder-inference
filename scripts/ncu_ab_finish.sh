@@ -1,4 +1,5 @@
 #!/usr/bin/env sh
+# ncu_ab_finish.sh — Finish the head-to-head ncu capture started by ncu_ab.sh.
 # Finish the apples-to-apples ncu run.  The main ncu_ab.sh run had already
 # produced a valid reference census (/tmp/ncu_ab_ref.txt), a valid TinyCoder
 # LM-head SpeedOfLight window (/tmp/ncu_ab_tiny_lmhead.txt) and a valid

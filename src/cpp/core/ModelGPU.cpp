@@ -83,6 +83,8 @@ namespace tinycoder {
                     return 176;// 256 weights in 176 bytes
                 case GGML_TYPE_PQ2_0:
                     return 34;// 128 weights: d(fp16,2) + qs[32] (Prism ternary)
+                case GGML_TYPE_PTQ1_0:
+                    return 28;// 128 weights: qs(24) + qh(2) + d(fp16,2)
                 default:
                     return 0;
             }
@@ -128,6 +130,7 @@ namespace tinycoder {
                 case GGML_TYPE_IQ4_XS:
                 case GGML_TYPE_IQ4_NL:
                 case GGML_TYPE_PQ2_0:
+                case GGML_TYPE_PTQ1_0:
                 case GGML_TYPE_EXL3:
                     return true;
                 default:
@@ -140,7 +143,8 @@ namespace tinycoder {
                    type == GGML_TYPE_Q2_K || type == GGML_TYPE_Q5_0 ||
                    type == GGML_TYPE_Q8_0 || type == GGML_TYPE_IQ3_S ||
                    type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K ||
-                   type == GGML_TYPE_IQ4_NL || type == GGML_TYPE_PQ2_0;
+                   type == GGML_TYPE_IQ4_NL || type == GGML_TYPE_PQ2_0 ||
+                   type == GGML_TYPE_PTQ1_0;
         }
 
         DeviceMatrix toDeviceMatrix(const QuantizedMatrix &m) {

@@ -79,6 +79,8 @@ enum tc_type {
     TC_TYPE_BF16 = 30,
     TC_TYPE_MXFP4 = 39,
     TC_TYPE_NVFP4 = 40,
+    TC_TYPE_PQ2_0 = 142,// Prism PQ2_0 ternary, 34 B per 128 weights
+    TC_TYPE_PTQ1_0 = 143,// Prism native ternary, 28 B per 128 weights
 };
 
 // ============================================================
@@ -562,6 +564,24 @@ struct tc_type_traits<TC_TYPE_Q8_0> {
     static constexpr int qk = QK8_0;
     static constexpr int qr = QR8_0;
     static constexpr int qi = QI8_0;
+};
+template<>
+struct tc_type_traits<TC_TYPE_PTQ1_0> {
+    // 28-byte block per 128 ternary weights: 5 trits/byte qs[24], 4 trits/byte
+    // qh[2], one fp16 scale at 26.  The int8 tile sees one int per 4 weights,
+    // same qk/qr/qi as PQ2_0.
+    static constexpr int qk = 128;
+    static constexpr int qr = 4;
+    static constexpr int qi = 4;
+};
+template<>
+struct tc_type_traits<TC_TYPE_PQ2_0> {
+    // 34-byte block per 128 ternary weights: 4 codes per byte, one fp16 scale.
+    // qr = 4 weights per int (same packing as Q8_0), qi = 4 ints-groups per block
+    // = 128/32, which is what the Q8_0 k-unit convention needs.
+    static constexpr int qk = 128;
+    static constexpr int qr = 4;
+    static constexpr int qi = 4;
 };
 template<>
 struct tc_type_traits<TC_TYPE_Q2_K> {

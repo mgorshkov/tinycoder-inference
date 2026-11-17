@@ -245,6 +245,10 @@ DEFINE_INT8_SK_PAIR(TC_TYPE_Q4_K, Q4K)
 DEFINE_INT8_SK_PAIR(TC_TYPE_Q5_K, Q5K)
 DEFINE_INT8_SK_PAIR(TC_TYPE_Q6_K, Q6K)
 DEFINE_INT8_SK_PAIR(TC_TYPE_Q8_0, Q80)
+// PQ2_0 ternary prefill: packed 2-bit weights decoded straight into the
+// Q8_0 int8 tile layout, so prefill never materialises an fp16 twin.
+DEFINE_INT8_SK_PAIR(TC_TYPE_PQ2_0, PQ20)
+DEFINE_INT8_SK_PAIR(TC_TYPE_PTQ1_0, PTQ10)
 DEFINE_INT8_SK_PAIR(TC_TYPE_IQ2_S, IQ2S)
 DEFINE_INT8_SK_PAIR(TC_TYPE_IQ3_XXS, IQ3XXS)
 // IQ3_S had no int8 kernels at all, so `int8Gemm` refused type 21 and the

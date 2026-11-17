@@ -1,4 +1,9 @@
 #!/usr/bin/env bash
+# ncu_llama.sh — nsight-compute profile of the reference engine's decode kernels; needs root for GPU counters.
+# Paths are relative to this checkout; override with TINYCODER_ROOT / LLAMA_DIR.
+ROOT="${TINYCODER_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+LLAMA_DIR="${LLAMA_DIR:-$ROOT/../llama.cpp}"
+PRISM_DIR="${PRISM_DIR:-$ROOT/../llama-prism}"
 # Profile the reference benchmark decode kernels with ncu (requires root for GPU counters).
 # Usage:  sudo bash scripts/ncu_llama.sh
 # Output: /tmp/ncu_ref.txt
@@ -10,7 +15,7 @@ if [ -z "$NCU" ]; then
     exit 1
 fi
 
-BENCH=/home/mike/git/llama.cpp/build-cuda/bin/llama-bench
+BENCH=${LLAMA_DIR}/build-cuda/bin/llama-bench
 MODEL=/data/models/qwen/qwen2.5-coder-1.5b-instruct-q2_k.gguf
 
 "$NCU" \

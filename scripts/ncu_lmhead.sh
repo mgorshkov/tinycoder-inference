@@ -1,4 +1,9 @@
 #!/usr/bin/env bash
+# ncu_lmhead.sh — nsight-compute LM-head capture, TinyCoder vs reference; needs root for GPU counters.
+# Paths are relative to this checkout; override with TINYCODER_ROOT / LLAMA_DIR.
+ROOT="${TINYCODER_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+LLAMA_DIR="${LLAMA_DIR:-$ROOT/../llama.cpp}"
+PRISM_DIR="${PRISM_DIR:-$ROOT/../llama-prism}"
 # LM-head head-to-head ncu capture (requires root for GPU counters).
 # Usage:  sudo bash -c 'nohup bash scripts/ncu_lmhead.sh > /tmp/ncu_lmhead.log 2>&1 &'
 # Output: /tmp/ncu_lmhead_tiny.txt (kQGemvQ6KxQ8K_4xW, eager decode)
@@ -15,7 +20,7 @@ if [ -z "$NCU" ]; then
 fi
 
 MODEL=/data/models/qwen/qwen2.5-coder-1.5b-instruct-q2_k.gguf
-BENCH=/home/mike/git/llama.cpp/build-cuda/bin/llama-bench
+BENCH=${LLAMA_DIR}/build-cuda/bin/llama-bench
 
 # --- TinyCoder side: eager decode (graph replay would still profile, but the
 # eager path matches the census protocol), Q6_K LM head only.  Skip the

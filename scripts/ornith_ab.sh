@@ -1,4 +1,9 @@
 #!/usr/bin/env bash
+# ornith_ab.sh — Interleaved A/B of TinyCoder vs llama-bench on one checkpoint (3 alternating pairs, means, spread).
+# Paths are relative to this checkout; override with TINYCODER_ROOT / LLAMA_DIR.
+ROOT="${TINYCODER_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+LLAMA_DIR="${LLAMA_DIR:-$ROOT/../llama.cpp}"
+PRISM_DIR="${PRISM_DIR:-$ROOT/../llama-prism}"
 # Interleaved A/B of TinyCoder vs llama-bench on one checkpoint.
 #
 # Protocol (AGENTS.md): default environment, no env knobs, 3 alternating
@@ -19,10 +24,9 @@ MODEL="${1:?usage: $0 <checkpoint> [llama extra args...]}"
 shift || true
 LLAMA_ARGS=("$@")
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BENCH="$ROOT/build-1.0/benchmarks/tinycoder_bench"
-LLAMA_BENCH="${LLAMA_BENCH:-/home/mike/git/llama.cpp/build-cuda/bin/llama-bench}"
-LLAMA_LIB="${LLAMA_LIB:-/home/mike/git/llama.cpp/build-cuda/bin}"
+LLAMA_BENCH="${LLAMA_BENCH:-${LLAMA_DIR}/build-cuda/bin/llama-bench}"
+LLAMA_LIB="${LLAMA_LIB:-${LLAMA_DIR}/build-cuda/bin}"
 PAIRS="${PAIRS:-3}"
 TAG="$(basename "$MODEL")"
 TINYCODER_LOG="${TINYCODER_LOG:-/tmp/ab_tiny_${TAG}.log}"

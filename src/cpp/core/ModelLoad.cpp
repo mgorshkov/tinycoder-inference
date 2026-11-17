@@ -45,6 +45,78 @@ namespace tinycoder {
 
     // ---- Model loading ----
 
+namespace {
+    // ------------------------------------------------------------------
+    // PTQ1_0 (Prism ternary, group 128, 28 B/block) -> PQ2_0 (34 B/block).
+    //
+    // The two packs carry the SAME ternary values and the same fp16 group
+    // scale; they differ only in bit packing, so this is lossless and lets the
+    // whole PQ2_0 pipeline (ternary GEMV, Hadamard fold on activations, fp16
+    // twin prefill, latent embedding) serve both files.  Block layouts, taken
+    // from the reference implementation (PrismML-Eng/llama.cpp,
+    // ggml-quants.c:dequantize_row_ptq1_0):
+    //
+    //   PTQ1_0: qs[24] (5 trits/byte) + qh[2] (4 trits/byte) + d(fp16) = 28 B
+    //           element  16*n + m      = trit n of qs[m],      m <  16, n < 5
+    //           element  80 + 8*n + m  = trit n of qs[16+m],   m <   8, n < 5
+    //           element 120 + 2*n + h  = trit n of qh[h],      h <   2, n < 4
+    //           trit n = ((uint16_t)(qs*pow3[n] as uint8) * 3) >> 8
+    //   PQ2_0:  d(fp16) + qs[32]; element j at byte j/4, bits 2*(j%4); code q
+    //           in 0..2 and value = (q - 1) * d in both packs.
+    //
+    // Verified by decoding a real PTQ1_0 block and comparing the recovered
+    // symbols against the reference order above; the end-to-end check is that
+    // the transcoded file reproduces the native PQ2_0 file's logits.
+    // ------------------------------------------------------------------
+    void transcodePTQ1_0ToPQ2_0(const uint8_t *src, uint8_t *dst, size_t blocks) {
+        static const uint8_t pow3[5] = {1, 3, 9, 27, 81};
+        for (size_t b = 0; b < blocks; ++b) {
+            const uint8_t *s = src + b * 28u;
+            uint8_t *o = dst + b * 34u;
+            o[0] = s[26];// d (fp16), same value in both packs
+            o[1] = s[27];
+            std::memset(o + 2, 0, 32);
+            uint8_t code[128];
+            uint32_t idx = 0;
+            for (uint32_t n = 0; n < 5; ++n) {
+                for (uint32_t m = 0; m < 16; ++m) {
+                    const uint8_t q = static_cast<uint8_t>(s[m] * pow3[n]);
+                    code[idx++] =
+                            static_cast<uint8_t>((static_cast<uint16_t>(q) * 3u) >> 8);
+                }
+            }
+            for (uint32_t n = 0; n < 5; ++n) {
+                for (uint32_t m = 0; m < 8; ++m) {
+                    const uint8_t q =
+                            static_cast<uint8_t>(s[16u + m] * pow3[n]);
+                    code[idx++] =
+                            static_cast<uint8_t>((static_cast<uint16_t>(q) * 3u) >> 8);
+                }
+            }
+            for (uint32_t n = 0; n < 4; ++n) {
+                for (uint32_t h = 0; h < 2; ++h) {
+                    const uint8_t q =
+                            static_cast<uint8_t>(s[24u + h] * pow3[n]);
+                    code[idx++] =
+                            static_cast<uint8_t>((static_cast<uint16_t>(q) * 3u) >> 8);
+                }
+            }
+            for (uint32_t j = 0; j < 128; ++j) {
+                o[2u + (j >> 2)] |=
+                        static_cast<uint8_t>((code[j] & 3u) << (2u * (j & 3u)));
+            }
+        }
+    }
+
+    bool ptq1NativeEnabled() {
+        static const bool on = [] {
+            const char *e = std::getenv("TINYCODER_PT_NATIVE");
+            return e != nullptr && e[0] == '1';
+        }();
+        return on;
+    }
+}// namespace
+
     namespace {
         void requantIQ2XSGateUpToQ4K(std::vector<Model::LayerWeights> &layers) {
             const char *e = std::getenv("TINYCODER_IQ2_GATEUP_Q4K");
@@ -433,6 +505,10 @@ namespace tinycoder {
         std::cout << "[TinyCoder] Building pre-dequantized embedding matrix..."
                   << std::endl;
         if (!buildDequantizedEmbeddings()) {
+            // The dequantized table is not optional: the generation-time LM
+            // head and the sampler read it, and continuing without it produced
+            // coherent-looking logits but garbage text (caught by the text gate,
+            // not by the logits probe).
             setError("Failed to build pre-dequantized embeddings");
             return false;
         }
@@ -664,6 +740,22 @@ namespace tinycoder {
             if (data != nullptr) {
                 qm.data.setExternal(data, static_cast<size_t>(dataBytes));
             }
+            // PTQ1_0 is transcoded to the PQ2_0 block layout here, once, so the
+            // rest of the engine only ever sees one ternary format.  Lossless
+            // (same trits, same fp16 group scale); costs the 28 -> 34 byte
+            // expansion in RAM/VRAM, which is the same footprint the native
+            // PQ2_0 file already needs on this box.
+            if (qm.type == GGML_TYPE_PTQ1_0 && data != nullptr &&
+                !ptq1NativeEnabled()) {
+                const uint64_t blocksPerRowT =
+                        (static_cast<uint64_t>(cols) + 127u) / 128u;
+                const uint64_t blocks = static_cast<uint64_t>(rows) * blocksPerRowT;
+                std::vector<uint8_t> out(static_cast<size_t>(blocks * 34u));
+                transcodePTQ1_0ToPQ2_0(data, out.data(),
+                                       static_cast<size_t>(blocks));
+                qm.data.assign(out);
+                qm.type = GGML_TYPE_PQ2_0;
+            }
             return qm;
         };
 
@@ -754,6 +846,19 @@ namespace tinycoder {
             quantizedEmbeddings_.vocabSize = rows;
             quantizedEmbeddings_.hiddenSize = cols;
             quantizedEmbeddings_.type = info->type;
+            // PTQ1_0 table: transcode to the PQ2_0 block layout once, exactly as
+            // loadQuantized() does for every other ternary tensor, so the latent
+            // embedding dequant + inverse Hadamard path is shared.
+            // The embedding table stays in the PQ2_0 layout: it is read once
+            // per token, so the 28 B saving is irrelevant, and the shared
+            // latent dequant / inverse-Hadamard path is the validated one.
+            if (quantizedEmbeddings_.type == GGML_TYPE_PTQ1_0) {
+                std::vector<uint8_t> out(static_cast<size_t>(numBlocks * 34u));
+                transcodePTQ1_0ToPQ2_0(data, out.data(),
+                                       static_cast<size_t>(numBlocks));
+                quantizedEmbeddings_.data.assign(out.begin(), out.end());
+                quantizedEmbeddings_.type = GGML_TYPE_PQ2_0;
+            }
             if (latent) {
                 quantizedEmbeddings_.isLatentPrism = true;
                 quantizedEmbeddings_.hadamardBlockSize = prismBlockSize_;
