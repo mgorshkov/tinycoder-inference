@@ -177,7 +177,7 @@ different class of mistake.
    `!!!!`. A short prompt is not a smoke test for a 27B model. Always also check a **>=45-token
    chat-style prompt** for finite logits, and check that generation answers a factual question.
 
-4. **Suite** — `./build-1.0/unit_tests/tinycoder_test` must report **90 tests, 73 passed, 0 failed**
+4. **Suite** — `./build-1.0/unit_tests/tinycoder_test` must report **113 tests, 96 passed, 0 failed**
    without a model (the rest skip because they need a checkpoint). With `TINYCODER_MODEL_PATH` set, the gated question tests run instead of skipping; they
    are the ones that catch real inference bugs:
 

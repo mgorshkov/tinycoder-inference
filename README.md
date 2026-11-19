@@ -19,7 +19,7 @@ The engine runs the **Qwen2.5** (`qwen2`), **Qwen3.6** and **Qwen3.8** (`qwen35`
 
 TinyCoder builds and runs with only the base toolchain, but **both items below are strongly recommended** — without them you get the unoptimised fallback, not the numbers in [BENCHMARKS.md](BENCHMARKS.md):
 
-- **CUDA Toolkit** ≥ 11.0 + nvcc — **install this if you have any NVIDIA GPU.** It enables the GPU offload engine on Turing / Ampere / Ada and newer (RTX 2080 Ti, RTX 3090, RTX 4090, RTX 5090). Without it the engine runs on the CPU only, which is several times to orders of magnitude slower depending on model size; on a model that does not fit in RAM it will not run at all.
+- **CUDA Toolkit** ≥ 11.0 + nvcc — **install this if you have any NVIDIA GPU.** CMake enables the GPU offload automatically when nvcc is on the `PATH` (`-DENABLE_CUDA=OFF` forces a CPU-only build); a CPU-only `tinycoder_bench` rejects `--gpu` with an explicit "needs a CUDA build" message rather than an unknown-option error. It enables the GPU offload engine on Turing / Ampere / Ada and newer (RTX 2080 Ti, RTX 3090, RTX 4090, RTX 5090). Without it the engine runs on the CPU only, which is several times to orders of magnitude slower depending on model size; on a model that does not fit in RAM it will not run at all.
 - **OpenMP** — **usually already present with the compiler**, so this normally costs nothing. It parallelises the CPU path across all cores; without it CPU inference is single-threaded.
 
 ### One-shot build
@@ -35,13 +35,13 @@ The script configures CMake, builds `tinycoder_core` (+ `tinycoder_test` and `ti
 ### Manual build
 
 ```bash
-# CPU-only
+# CUDA GPU offload — the default whenever nvcc is found
 cmake -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build --config Release -j
 
-# CUDA GPU offload
-cmake -B build-cuda -DCMAKE_BUILD_TYPE=Release -DENABLE_CUDA=ON
-cmake --build build-cuda --config Release -j
+# CPU-only: force it explicitly (a box without nvcc gets this automatically)
+cmake -B build-cpu -DCMAKE_BUILD_TYPE=Release -DENABLE_CUDA=OFF
+cmake --build build-cpu --config Release -j
 
 # Run tests
 ctest --test-dir build --output-on-failure
@@ -75,20 +75,21 @@ protocol, and the procedure used for the exllamav3 baseline — lives in
 
 ### ⚡ SIMD CPU Acceleration
 
-- **Runtime SIMD dispatch** — auto-detects the best available instruction set: **AMX** (Intel Sapphire Rapids+), **AVX-512** (Skylake-X / Ice Lake+), **AVX2** (Haswell+ / AMD Zen+), or a universal **Scalar** fallback
+- **Runtime SIMD dispatch** — auto-detects the best available instruction set: **AMX** (Intel Sapphire Rapids+), **AVX-512** (Skylake-X / Ice Lake+), **AVX2** (Haswell+ / AMD Zen+), or a universal **Scalar** fallback. The configure step reads the build host's CPU flags too and enables AVX-512 only when that CPU has it, so a default build runs on the machine that produced it
 - **OpenMP** thread parallelism for all matrix operations
 
 ### 🎮 CUDA GPU Offload Engine
 
 - Full-model GPU offload:
   - **Prefill** — two paths, selected per projection: cuBLAS fp16 tensor-core GEMM, and a from-scratch int8 `mma.s8.m8n8k16` stream-K GEMM that quantizes activations to Q8_0 and reads GGUF blocks straight from VRAM
-  - **Decode** — quantized on-the-fly-dequant GEMV kernels reading raw GGUF blocks from VRAM, fed by an int8 KV pool for qwen35 full-attention layers (per-slot row tracking, so repeated `generate()` calls cannot reuse a previous conversation's rows)
+  - **Decode** — quantized on-the-fly-dequant GEMV kernels reading raw GGUF blocks from VRAM, with an int8 KV store (or an f32 store plus an int8 decode mirror, or plain f32 — whichever the planner's fit chose) for qwen35 full-attention layers, with per-slot row tracking so repeated `generate()` calls cannot reuse a previous conversation's rows
   - **Attention** — warp flash attention (`kWarpAttention<HD>`, compile-time register accumulators, exactly `nHeads` warps) and the gated-delta-net recurrent kernels for qwen35's linear layers
   - **Decode capture** — the decode graph is captured into a CUDA graph (`TINYCODER_GPU_GRAPH`)
 - **EXL3 native kernels** — trellis reconstruct, GEMV and a fused prefill GEMM under [`cuda/exl3/`](src/cpp/core/cuda/exl3), with the cublasLt autotuned path as default and `TINYCODER_EXL3_LT=0` reproducing the older fixed-order k summation bit-for-bit
 - **Enabled by default** in builds compiled with `ENABLE_CUDA=ON`; all layers offloaded; automatic fallback to CPU when CUDA is unavailable or at the first forward error
 - **Two offload modes for models that exceed VRAM**: hybrid partial offload keeps the whole model in RAM and mirrors the first `numGpuLayers` layers to the GPU, and the MoE path additionally streams experts for the 35B-A3B checkpoint through a layer arena while the dense body stays resident
-- Runtime controls: `TINYCODER_GPU=0` forces the CPU path, `TINYCODER_NGL` limits offload to N layers (unset → automatic VRAM fit), `TINYCODER_INT8_GEMM=0` disables the int8 prefill path, `TINYCODER_KV8=0` disables the int8 KV pool, `TINYCODER_GPU_VERBOSE=1` prints per-stage CUDA timings. Full list in [ENVIRONMENT.md](ENVIRONMENT.md).
+- **Context window sized by memory, not by a constant** — `model.setContextLength(N)` (or `tinycoder_bench --ctx N`) asks for N tokens before the load; the planner measures free VRAM/RAM and grants the largest window that still fits the weights, the session's fixed ~1.4 GiB of scratch, and the K/V it is about to allocate. It sheds the int8 decode mirror first, then switches the K/V store to int8, so an 11 GB card holds **52,480** tokens for a 9B `q4_k_m` at f32 and **196,352** at int8 (27B EXL3: 2,560 f32 / **12,288** int8). A request that does not fit is reduced to the fit and the reason is printed; a window below 1024 tokens refuses the load. The default is unchanged at 2048 tokens, so every published throughput number still describes the shipped default. `TINYCODER_CONTEXT_DEBUG=1` prints the planner's inputs
+- Runtime controls: `TINYCODER_GPU=0` forces the CPU path, `TINYCODER_NGL` limits offload to N layers (unset → automatic VRAM fit), `TINYCODER_INT8_GEMM=0` disables the int8 prefill path, `TINYCODER_KV8=0` disables the int8 decode mirror (it follows the context plan by default), `TINYCODER_CONTEXT_KV8` pins the precision the planner may grant, `TINYCODER_GPU_VERBOSE=1` prints per-stage CUDA timings. Full list in [ENVIRONMENT.md](ENVIRONMENT.md).
 
 #### Supported GPUs
 
@@ -133,6 +134,9 @@ using namespace tinycoder;
 // 1. Create and load the model (GGUF v3)
 Model model;
 std::string err;
+// Optional, and only before load(): ask for a window and let the planner grant
+// the largest that fits (unset = 2048; see model.contextLength() / contextPlan()).
+model.setContextLength(65536);
 if (!model.load("/path/to/Qwen3.8-27B-UD-Q4_K_M.gguf", &err)) {
     // handle error
 }
@@ -175,7 +179,7 @@ cmake --build build -j
 ctest --test-dir build --output-on-failure
 ```
 
-The Google Test suite (`tinycoder_test`) covers dequantization correctness across all quantization types, reference parity against sequential token-by-token forward passes, full-question generation tests, thread-pool reentrancy, and GPU/CPU comparison. On the reference build (`q2_k`) **55 pass / 2 fail / 16 skip** — the 2 failures are the non-deterministic sampled full-question cases (`SampleQuestionTest.AnswersQuestion/0,2`), which pass in isolation and are pre-existing sampling flakes, not regressions. All deterministic parity tests (GPU-vs-CPU logits, batch-vs-sequential prefill, sequential-decode argmax) pass bit-exactly with the split-KV and fp16-KV paths both on and off.
+The Google Test suite (`tinycoder_test`) covers dequantization correctness across all quantization types, the context planner and its window guards, reference parity against sequential token-by-token forward passes, split-vs-single prefill, full-question generation tests, thread-pool reentrancy, and GPU/CPU comparison. Without a model it reports **114 tests, 97 passed, 0 failed** (the rest skip for want of a checkpoint); with one loaded the gated inference tests run too — `ModelTest.*` on a 1.5B `q2_k` passes 14/14 and the four `FullQuestions` cases pass on the 9B `q4_k_m`. The sampled full-question cases (temperature 0.7, `TOP_K`/`TOP_P` set) remain the flaky part: on the 27B EXL3 `1.60bpw` reference two of the four stop right after the opening code fence (`"```cpp"`, `"```python"`) because that checkpoint emits EOG there under sampling, while the same prompts answer correctly under greedy decoding — a checkpoint/sampler interaction, not a forward-path defect. All deterministic parity tests (GPU-vs-CPU logits, batch-vs-sequential prefill, sequential-decode argmax) pass bit-exactly with the split-KV and fp16-KV paths both on and off.
 
 **EXL3 tests** (self-contained; the `EXL3*` suite covers the trellis codec, the safetensors reader/JSON parser, path sniffing, the Hugging Face `tokenizer.json` loader, and — when a checkpoint directory is present — config mapping + tokenizer round-trip):
 

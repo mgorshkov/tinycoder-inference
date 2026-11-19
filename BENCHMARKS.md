@@ -2,7 +2,7 @@
 
 ## GPU Comparison (TinyCoder vs llama.cpp / exllamav3)
 
-Columns follow the benchmark defaults: `tinycoder_bench --n-prompts 512 --n-gen 128 --threads 36` (**pp512 / tg128**). GGUF baselines are `llama-bench -p 512 -n 128 -t 36 -r 1`, run **interleaved** with the TinyCoder run (three alternating pairs, so clock drift affects both columns equally, means reported; the Ornith-35B row adds `-ncmoe 99`, the same expert-offload mode the TinyCoder column uses); the EXL3 baseline is a local exllamav3 1.6.6 run measured with the same pp512/tg128 protocol — see [How the exllamav3 EXL3 baseline was measured](#how-the-exllamav3-exl3-baseline-was-measured); the two Ternary-Bonsai rows instead use PrismML's llama.cpp fork, because stock llama.cpp cannot load either Bonsai packing — see [How the Prism Bonsai baseline was measured](#how-the-prism-bonsai-baseline-was-measured). Warm mean-of-reps, RTX 2080 Ti. Bold marks the faster engine in a column. Figures are the mean of three alternating interleaved pairs (spread = (max - min)/2); the
+Columns follow the benchmark defaults: `tinycoder_bench --n-prompts 512 --n-gen 128 --threads 36` (**pp512 / tg128**). Every row below is a **CUDA build** (`cmake -B build -DCMAKE_BUILD_TYPE=Release`, which enables the offload engine whenever `nvcc` is installed; `-DENABLE_CUDA=OFF` produces a CPU-only binary that these numbers do not describe). `--gpu` forces the offload path and `--cpu` takes the CPU baseline of the same run; a CPU-only binary answers `--gpu` with "needs a CUDA build" and exit 2 rather than an unknown-option error. GGUF baselines are `llama-bench -p 512 -n 128 -t 36 -r 1`, run **interleaved** with the TinyCoder run (three alternating pairs, so clock drift affects both columns equally, means reported; the Ornith-35B row adds `-ncmoe 99`, the same expert-offload mode the TinyCoder column uses); the EXL3 baseline is a local exllamav3 1.6.6 run measured with the same pp512/tg128 protocol — see [How the exllamav3 EXL3 baseline was measured](#how-the-exllamav3-exl3-baseline-was-measured); the two Ternary-Bonsai rows instead use PrismML's llama.cpp fork, because stock llama.cpp cannot load either Bonsai packing — see [How the Prism Bonsai baseline was measured](#how-the-prism-bonsai-baseline-was-measured). Warm mean-of-reps, RTX 2080 Ti. Bold marks the faster engine in a column. Figures are the mean of three alternating interleaved pairs (spread = (max - min)/2); the
 dense-prefill attention path computes QK^T, causal softmax and PV in fp16 via cuBLAS, which moves the
 attention output by maxAbsDiff 0.0146 against the previous fp32 warp kernel -- a numerics change
 licensed by the gates, not a refactor, and measured as byte-identical greedy text on a 512-token prompt
@@ -113,6 +113,63 @@ transcode's own 1.19 GB/step: 5.66 GB native against 6.85 transcoded, which is 0
 ratio is 0.79. A native 28 B/128 decode would land near 62 tok/s at the current per-byte rate; the
 first attempt at one measured 4.6x slower (a per-code map lookup in the inner loop) and was not
 shipped, so the transcode stays and is also why the `ptq1_0` column exists at all.
+
+## Context window: what each checkpoint is granted, and what a long window costs
+
+The default is still **2048 tokens** (`--ctx` unset): a request is only honoured when one is given, so
+every row in the table above is unchanged and the three long-context rows were re-measured at the
+default window to confirm it (9B 2554.9 / 83.44, Bonsai `pq2_0` 878.7 / 51.28, 27B EXL3 727.4 / 23.52
+against the published 2560.4 / 82.3, 880.6 / 51.73, 727.5 / 23.60 -- all inside the run-to-run spread).
+Passing `--ctx N` asks the planner for N; it grants the largest window that fits the measured free
+VRAM/RAM minus the weights, the session's fixed ~1.4 GiB of scratch, and the K/V cost of the precision
+it picks (f32 K/V + an int8 decode mirror, then f32, then int8), and it refuses the load below 1024
+tokens. What it grants on an 11 GB card:
+
+| Checkpoint | K/V at the grant | Largest window granted (`maxAllowed`) | What leaves the ladder first |
+|---|---|---|---|
+| Ornith-1.5-9B `q4_k_m` | int8 | **196,352** | f32 K/V (52,480), then f32+mirror (41,984) |
+| Ternary-Bonsai-2-27B `pq2_0` | int8 | **64,256** | f32 K/V (16,640), then f32+mirror |
+| Qwen3.8-27B EXL3 `1.60bpw` | int8 | **12,288** (default 2048 stays f32+mirror) | f32 K/V (2,560), then f32+mirror |
+
+Throughput at a granted window, same protocol as the table above (`--n-prompts 512 --n-gen 128 --reps 1
+--threads 36`, one process at a time; `maxAllowed` alongside each grant):
+
+| Checkpoint | `--ctx` | Granted | `maxAllowed` | K/V | pp512 | tg128 |
+|---|---|---|---|---|---|---|
+| Ornith-1.5-9B | 8192 | 8192 | 196,352 | f32+mirror, 652 MB | 2535.9 tok/s | 83.36 tok/s |
+| Ornith-1.5-9B | 65536 | 65536 | 196,352 | int8, 1120 MB | 2531.2 tok/s | 79.88 tok/s |
+| Ternary-Bonsai-2-27B | 8192 | 8192 | 64,256 | f32+mirror, 1294 MB | 878.8 tok/s | 51.34 tok/s |
+| Ternary-Bonsai-2-27B | 64000 | 64000 | 64,256 | int8, 2109 MB | 873.2 tok/s | 48.49 tok/s |
+
+A 64k window costs **2-6% of decode and nothing measurable in prefill** at these sizes (prefill here
+processes 512 tokens, so its per-token cost does not see the window; the long-prompt prefill rate does
+-- the f32 store without the mirror (`--ctx 45056`, a rung only that request can take) prefills a
+44,892-token prompt at 533 tok/s because the causal attention over the window is quadratic, against
+2535 tok/s at pp512). The int8 store is what makes the window fit, and its cost is one
+quantisation pass per K/V row: at the same 2048 window on Bonsai, f32 gives `id=198 logit=17.122244`
+and int8 `id=198 logit=17.109360` -- same top-1, same top-3 order, a 0.0129 absolute (7.5e-4 relative)
+shift, i.e. quantisation noise rather than a different distribution.
+
+Sizes this does **not** reach on an 11 GB card, computed from the measured per-token costs (9B
+17,920 B/token int8, Bonsai and the 27B 34,560 B/token) plus the weights and the fixed overhead:
+
+| Window | 9B (5.6 GB weights) | Bonsai (6.7 GB) | 27B EXL3 (8.6 GB) |
+|---|---|---|---|
+| 262,144 (256k) | 11.3 GiB | 16.4 GiB | 18.2 GiB |
+| 1,048,576 (1M) | 24.4 GiB | 41.7 GiB | 44.6 GiB |
+
+so 256k needs roughly a 12-24 GiB card for these checkpoints and 1M needs 24-48 GiB (or four cards
+with layer sharding, which this engine does not implement). Positions past the 262,144 tokens the
+checkpoints were trained for also need RoPE scaling, which the engine does not have: the grant is a
+capacity, not an accuracy claim, and retrieval accuracy beyond the trained length is untested here.
+
+Gates for these rows: `./scripts/context_gate.sh` (six rows, exit 0 -- the 9B answers a needle from
+token 0 at 64k, Bonsai is grant-checked because it does not answer a needle at any length, the 27B
+grant row confirms its default 2048 is untouched), and `./scripts/text_gate.sh`, where every checkpoint
+these rows use answers (1.5B, 7B, 9B, Bonsai `pq2_0`/`ptq1_0`, 27B EXL3). The 35B-A3B row is the one
+failure in that script and it is not this feature's: it emits `endahendah...` from the first token at
+BASE `d79d73f` too, byte-identical logits, so its published 176.3 / 53.6 row still has no working text
+gate.
 
 ---
 

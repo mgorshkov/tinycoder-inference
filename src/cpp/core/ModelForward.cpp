@@ -51,6 +51,17 @@ namespace tinycoder {
             return np::Array<float>{};
         }
 
+        // A request that would not fit the window is refused before anything
+        // touches the cache.  This used to be unchecked: the position simply
+        // grew past maxSeqLen and the K/V store wrote past its allocation.
+        if (kvCache_.pos + tokens.size() > config_.maxSeqLen) {
+            contextFull_ = true;
+            std::cerr << "[TinyCoder] context full: " << kvCache_.pos << " cached + "
+                      << tokens.size() << " new > " << config_.maxSeqLen
+                      << "-token window" << std::endl;
+            return np::Array<float>{};
+        }
+
         // GPU-offload continuation state for the qwen35 hybrid (partial
         // offload): when the GPU runs only the first N layers ($TINYCODER_NGL),
         // the CPU path below resumes from layer N on the GPU-produced hidden
@@ -161,6 +172,12 @@ namespace tinycoder {
                 // shared tail.
                 gpuSessionActive_ = true;
             } else {
+                // A window overflow is not a GPU fault: the CPU cannot hold the
+                // request either, and falling back would recompute a session
+                // from position 0 that the caller just asked to extend.
+                if (gpuContextFull_ || contextFull_) {
+                    return np::Array<float>{};
+                }
                 if (std::getenv("TINYCODER_NO_CPU_FALLBACK") != nullptr) {
                     // Diagnostic: stop at the first GPU failure instead of
                     // grinding through a multi-minute CPU prefill, so a fault
@@ -297,6 +314,16 @@ namespace tinycoder {
         // For the qwen35 hybrid the GPU already ran layers 0..gpuContinueLayer-1
         // (their conv/GDN/KV state lives on the device); resume on the CPU from
         // gpuContinueLayer.  Pure-CPU runs start at layer 0.
+        //
+        // The host K/V cache is allocated here, on first use, for exactly the
+        // layers this loop will run: a fully offloaded session never allocates
+        // it at all, and a partial one allocates only its CPU tail.
+        if (!ensureHostKv(gpuContinueLayer)) {
+            std::cerr << "[TinyCoder] cannot allocate the host K/V cache for "
+                      << (nLayers - gpuContinueLayer) << " CPU layers at "
+                      << config_.maxSeqLen << " tokens" << std::endl;
+            return np::Array<float>();
+        }
         for (uint32_t layer = gpuContinueLayer; layer < nLayers; ++layer) {
             // Cooperative cancellation: bail out between layers. The token
             // callback alone cannot interrupt a single long prefill/decode
@@ -523,9 +550,9 @@ namespace tinycoder {
                 // Store K, V in cache (K-RoPE fused into the K write, P3).
                 uint32_t cachePos = static_cast<uint32_t>(kvCache_.pos);
                 float *kCacheLayer =
-                        kvCache_.k.data() + layer * maxSeqLen * nKVHeads * headDim;
+                        kvCache_.k.data() + static_cast<size_t>(hostKvSlot(layer)) * maxSeqLen * nKVHeads * headDim;
                 float *vCacheLayer =
-                        kvCache_.v.data() + layer * maxSeqLen * nKVHeads * headDim;
+                        kvCache_.v.data() + static_cast<size_t>(hostKvSlot(layer)) * maxSeqLen * nKVHeads * headDim;
 
                 storeKVWithRoPE(kData, vData, kCacheLayer, vCacheLayer, seqLen,
                                 cachePos, nKVHeads);
@@ -1208,6 +1235,12 @@ namespace tinycoder {
 
         // Update KV cache position
         kvCache_.pos += seqLen;
+        // A successful forward proves the window was not full.  Both latches are
+        // sticky until now, so one refusal (a probe, an aborted long prompt)
+        // permanently suppressed the later GPU->CPU fallback and left
+        // contextFull() true after a perfectly good forward.
+        contextFull_ = false;
+        gpuContextFull_ = false;
 
         // Consume any pending one-shot P0 pruning request now that the core
         // forward has run, so it never leaks into a subsequent forward call.

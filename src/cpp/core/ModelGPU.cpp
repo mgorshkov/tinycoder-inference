@@ -322,6 +322,22 @@ namespace tinycoder {
                                   typeBlockBytes(m.type);
                 };
                 const uint32_t kvLen = cfg.numKVHeads * cfg.headDim;
+                // Bytes of K/V this session really keeps per token, at the
+                // precision the context plan granted.  A model without a plan
+                // (a direct GPU upload outside Model::load) falls back to the
+                // historical f32 store.
+                const auto &plan = m.contextPlan();
+                uint64_t kvBytesPerToken_ = static_cast<uint64_t>(kvLen) *
+                                            sizeof(float) * 2;
+                if (plan.seqLen > 0) {
+                    detail::ContextRequest kvReq;
+                    kvReq.numAttentionLayers = 1;
+                    kvReq.numKVHeads = cfg.numKVHeads;
+                    kvReq.headDim = cfg.headDim;
+                    kvReq.ropeDims = 0;
+                    kvBytesPerToken_ = detail::kvBytesPerToken(
+                            kvReq, plan.kv, plan.kvMirror);
+                }
                 if (cfg.architecture == ARCH_QWEN35) {
                     const uint32_t keyDim = cfg.ssmStateSize * cfg.ssmGroupCount;
                     const uint32_t valueDim = cfg.ssmInnerSize;
@@ -354,8 +370,12 @@ namespace tinycoder {
                         nAttnLayers = (cfg.numLayers + cfg.fullAttentionInterval - 1u) /
                                       cfg.fullAttentionInterval;
                     }
+                    // Charge the K/V at the precision the context plan
+                    // granted (f32 store, its int8 decode mirror, or the int8
+                    // store) instead of assuming f32: at a long window the
+                    // difference is what decides the layer split.
                     layerBytes += static_cast<uint64_t>(nAttnLayers) *
-                                  cfg.maxSeqLen * kvLen * sizeof(float) * 2 /
+                                  cfg.maxSeqLen * kvBytesPerToken_ /
                                   static_cast<uint64_t>(cfg.numLayers);
                     layerBytes += static_cast<uint64_t>(cfg.ssmConvKernel - 1) *
                                   convChannels * sizeof(float);
@@ -374,8 +394,8 @@ namespace tinycoder {
                         addMat(w.ffnDown);
                     }
                     layerBytes = (layerBytes + cfg.numLayers - 1) / cfg.numLayers;
-                    layerBytes += static_cast<uint64_t>(cfg.maxSeqLen) * kvLen *
-                                  sizeof(float) * 2;
+                    layerBytes += static_cast<uint64_t>(cfg.maxSeqLen) *
+                                  kvBytesPerToken_;
                 }
                 // Token embedding bytes (K-quants: width-256 blocks).
                 const uint32_t embBlockBytes = typeBlockBytes(emb.type);
@@ -555,6 +575,16 @@ namespace tinycoder {
             geom.numKVHeads = cfg.numKVHeads;
             geom.headDim = cfg.headDim;
             geom.maxSeqLen = cfg.maxSeqLen;
+            // int8 K/V as the store when the window was granted that way: the
+            // f32 cache is 4x larger, and at 64k that is the difference between
+            // fitting and being reduced by the planner.
+            geom.kvStoreI8 =
+                    (m.contextPlan().seqLen > 0 &&
+                     m.contextPlan().kv == detail::KvPrecision::I8) ? 1u : 0u;
+            // The mirror is only free if the grant paid for it.  Rung 2 exists
+            // to shed it, and an unplanned mirror allocation is a window the
+            // planner charged 25% too little for.
+            geom.kvMirror = (m.contextPlan().kvMirror && geom.kvStoreI8 == 0) ? 1u : 0u;
             geom.vocabSize = cfg.vocabSize;
             geom.ropeTheta = cfg.ropeTheta;
             geom.qwen2Bias = (cfg.architecture == ARCH_QWEN2) ? 1u : 0u;
@@ -1306,6 +1336,19 @@ namespace tinycoder {
         std::string err;
         bool ok = gpuState_->adapter->forward(*this, tokens, computeAllLogits,
                                               logitsOut, err);
+        if (!ok && err.empty()) {
+            // A bare `false` used to reach the caller as "forward fallback to
+            // CPU (no detail)", which hides an out-of-memory or an unsupported
+            // shape.  Ask CUDA what happened before the error state is cleared.
+            cudaError_t last = cudaGetLastError();
+            err = std::string("GPU forward failed: ") +
+                  (last == cudaSuccess ? std::string("no CUDA error recorded")
+                                       : std::string(cudaGetErrorString(last)));
+        }
+        // A refused window is reported to the caller as a distinct state: the
+        // CPU path cannot hold the request either, so forward() must not treat
+        // this like a GPU fault and fall back.
+        if (gpuState_->adapter->gpu_.contextFull()) gpuContextFull_ = true;
         if (errMsg && !err.empty()) *errMsg = std::move(err);
         return ok;
     }

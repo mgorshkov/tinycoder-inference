@@ -26,6 +26,7 @@ add_executable(tinycoder_test
     Main.cpp
     ModelTest.cpp
     DequantizeTest.cpp
+    ContextPlanTest.cpp
     EXL3Test.cpp
     ReferenceCompareTest.cpp
     ThreadPoolReentrancyTest.cpp
@@ -62,6 +63,18 @@ add_executable(tiny_logits_probe
 )
 
 target_link_libraries(tiny_logits_probe
+    PRIVATE
+    tinycoder_core
+)
+
+# Context-window probe: needle-in-a-haystack at a requested window.  The gate
+# script (scripts/context_gate.sh) drives it, so it lives next to the logits
+# probe rather than in tests/.
+add_executable(ctx_probe
+    ../tools/ctx_probe.cpp
+)
+
+target_link_libraries(ctx_probe
     PRIVATE
     tinycoder_core
 )

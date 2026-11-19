@@ -72,6 +72,7 @@ int main(int argc, char **argv) {
     std::vector<int32_t> idsPrompt;   // --ids-file: raw ids, no tokenizer
     int seqGen = 0;                   // --seq-gen: decode-vs-prefill chain
     bool dumpTokens = false;
+    uint32_t ctxRequest = 0;
     bool runGenerate = false;
     int32_t genMaxTokens = 160;
     uint32_t genSeed = 42;
@@ -110,6 +111,9 @@ int main(int argc, char **argv) {
         } else if (strcmp(a, "--max-tokens") == 0 && i + 1 < argc) {
             genMaxTokens = atoi(argv[i + 1]);
             i += 2;
+        } else if (strcmp(a, "--ctx") == 0 && i + 1 < argc) {
+            ctxRequest = static_cast<uint32_t>(std::atoi(argv[i + 1]));
+            i += 2;
         } else if (strcmp(a, "--seed") == 0 && i + 1 < argc) {
             genSeed = (uint32_t) strtoul(argv[i + 1], nullptr, 10);
             i += 2;
@@ -131,7 +135,8 @@ int main(int argc, char **argv) {
     }
     if (!modelPath) {
         fprintf(stderr,
-                "usage: %s [<model.gguf>] [--file <prompt> | \"prompt\"] [--tokens]\n",
+                "usage: %s [<model.gguf>] [--file <prompt> | \"prompt\"] [--tokens] "
+                "[--ctx N]\n",
                 argv[0]);
         return 1;
     }
@@ -149,11 +154,24 @@ int main(int argc, char **argv) {
     Model model;
     std::string loadErr;
     auto t0 = std::chrono::high_resolution_clock::now();
+    // --ctx N requests a window before load: the planner grants what fits, and
+    // the granted value is printed below (this tool's job is the logits, not the
+    // window, but a probe that cannot ask for a window cannot check one either).
+    if (ctxRequest != 0 && !model.setContextLength(ctxRequest)) {
+        fprintf(stderr, "cannot set the context window to %u\n", ctxRequest);
+        return 1;
+    }
     if (!model.load(modelPath, &loadErr)) {
         fprintf(stderr, "model load failed: %s\n", loadErr.c_str());
         return 2;
     }
     auto t1 = std::chrono::high_resolution_clock::now();
+    std::fprintf(stderr, "context window: %u tokens (maxAllowed %u, kv=%s)\n",
+                 model.contextLength(),
+                 model.contextPlan().maxAllowed,
+                 model.contextPlan().kv == tinycoder::detail::KvPrecision::I8
+                         ? "int8"
+                         : "f32");
     fprintf(stderr, "model loaded in %.1f s\n",
             std::chrono::duration<double>(t1 - t0).count());
 
@@ -346,6 +364,15 @@ int main(int argc, char **argv) {
     auto f0 = std::chrono::high_resolution_clock::now();
     np::Array<float> logits = model.forward(toks, false);
     auto f1 = std::chrono::high_resolution_clock::now();
+    if (logits.size() == 0) {
+        // The engine refuses a request that does not fit the window (it used
+        // to write past the K/V allocation instead); report it as a failure
+        // rather than dereferencing an empty array.
+        fprintf(stderr, "  forward refused: %s\n",
+                model.contextFull() ? "the prompt does not fit the window"
+                                    : "no logits produced");
+        return 2;
+    }
     fprintf(stderr, "  forward took %.1f s\n",
             std::chrono::duration<double>(f1 - f0).count());
 

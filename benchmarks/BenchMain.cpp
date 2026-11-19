@@ -51,7 +51,8 @@ namespace {
         int32_t nGen = 128;     // generated token count
         int32_t reps = 5;       // warm repeats
         int32_t threads = 0;    // 0 = recommendedThreadCount()
-        bool gpu = false;       // --gpu: use the CUDA offload engine
+        uint32_t ctx = 0;        // --ctx: requested window, 0 = auto (2048)
+        int forceGpu = -1;       // --gpu = 1, --cpu/--no-gpu = 0, unset = -1
     };
 
     double nowMs() {
@@ -136,8 +137,15 @@ namespace {
                      "  --n-gen N        generated token count (default 128)\n"
                      "  --reps N         warm repeat count (default 5)\n"
                      "  --threads N      thread pool size (default: logical CPUs)\n"
-#ifdef USE_CUDA
-                     "  --gpu            use the CUDA offload engine (default when built with CUDA)\n"
+                     "  --ctx N          context window in tokens (default 0 = auto, 2048;\n"
+                     "                   granted = min(request, model max, what fits))\n"
+                     "  --gpu            use the CUDA offload engine (the default in a CUDA\n"
+                     "                   build; overrides TINYCODER_GPU=0)\n"
+                     "  --cpu, --no-gpu  force the CPU path (CPU baseline of the same run)\n"
+#ifndef USE_CUDA
+                     "                   NOTE: this binary was built WITHOUT CUDA, so --gpu\n"
+                     "                   is unavailable: reconfigure with -DENABLE_CUDA=ON\n"
+                     "                   (the default when nvcc is installed)\n"
 #endif
                      ,
                      argv0);
@@ -159,16 +167,22 @@ int main(int argc, char **argv) {
             opt.modelPath = next();
         } else if (std::strcmp(argv[i], "--n-prompts") == 0) {
             opt.nPrompts = std::atoi(next().c_str());
+        } else if (std::strcmp(argv[i], "--ctx") == 0) {
+            opt.ctx = static_cast<uint32_t>(std::atoi(next().c_str()));
         } else if (std::strcmp(argv[i], "--n-gen") == 0) {
             opt.nGen = std::atoi(next().c_str());
         } else if (std::strcmp(argv[i], "--reps") == 0) {
             opt.reps = std::atoi(next().c_str());
         } else if (std::strcmp(argv[i], "--threads") == 0) {
             opt.threads = std::atoi(next().c_str());
-#ifdef USE_CUDA
         } else if (std::strcmp(argv[i], "--gpu") == 0) {
-            opt.gpu = true;
-#endif
+            // Accepted in every build on purpose: "unknown option: --gpu" is what
+            // a CPU-only binary used to say, and it reads like a typo rather than
+            // "this build has no offload engine".  The clear error comes below.
+            opt.forceGpu = 1;
+        } else if (std::strcmp(argv[i], "--cpu") == 0 ||
+                   std::strcmp(argv[i], "--no-gpu") == 0) {
+            opt.forceGpu = 0;
         } else if (std::strcmp(argv[i], "-h") == 0 ||
                    std::strcmp(argv[i], "--help") == 0) {
             printUsage(argv[0]);
@@ -191,16 +205,25 @@ int main(int argc, char **argv) {
     if (opt.modelPath.empty()) {
         opt.modelPath = "/data/models/qwen/qwen2.5-coder-1.5b-instruct-q2_k.gguf";
     }
+    if (opt.forceGpu == 1) {
 #ifdef USE_CUDA
-    // --gpu: force the CUDA offload engine on (the default in CUDA builds;
-    // this also overrides a TINYCODER_GPU=0 opt-out e.g. for a CPU baseline).
-    // Must happen before Model::load() so weights are uploaded once at first
-    // forward.
-    if (opt.gpu) {
-        std::fprintf(stderr, "[bench] CUDA offload engine enabled\n");
+        // The default in a CUDA build; --gpu also overrides a TINYCODER_GPU=0
+        // opt-out.  Must happen before Model::load() so weights are uploaded
+        // once, at first forward.
+        std::fprintf(stderr, "[bench] CUDA offload engine requested\n");
         setenv("TINYCODER_GPU", "1", 1);
-    }
+#else
+        std::fprintf(stderr,
+                     "[bench] --gpu needs a CUDA build, and this binary has none: "
+                     "reconfigure with -DENABLE_CUDA=ON (the default when nvcc is "
+                     "installed) and rebuild.\n");
+        return 2;
 #endif
+    } else if (opt.forceGpu == 0) {
+        // CPU baseline of the same run: the engine reads this at load time.
+        std::fprintf(stderr, "[bench] CPU path forced (no GPU offload)\n");
+        setenv("TINYCODER_GPU", "0", 1);
+    }
     if (opt.reps < 1) opt.reps = 1;
 
     size_t threads = opt.threads > 0
@@ -211,6 +234,11 @@ int main(int argc, char **argv) {
     std::fprintf(stderr, "Loading model: %s\n", opt.modelPath.c_str());
     tinycoder::Model model;
     std::string err;
+    // The window has to be requested before load: it sizes the caches.
+    if (opt.ctx > 0 && !model.setContextLength(opt.ctx)) {
+        std::fprintf(stderr, "FATAL: cannot set context length %u\n", opt.ctx);
+        return 1;
+    }
     if (!model.load(opt.modelPath, &err)) {
         std::fprintf(stderr, "FATAL: model load failed: %s\n", err.c_str());
         return 1;

@@ -192,6 +192,139 @@ TEST_F(ModelTest, ModelLoaded) {
 }
 
 // ---------------------------------------------------------------------------
+// Test: a caller-requested context window survives load()
+//
+// Before this, Model::load overwrote the caller's maxSeqLen with the loader's
+// config and then clamped it to 2048, so `tc_engine_load(..., max_seq_len)`
+// and every per-model context_length in the server were silently ignored.
+// ---------------------------------------------------------------------------
+
+TEST_F(ModelTest, ContextLengthRequestIsHonored) {
+    tinycoder::Model m;
+    ASSERT_TRUE(m.setContextLength(4096));
+    std::string err;
+    ASSERT_TRUE(m.load(SharedTestEnv::modelPath, &err)) << err;
+    EXPECT_EQ(m.contextLength(), 4096u);
+    EXPECT_EQ(m.contextPlan().seqLen, 4096u);
+    EXPECT_GE(m.contextPlan().maxAllowed, 4096u);
+    EXPECT_FALSE(m.contextPlan().reason.empty());
+    // Too late: the window is fixed once the cache exists.
+    EXPECT_FALSE(m.setContextLength(8192));
+}
+
+// ---------------------------------------------------------------------------
+// Test: a forward that does not fit the window is refused, not truncated
+//
+// The cache position used to grow past maxSeqLen and the store wrote past the
+// allocation: a 3000-token prefill on a 2048 window ran at full speed and
+// silently corrupted memory past the K/V buffer.
+// ---------------------------------------------------------------------------
+
+TEST_F(ModelTest, ContextFullMidConversation) {
+    tinycoder::Model m;
+    ASSERT_TRUE(m.setContextLength(1024));
+    std::string err;
+    ASSERT_TRUE(m.load(SharedTestEnv::modelPath, &err)) << err;
+    ASSERT_EQ(m.contextLength(), 1024u) << err;
+    // Prefill 1000 tokens, then ask for 64 more: 1064 > 1024.
+    const std::vector<int32_t> first(1000, 1);
+    const std::vector<int32_t> second(64, 1);
+    ASSERT_NE(m.forward(first).size(), 0u);
+    const auto out = m.forward(second);
+    EXPECT_EQ(out.size(), 0u);
+    EXPECT_TRUE(m.contextFull());
+    EXPECT_EQ(m.kvCacheSize(), 1000u);
+}
+
+// ---------------------------------------------------------------------------
+// Test: an over-window prompt is refused by generate(), not read as a row
+//
+// forward() signals a refusal with an EMPTY logits array.  generate() used to
+// memcpy vocabSize floats from that array's data() (null for a rank-0 array),
+// i.e. a ~1 MB read at address 0 on the most common public entry point, for any
+// prompt longer than the window.  The refusal must come back as an empty token
+// list with contextFull() set.
+// ---------------------------------------------------------------------------
+TEST_F(ModelTest, GenerateOverLongPromptReturnsEmpty) {
+    tinycoder::Model m;
+    ASSERT_TRUE(m.setContextLength(1024));
+    std::string err;
+    ASSERT_TRUE(m.load(SharedTestEnv::modelPath, &err)) << err;
+
+    // ~1200 tokens of a repeated word: longer than the window, and cheap to
+    // tokenize (no prefill runs -- the guard fires before any compute).
+    std::string prompt;
+    prompt.reserve(6000);
+    for (int i = 0; i < 1600; ++i) prompt += "hello ";
+    const auto toks = m.tokenize(prompt);
+    ASSERT_GT(toks.size(), 1024u);
+
+    tinycoder::InferenceParams params;
+    params.maxTokens = 4;
+    const auto out = m.generate(prompt, params, {});
+    EXPECT_TRUE(out.empty()) << "generated " << out.size() << " tokens from a "
+                             << toks.size() << "-token prompt on a 1024 window";
+    EXPECT_TRUE(m.contextFull());
+    EXPECT_EQ(m.kvCacheSize(), 0u);
+}
+
+// ---------------------------------------------------------------------------
+// Test: a chunked prefill agrees with a single prefill of the same tokens
+//
+// Long prompts are fed in kPrefillChunk pieces so the activation scratch stays
+// bounded.  That path is only correct if the cache carries the prefix exactly:
+// the last-token logits of "A then B" must equal those of "A+B" in one call.
+// ---------------------------------------------------------------------------
+
+TEST_F(ModelTest, SplitPrefillMatchesSinglePrefill) {
+    tinycoder::Model m;
+    // Both sides must run the SAME chunk shapes or this measures the GEMM's
+    // m-tile accumulation instead of the cache carry: 1200+1200 against one 2400
+    // call splits into (512,512,176)x2 against (512,512,512,512,352), and that
+    // shape change alone moves the last-row logits by 0.0638 (measured).  1024
+    // and 2048 are both exact multiples of kPrefillChunk, so the chunks are
+    // (512,512) twice against (512,512,512,512) and any difference is a carry
+    // bug.  The window stays inside the f32+mirror rung on every checkpoint used
+    // here (the 27B reference grants 2560 there; above that it takes int8, whose
+    // quantisation would add its own shift).
+    ASSERT_TRUE(m.setContextLength(2048));
+    std::string err;
+    ASSERT_TRUE(m.load(SharedTestEnv::modelPath, &err)) << err;
+    std::vector<int32_t> a(1024, 100), b(1024, 101), all = a;
+    all.insert(all.end(), b.begin(), b.end());
+    // computeAllLogits=false takes the chunked prefill path (kPrefillChunk =
+    // 512) on both sides: the only difference is where the boundary falls, so a
+    // difference here is a cache bug, not a different GEMM shape.  (With
+    // computeAllLogits=true the GPU runs one 6000-row batch against two 3000-row
+    // ones and the tensor-core accumulation differs by ~0.06 -- a shape effect
+    // that predates the window work and is not what this test is about.)
+    const auto one = m.forward(all, false);// 6000 tokens in one call
+    ASSERT_NE(one.size(), 0u);
+    m.clearKVCache();
+    ASSERT_NE(m.forward(a, false).size(), 0u);// 3000 ...
+    const auto two = m.forward(b, false);     // ... then 3000 more
+    ASSERT_NE(two.size(), 0u);
+    const uint32_t V = SharedTestEnv::config.vocabSize;
+    const size_t oneOff = one.size() - V, twoOff = two.size() - V;
+    float maxDiff = 0.0f;
+    int32_t oneTop = 0, twoTop = 0;
+    for (uint32_t i = 0; i < V; ++i) {
+        const float a = one.get(oneOff + i), b = two.get(twoOff + i);
+        maxDiff = std::max(maxDiff, std::fabs(a - b));
+        if (a > one.get(oneOff + oneTop)) oneTop = static_cast<int32_t>(i);
+        if (b > two.get(twoOff + twoTop)) twoTop = static_cast<int32_t>(i);
+    }
+    // The token has to be the same: a cache bug reorders it long before the
+    // value moves.  Measured with a 512-token chunk boundary at 6000 vs
+    // 3000+3000: CPU < 1e-3 (fp32 SIMD, exact cache carry), GPU 0.0101 (the
+    // fp16 tensor-core chunk GEMM accumulates over a different m-tile count at
+    // the two boundaries; the same tokens in one 6000-row batch differ by
+    // 0.0618, which is why both sides take the chunked path here).
+    EXPECT_EQ(oneTop, twoTop) << "split prefill changed the argmax";
+    EXPECT_LT(maxDiff, 0.05f) << "split prefill diverged from a single prefill";
+}
+
+// ---------------------------------------------------------------------------
 // Test: Tokenizer Encoding/Decoding
 // ---------------------------------------------------------------------------
 
@@ -562,6 +695,14 @@ TEST_P(SampleQuestionTest, AnswersQuestion) {
 
     std::string generatedText;
     int tokenCount = 0;
+
+    // Every gated question starts from an EMPTY cache.  Without this the four
+    // instantiations share one Model and each one generates on top of the
+    // previous answer's tokens: running the suite with the 27B reference had
+    // question /3 ("write a for loop...") answer "Paris", i.e. it attended the
+    // previous question's context instead of its own.  `text_gate.sh` never saw
+    // it because it runs one instantiation per process.
+    SharedTestEnv::model->clearKVCache();
 
     auto t0 = std::chrono::high_resolution_clock::now();
     SharedTestEnv::model->generate(prompt, params,

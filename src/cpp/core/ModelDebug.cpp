@@ -49,6 +49,13 @@ namespace tinycoder {
         uint32_t vocabSize = config_.vocabSize;
         uint32_t intermediateSize = config_.intermediateSize;
 
+        // This dump runs its own CPU layer loop, so it needs the host K/V even
+        // when the GPU owns the session: allocate it (idempotent) for all layers.
+        if (!ensureHostKv(0)) {
+            std::cerr << "[TinyCoder] debug forward: no host K/V" << std::endl;
+            return {};
+        }
+
         std::cout << "\n=== Debug Forward Pass (Per-Layer Dumps) ===" << std::endl;
         std::cout << "  Token ID: " << tokenId << std::endl;
         std::cout << "  Config: " << nLayers << " layers, " << hiddenSize
@@ -228,9 +235,9 @@ namespace tinycoder {
                 // Store K, V in cache
                 uint32_t cachePos = static_cast<uint32_t>(kvCache_.pos);
                 float *kCacheLayer =
-                        kvCache_.k.data() + layer * maxSeqLen * nKVHeads * headDim;
+                        kvCache_.k.data() + static_cast<size_t>(hostKvSlot(layer)) * maxSeqLen * nKVHeads * headDim;
                 float *vCacheLayer =
-                        kvCache_.v.data() + layer * maxSeqLen * nKVHeads * headDim;
+                        kvCache_.v.data() + static_cast<size_t>(hostKvSlot(layer)) * maxSeqLen * nKVHeads * headDim;
                 uint32_t kvSize = nKVHeads * headDim;
                 for (uint32_t i = 0; i < kvSize; ++i) {
                     kCacheLayer[cachePos * nKVHeads * headDim + i] = k[i];
@@ -599,9 +606,9 @@ namespace tinycoder {
                 // Store K, V in cache
                 uint32_t cachePos = static_cast<uint32_t>(kvCache_.pos);
                 float *kCacheLayer =
-                        kvCache_.k.data() + layer * maxSeqLen * nKVHeads * headDim;
+                        kvCache_.k.data() + static_cast<size_t>(hostKvSlot(layer)) * maxSeqLen * nKVHeads * headDim;
                 float *vCacheLayer =
-                        kvCache_.v.data() + layer * maxSeqLen * nKVHeads * headDim;
+                        kvCache_.v.data() + static_cast<size_t>(hostKvSlot(layer)) * maxSeqLen * nKVHeads * headDim;
                 uint32_t kvSize = nKVHeads * headDim;
                 for (uint32_t i = 0; i < kvSize; ++i) {
                     kCacheLayer[cachePos * nKVHeads * headDim + i] = k[i];

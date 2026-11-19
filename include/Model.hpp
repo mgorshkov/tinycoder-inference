@@ -36,6 +36,7 @@
 #include <np/Array.hpp>
 
 #include "AlignedVector.hpp"
+#include "ContextPlan.hpp"
 #include "GGMLDequantize.hpp"
 #include "GGUFLoader.hpp"
 #include "IModelLoader.hpp"
@@ -194,6 +195,17 @@ namespace tinycoder {
         /// @brief GPU adapter runtime state (opaque; defined in ModelGPU.cpp).
         struct ModelGPUState;
 
+        /// @brief Allocate the host K/V cache lazily, for the layers the CPU
+        /// will run ([firstCpuLayer, numLayers)) and only their full-attention
+        /// layers.  Idempotent for the same first layer; refuses (with the
+        /// numbers) when the CPU tail's f32 cache does not fit free host RAM.
+        bool ensureHostKv(uint32_t firstCpuLayer);
+
+        /// @brief Slot index of `layer` inside the allocated host K/V cache.
+        /// Mirrors the device side (slot = layer / fullAttentionInterval), so a
+        /// partially offloaded session cannot hand a CPU layer the wrong slot.
+        uint32_t hostKvSlot(uint32_t layer) const;
+
         /// @brief Run a forward pass on the GPU (see GPUCompute.hpp).
         /// @param logitsOut Host buffer: vocabSize floats when computeAllLogits is
         ///        false, else seqLen*vocabSize.
@@ -342,6 +354,26 @@ namespace tinycoder {
 
         Model();
         ~Model();
+
+        /// @brief Request a context window before load() (0 = auto, 2048).
+        ///
+        /// The window the engine actually grants is the smaller of this
+        /// request, the checkpoint's own trained limit, and what free VRAM/RAM
+        /// can hold — see Model::load and Model::contextPlan.  Returns false
+        /// once the model is loaded, because the cache is already sized.
+        bool setContextLength(uint32_t tokens);
+
+        /// @brief The context window that was granted at load time.
+        uint32_t contextLength() const { return config_.maxSeqLen; }
+
+        /// @brief True once a call asked for more tokens than the window holds.
+        /// The cache is left untouched and forward() returns an empty array;
+        /// clearKVCache() resets it.
+        bool contextFull() const { return contextFull_; }
+
+        /// @brief The full decision behind the granted window (precision,
+        /// memory-derived maximum, and the one-line reason that was printed).
+        const detail::ContextPlan &contextPlan() const { return contextPlan_; }
 
         /// @brief Load model from a GGUF file.
         /// @param modelPath Path to the GGUF model file
@@ -756,6 +788,15 @@ namespace tinycoder {
         // ---- Runtime state ----
         bool loaded_ = false;
         ModelConfig config_;
+        /// Set when a forward was refused because it would not fit the window.
+        bool contextFull_ = false;
+        /// Set when the *device* engine refused for the same reason; keeps the
+        /// GPU->CPU fallback from retrying a request the window cannot hold.
+        bool gpuContextFull_ = false;
+        /// Caller's window request, kept across the loader overwrites of config_.
+        uint32_t requestedSeqLen_ = 0;
+        /// How the granted window was decided; printed once at load.
+        detail::ContextPlan contextPlan_{};
         Tokenizer tokenizer_;
 
         // Persistent 32-bit RNG for sampling (mt19937)
@@ -764,6 +805,14 @@ namespace tinycoder {
         bool rngInitialized_ = false;
 
         // KV cache: [numLayers][2][maxSeqLen x numKVHeads x headDim]
+        /// Host K/V allocation window: slots [hostKvBaseSlot_, +hostKvCount_)
+        /// of the device-style slot map, i.e. the attention layers at or after
+        /// hostKvFirst_.  Nothing is allocated until a CPU-path forward needs it.
+        uint32_t hostKvFirst_ = 0;
+        uint32_t hostKvBaseSlot_ = 0;
+        uint32_t hostKvCount_ = 0;
+        bool hostKvReady_ = false;
+
         struct KVCache {
             np::Array<float> k;// numLayers x maxSeqLen x numKVHeads x headDim
             np::Array<float> v;// numLayers x maxSeqLen x numKVHeads x headDim

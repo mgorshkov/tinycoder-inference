@@ -229,6 +229,17 @@ namespace tinycoder {
         if (abortRequested()) {
             return {};
         }
+        // forward() refuses a request that does not fit the window (and a GPU
+        // fault with no CPU fallback) by handing back an EMPTY array.  The
+        // memcpy below would then read vocabSize floats from a null row: a ~1 MB
+        // read at address 0, on the most common public entry point, for any
+        // prompt longer than the window.  Name the refusal instead.
+        if (logits.size() < static_cast<size_t>(config_.vocabSize)) {
+            std::cerr << "[TinyCoder] generate: prompt refused (window "
+                      << config_.maxSeqLen << " tokens, prompt " << tokens.size()
+                      << ")" << std::endl;
+            return {};
+        }
         auto tPrefill1 = std::chrono::high_resolution_clock::now();
         auto prefillMs =
                 std::chrono::duration_cast<std::chrono::milliseconds>(tPrefill1 - tPrefill0).count();
@@ -302,6 +313,13 @@ namespace tinycoder {
             if (abortRequested()) {
                 break;
             }
+            // A full window ends generation the way n_ctx does in the reference
+            // engines: cleanly, with the tokens produced so far.  Without this,
+            // the next forward() would be refused and its empty logits would be
+            // read as a token id.
+            if (kvCache_.pos + 1 > config_.maxSeqLen) {
+                break;
+            }
             // Forward pass for single token (P0 top-K pruning of the LM head).
             forceInclude.clear();
             if (params.repeatPenalty != 1.0f && !penaltyHistory.empty()) {
@@ -319,6 +337,12 @@ namespace tinycoder {
                 newLogits = forward({nextToken});
             }
 
+            // A refused forward (window full, GPU fault) returns an empty array;
+            // cache-reading it as a token row would read from address 0.  Stop
+            // generation cleanly with the tokens produced so far.
+            if (newLogits.size() < static_cast<size_t>(config_.vocabSize)) {
+                break;
+            }
             // Get logits (memcpy instead of per-element virtual get()/set(), see §4.4)
             std::memcpy(lastLogits.data(), newLogits.data(),
                         static_cast<size_t>(config_.vocabSize) * sizeof(float));

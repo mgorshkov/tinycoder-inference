@@ -3023,10 +3023,15 @@ namespace tinycoder::gpu {
                 // floor(L/interval) — NOT by L (see kvLayerOffset()).
                 const uint32_t kvSlot = static_cast<uint32_t>(
                         kvLayerOffset(L) / kvLayerStride_);
-                float *kvK = reinterpret_cast<float *>(
-                        static_cast<uint8_t *>(kvK_) + kvLayerOffset(L));
-                float *kvV = reinterpret_cast<float *>(
-                        static_cast<uint8_t *>(kvV_) + kvLayerOffset(L));
+                // In int8-store mode there is no f32 cache to point at.
+                float *kvK = nullptr;
+                float *kvV = nullptr;
+                if (!kvStoreI8_) {
+                    kvK = reinterpret_cast<float *>(
+                            static_cast<uint8_t *>(kvK_) + kvLayerOffset(L));
+                    kvV = reinterpret_cast<float *>(
+                            static_cast<uint8_t *>(kvV_) + kvLayerOffset(L));
+                }
                 const bool kv8Decode = kv8_ && seqLen == 1 &&
                                        !graphCaptureActive_ && kvK8_ != nullptr;
                 const float invSqrtA = 1.0f / std::sqrt(static_cast<float>(hd));
@@ -3055,7 +3060,7 @@ namespace tinycoder::gpu {
                     // makes the rebuild per-layer: rows [rows8, pos) are the
                     // ones a prefill left in the f32 cache but not in the pool.
                     uint32_t &rows8 = kv8Rows_[kvSlot];
-                    if (rows8 < pos) {
+                    if (!kvStoreI8_ && rows8 < pos) {
                         const uint32_t n = pos - rows8;
                         dim3 qg(n, nKV);
                         kQ35QuantKV8<<<qg, 128, 0, g_stream>>>(
@@ -3092,6 +3097,46 @@ namespace tinycoder::gpu {
                                              g_stream>>>(
                                 s.q, k8, v8, ks, vs, s.attnOut, nHeads, nKV,
                                 static_cast<uint32_t>(pos), hd, invSqrtA);
+                    }
+                } else if (kvStoreI8_) {
+                    // int8 as the store: quantize the chunk straight into the
+                    // pool (one block per (token, kv-head), 128 threads) and
+                    // attend over the quantized rows.  The +16-row capacity
+                    // covers a decode token past a full window.
+                    int8_t *k8 = static_cast<int8_t *>(kvK8_) +
+                                 static_cast<size_t>(kvSlot) * kv8LayerStride_;
+                    int8_t *v8 = static_cast<int8_t *>(kvV8_) +
+                                 static_cast<size_t>(kvSlot) * kv8LayerStride_;
+                    const size_t sCount = kv8ScaleStride_ / sizeof(float);
+                    float *ks = kvK8Scale_ + static_cast<size_t>(kvSlot) * sCount;
+                    float *vs = kvV8Scale_ + static_cast<size_t>(kvSlot) * sCount;
+                    kQ35QuantKV8<<<dim3(seqLen, nKV), 128, 0, g_stream>>>(
+                            s.k, s.v, k8, v8, ks, vs, seqLen, nKV, hd,
+                            static_cast<uint32_t>(pos), /*srcTokenBase=*/0);
+                    kv8Rows_[kvSlot] = static_cast<uint32_t>(pos) + seqLen;
+                    // Opt-in like the f32 shared-KV variant: the warp kernel is
+                    // the proven default, and the shared one needs a block per
+                    // kv head (see the kernel comment).
+                    static const bool attnShared8 = [] {
+                        const char *e = std::getenv("TINYCODER_ATTN_MMA");
+                        return e != nullptr && e[0] != '0';
+                    }();
+                    const uint32_t headGroup = nHeads / nKV;
+                    if (attnShared8 && seqLen > 1 && headGroup >= 1 &&
+                        headGroup <= 32) {
+                        kQ35PrefillAttnSharedKV8<256>
+                                <<<dim3(seqLen, nKV),
+                                   dim3(32, headGroup), 2 * 256 * sizeof(float),
+                                   g_stream>>>(s.q, k8, v8, ks, vs, s.attnOut,
+                                               seqLen, nHeads, nKV, pos, dpos,
+                                               invSqrtA);
+                    } else {
+                        constexpr uint32_t kW = 4;
+                        kQ35WarpAttention8Prefill<256, kW>
+                                <<<dim3(seqLen, (nHeads + kW - 1) / kW),
+                                   dim3(32, kW), 0, g_stream>>>(
+                                        s.q, k8, v8, ks, vs, s.attnOut, seqLen,
+                                        nHeads, nKV, pos, dpos, invSqrtA);
                     }
                 } else {
                     kQ35StoreKV<<<seqLen, 256, 0, g_stream>>>(
