@@ -43,6 +43,12 @@ namespace tinycoder {
 
     std::pair<std::vector<float>, std::vector<float>>
     Model::forwardWithHidden(const std::vector<int32_t> &tokens) {
+        // These entry points run their own CPU layer loop; make sure the
+        // host K/V exists even when the GPU owned the session.
+        if (!ensureHostKv(0)) {
+            std::cerr << "[TinyCoder] debug forward: no host K/V" << std::endl;
+            return {};
+        }
         if (tokens.empty()) {
             return {};
         }
@@ -245,9 +251,9 @@ namespace tinycoder {
                 // Store K, V in cache (K-RoPE fused into the K write, P3).
                 uint32_t cachePos = static_cast<uint32_t>(kvCache_.pos);
                 float *kCacheLayer =
-                        kvCache_.k.data() + layer * maxSeqLen * nKVHeads * headDim;
+                        kvCache_.k.data() + static_cast<size_t>(hostKvSlot(layer)) * maxSeqLen * nKVHeads * headDim;
                 float *vCacheLayer =
-                        kvCache_.v.data() + layer * maxSeqLen * nKVHeads * headDim;
+                        kvCache_.v.data() + static_cast<size_t>(hostKvSlot(layer)) * maxSeqLen * nKVHeads * headDim;
 
                 storeKVWithRoPE(kData, vData, kCacheLayer, vCacheLayer, seqLen,
                                 cachePos, nKVHeads);
@@ -471,6 +477,12 @@ namespace tinycoder {
 
     std::vector<float>
     Model::forwardHiddenOnly(const std::vector<int32_t> &tokens) {
+        // These entry points run their own CPU layer loop; make sure the
+        // host K/V exists even when the GPU owned the session.
+        if (!ensureHostKv(0)) {
+            std::cerr << "[TinyCoder] debug forward: no host K/V" << std::endl;
+            return {};
+        }
         if (tokens.empty()) {
             return {};
         }
@@ -680,9 +692,9 @@ namespace tinycoder {
                 // Store K, V in cache (K-RoPE fused into the K write, P3).
                 uint32_t cachePos = static_cast<uint32_t>(kvCache_.pos);
                 float *kCacheLayer =
-                        kvCache_.k.data() + layer * maxSeqLen * nKVHeads * headDim;
+                        kvCache_.k.data() + static_cast<size_t>(hostKvSlot(layer)) * maxSeqLen * nKVHeads * headDim;
                 float *vCacheLayer =
-                        kvCache_.v.data() + layer * maxSeqLen * nKVHeads * headDim;
+                        kvCache_.v.data() + static_cast<size_t>(hostKvSlot(layer)) * maxSeqLen * nKVHeads * headDim;
 
                 storeKVWithRoPE(kData, vData, kCacheLayer, vCacheLayer, seqLen,
                                 cachePos, nKVHeads);
@@ -839,6 +851,12 @@ namespace tinycoder {
 
     std::vector<std::vector<float>>
     Model::forwardWithPerLayerStates(const std::vector<int32_t> &tokens) {
+        // These entry points run their own CPU layer loop; make sure the
+        // host K/V exists even when the GPU owned the session.
+        if (!ensureHostKv(0)) {
+            std::cerr << "[TinyCoder] debug forward: no host K/V" << std::endl;
+            return {};
+        }
         if (tokens.empty()) {
             return {};
         }
@@ -1052,9 +1070,9 @@ namespace tinycoder {
                 // Store K, V in cache (K-RoPE fused into the K write, P3).
                 uint32_t cachePos = static_cast<uint32_t>(kvCache_.pos);
                 float *kCacheLayer =
-                        kvCache_.k.data() + layer * maxSeqLen * nKVHeads * headDim;
+                        kvCache_.k.data() + static_cast<size_t>(hostKvSlot(layer)) * maxSeqLen * nKVHeads * headDim;
                 float *vCacheLayer =
-                        kvCache_.v.data() + layer * maxSeqLen * nKVHeads * headDim;
+                        kvCache_.v.data() + static_cast<size_t>(hostKvSlot(layer)) * maxSeqLen * nKVHeads * headDim;
 
                 storeKVWithRoPE(kData, vData, kCacheLayer, vCacheLayer, seqLen,
                                 cachePos, nKVHeads);
@@ -1294,9 +1312,9 @@ namespace tinycoder {
             // Store K/V in cache
             uint32_t cachePos = pos;
             float *kCacheLayer =
-                    kvCache_.k.data() + 0 * maxSeqLen * nKVHeads * headDim;
+                    kvCache_.k.data() + static_cast<size_t>(0u) * maxSeqLen * nKVHeads * headDim;
             float *vCacheLayer =
-                    kvCache_.v.data() + 0 * maxSeqLen * nKVHeads * headDim;
+                    kvCache_.v.data() + static_cast<size_t>(0u) * maxSeqLen * nKVHeads * headDim;
             uint32_t kvSize = nKVHeads * headDim;
             for (uint32_t i = 0; i < kvSize; ++i) {
                 kCacheLayer[cachePos * nKVHeads * headDim + i] = k[i];
@@ -1357,6 +1375,12 @@ namespace tinycoder {
 
     std::pair<std::vector<std::vector<float>>, std::vector<float>>
     Model::forwardTokenByToken(const std::vector<int32_t> &tokens) {
+        // These entry points run their own CPU layer loop; make sure the
+        // host K/V exists even when the GPU owned the session.
+        if (!ensureHostKv(0)) {
+            std::cerr << "[TinyCoder] debug forward: no host K/V" << std::endl;
+            return {};
+        }
         // Process tokens one-by-one, exactly matching the reference
         // (token-by-token with KV cache accumulation). This isolates whether
         // batched prefill with causal masking is the source of divergence.
@@ -1536,9 +1560,9 @@ namespace tinycoder {
                     // Store K, V in cache
                     uint32_t cachePos = static_cast<uint32_t>(kvCache_.pos);
                     float *kCacheLayer =
-                            kvCache_.k.data() + layer * maxSeqLen * nKVHeads * headDim;
+                            kvCache_.k.data() + static_cast<size_t>(hostKvSlot(layer)) * maxSeqLen * nKVHeads * headDim;
                     float *vCacheLayer =
-                            kvCache_.v.data() + layer * maxSeqLen * nKVHeads * headDim;
+                            kvCache_.v.data() + static_cast<size_t>(hostKvSlot(layer)) * maxSeqLen * nKVHeads * headDim;
 
                     uint32_t kvSize = nKVHeads * headDim;
                     float *kDst = kCacheLayer + cachePos * kvSize;

@@ -279,9 +279,28 @@ namespace {
 
     }// namespace
 
+    bool Model::setContextLength(uint32_t tokens) {
+        if (loaded_) {
+            // The host cache and the device K/V are sized from the window at
+            // load time; changing it afterwards would desync every one of them.
+            return false;
+        }
+        requestedSeqLen_ = tokens;
+        config_.maxSeqLen = tokens;
+        return true;
+    }
+
     bool Model::load(const std::string &modelPath, std::string *outError,
                      ProgressCallback progressCb) {
         std::cout << "[TinyCoder] Loading model from: " << modelPath << std::endl;
+
+        // The caller's window request (Model::setContextLength, or the
+        // max_seq_len that tc_engine_load writes into config_).  It has to be
+        // captured here: the two loader.config() assignments below overwrite
+        // config_ wholesale with the file's metadata, which is how the request
+        // used to disappear before being clamped to 2048.
+        const uint32_t requestedSeqLen = requestedSeqLen_ ? requestedSeqLen_
+                                                          : config_.maxSeqLen;
 
         auto reportProgress = [&](float p, const std::string &stage) {
             std::cout << "[TinyCoder] " << stage << " (" << static_cast<int>(p * 100) << "%)" << std::endl;
@@ -345,15 +364,6 @@ namespace {
         }
         config_ = metaLoader->config();
 
-        // Cap maxSeqLen to a reasonable value to avoid excessive memory usage.
-        // The model may support up to 32768 tokens, but that requires ~1.8 GB for KV
-        // cache alone. We default to 2048 which gives ~112 MB KV cache.
-        if (config_.maxSeqLen > 2048) {
-            std::cout << "[TinyCoder] Reducing maxSeqLen from " << config_.maxSeqLen
-                      << " to 2048 to fit available memory" << std::endl;
-            config_.maxSeqLen = 2048;
-        }
-
         // Estimate total memory needed
         uint64_t estimatedMem = config_.estimatedMemoryBytes();
         uint64_t fileMem = fileSize;
@@ -399,9 +409,119 @@ namespace {
 
         config_ = loader.config();
 
-        // Re-apply maxSeqLen cap (config_ was overwritten by loader.config())
-        if (config_.maxSeqLen > 2048) {
-            config_.maxSeqLen = 2048;
+        // ---- Resolve the context window -----------------------------------
+        // The request survived the loader overwrite above; the checkpoint's own
+        // advertised limit is what loader.config() brought back.  planContext
+        // decides the window and the K/V precision from free VRAM (or RAM),
+        // and its `reason` is what gets printed, so the message and the
+        // decision cannot disagree.
+        {
+            const uint32_t interval = config_.fullAttentionInterval;
+            const uint32_t numAttnLayers =
+                    interval > 1u
+                            ? (config_.numLayers + interval - 1u) / interval
+                            : config_.numLayers;
+            // qwen35/qwen35moe carry an MRoPE table next to the text one; both
+            // are [maxSeqLen][dims/2] of cos+sin in f32.
+            const uint32_t mropeDims =
+                    (config_.architecture == ARCH_QWEN35 ||
+                     config_.architecture == ARCH_QWEN35MOE)
+                            ? (config_.ropeDimensionCount ? config_.ropeDimensionCount
+                                                          : 64u)
+                            : 0u;
+
+            detail::ContextRequest req;
+            req.requested = requestedSeqLen;
+            req.modelMax = config_.maxSeqLen;
+            req.numLayers = config_.numLayers;
+            req.numAttentionLayers = numAttnLayers;
+            req.numKVHeads = config_.numKVHeads;
+            req.headDim = config_.headDim;
+            req.ropeDims = config_.headDim + mropeDims;
+            // An int8 K/V store needs a kernel that writes and reads the
+            // quantized rows end to end.  Arch 1 (qwen35) has one: kQ35QuantKV8
+            // + kQ35PrefillAttnSharedKV8 / kQ35WarpAttention8Prefill for the
+            // prefill and the existing kQ35WarpAttention8* for the decode.  The
+            // MoE arch (2) still only converts for decode, so granting int8
+            // there would charge 1/4 of the K/V it actually allocates.
+            req.int8KvSupported = config_.architecture == ARCH_QWEN35;
+            // TINYCODER_CONTEXT_KV8=1|0 pins the K/V store precision, so the same
+            // window can be served both ways for a numerics comparison.
+            if (const char *fk = std::getenv("TINYCODER_CONTEXT_KV8");
+                fk != nullptr && fk[0] != '\0' && req.int8KvSupported) {
+                req.forceKv = fk[0] == '0' ? detail::KvPrecision::F32
+                                           : detail::KvPrecision::I8;
+                req.forceKvSet = true;
+            }
+            req.weightBytes = fileSize;
+            req.freeVram = detail::probeFreeVramBytes();
+            // The RAM probe runs after the weights are resident, so it already
+            // accounts for them; planContext must not subtract them again.
+            req.availableRam = req.freeVram == 0 ? detail::probeAvailableRamBytes() : 0;
+            contextPlan_ = detail::planContext(req);
+            // A checkpoint whose weights do not fit the CARD AT ALL (a Q8 35B on
+            // an 11 GB device) must not refuse to load: it is perfectly usable
+            // with its weights in RAM, where the window is bounded by RAM instead.
+            //
+            // The test is "could this ever fit here", not "does it fit now": a
+            // card that is merely busy (another process, a stale allocation from
+            // the previous test in this process) also reports a small freeVram,
+            // and silently dropping such a session to a 2 tok/s CPU path is far
+            // worse than the reduction the ladder already handles.  Only when
+            // the weights exceed the device's total capacity is the host the
+            // only place they can live.
+            const uint64_t totalVram = detail::probeTotalVramBytes();
+            const bool cannotFitCard =
+                    totalVram != 0 && req.weightBytes + req.gpuFixedOverhead > totalVram;
+            if (contextPlan_.seqLen == 0 && req.freeVram != 0 && cannotFitCard) {
+                const uint64_t ram = detail::probeAvailableRamBytes();
+                if (ram > 0) {
+                    detail::ContextRequest ramReq = req;
+                    ramReq.freeVram = 0;
+                    ramReq.availableRam = ram;
+                    const detail::ContextPlan ramPlan = detail::planContext(ramReq);
+                    if (ramPlan.seqLen > 0) contextPlan_ = ramPlan;
+                }
+            }
+            // TINYCODER_CONTEXT_DEBUG=1 prints the inputs the grant was made
+            // from.  Every number here has moved a ceiling at least once, so the
+            // report line alone is not enough to explain a surprising window.
+            {
+                const char *dbg = std::getenv("TINYCODER_CONTEXT_DEBUG");
+                if (dbg != nullptr && dbg[0] != '\0' && dbg[0] != '0') {
+                    std::fprintf(stderr,
+                                 "[ctx] freeVram=%llu MiB weights=%llu MiB fixed=%llu MiB "
+                                 "attnLayers=%u kvHeads=%u headDim=%u ropeDims=%u int8=%d\n",
+                                 (unsigned long long) (req.freeVram >> 20),
+                                 (unsigned long long) (req.weightBytes >> 20),
+                                 (unsigned long long) (req.gpuFixedOverhead >> 20),
+                                 req.numAttentionLayers, req.numKVHeads, req.headDim,
+                                 req.ropeDims, req.int8KvSupported ? 1 : 0);
+                    std::fprintf(stderr,
+                                 "[ctx] perToken f32=%llu f32+mirror=%llu int8=%llu\n",
+                                 (unsigned long long) detail::kvBytesPerToken(
+                                         req, detail::KvPrecision::F32, false),
+                                 (unsigned long long) detail::kvBytesPerToken(
+                                         req, detail::KvPrecision::F32, true),
+                                 (unsigned long long) detail::kvBytesPerToken(
+                                         req, detail::KvPrecision::I8, false));
+                }
+            }
+
+            if (contextPlan_.seqLen == 0) {
+                setError("cannot grant a context window: " + contextPlan_.reason);
+                return false;
+            }
+            config_.maxSeqLen = contextPlan_.seqLen;
+
+            std::cout << "[TinyCoder] context window: " << contextPlan_.seqLen
+                      << " tokens (" << contextPlan_.reason << "; "
+                      << (contextPlan_.kv == detail::KvPrecision::I8 ? "K/V int8"
+                                                                     : "K/V f32")
+                      << (contextPlan_.kvMirror ? " + int8 mirror" : "")
+                      << ", " << (contextPlan_.kvBytes / (1024 * 1024)) << " MB, "
+                      << (contextPlan_.kvOnGpu ? "on GPU" : "in host RAM") << ")"
+                      << std::endl;
         }
 
         // Validate model architecture
@@ -1239,27 +1359,123 @@ namespace {
         return true;
     }
 
+    bool Model::ensureHostKv(uint32_t firstCpuLayer) {
+        const uint32_t nLayers = config_.numLayers;
+        if (firstCpuLayer >= nLayers) {
+            // The device owns every layer; no host slots are needed.
+            hostKvFirst_ = firstCpuLayer;
+            hostKvBaseSlot_ = 0;
+            hostKvCount_ = 0;
+            hostKvReady_ = false;
+            return true;
+        }
+        if (hostKvReady_ && hostKvFirst_ == firstCpuLayer) return true;
+
+        // Slot map, identical to the device's kvLayerOffset(): the K/V slots
+        // belong to the full-attention layers, numbered layer/interval.  A
+        // recurrent layer's number collides with an attention layer's, but a
+        // recurrent layer never addresses K/V.
+        const uint32_t interval = config_.fullAttentionInterval;
+        const auto slotOf = [interval](uint32_t layer) {
+            return interval > 1u ? layer / interval : layer;
+        };
+        const uint32_t lastSlot = interval > 1u
+                                          ? (nLayers + interval - 1u) / interval
+                                          : nLayers;
+        const uint32_t baseSlot = slotOf(firstCpuLayer);
+        const uint32_t count = lastSlot > baseSlot ? lastSlot - baseSlot : 0;
+
+        const uint32_t maxSeq = config_.maxSeqLen;
+        if (count == 0) {
+            hostKvFirst_ = firstCpuLayer;
+            hostKvBaseSlot_ = baseSlot;
+            hostKvCount_ = 0;
+            hostKvReady_ = true;
+            return true;
+        }
+        const uint64_t kvBytes = static_cast<uint64_t>(count) * maxSeq *
+                                 config_.numKVHeads * config_.headDim *
+                                 sizeof(float) * 2;
+        // A partial offload keeps the CPU tail's K/V in host RAM, and the plan
+        // charged that window at the GRANTED precision (int8 is 4x smaller) and
+        // budgets RAM only on the CPU-only path.  Refuse with the numbers
+        // instead of letting `bad_alloc` surface as an empty-logits forward.
+        const uint64_t ramAvail = detail::probeAvailableRamBytes();
+        if (ramAvail != 0 && kvBytes + (512ull << 20) > ramAvail) {
+            std::cerr << "[TinyCoder] host K/V for " << count << " slots x "
+                      << maxSeq << " tokens needs " << (kvBytes >> 20)
+                      << " MiB, but only " << (ramAvail >> 20)
+                      << " MiB of RAM is available (GPU offload leaves no host "
+                         "cache room): request a smaller window or offload more "
+                         "layers" << std::endl;
+            return false;
+        }
+        try {
+            kvCache_.k = np::Array<float>(
+                    np::Shape{count, maxSeq, config_.numKVHeads, config_.headDim});
+            kvCache_.v = np::Array<float>(
+                    np::Shape{count, maxSeq, config_.numKVHeads, config_.headDim});
+        } catch (const std::exception &e) {
+            std::cerr << "[TinyCoder] host K/V allocation failed (" << e.what()
+                      << "): " << count << " slots x " << maxSeq << " tokens"
+                      << std::endl;
+            return false;
+        }
+        hostKvFirst_ = firstCpuLayer;
+        hostKvBaseSlot_ = baseSlot;
+        hostKvCount_ = count;
+        hostKvReady_ = true;
+        const uint64_t bytes = static_cast<uint64_t>(count) * maxSeq *
+                               config_.numKVHeads * config_.headDim *
+                               sizeof(float) * 2;
+        std::cout << "[TinyCoder] host K/V: " << count << " slots (layers "
+                  << firstCpuLayer << ".." << (nLayers - 1) << ") x " << maxSeq
+                  << " tokens = " << (bytes / (1024 * 1024)) << " MB (CPU path)"
+                  << std::endl;
+        return true;
+    }
+
+    uint32_t Model::hostKvSlot(uint32_t layer) const {
+        const uint32_t interval = config_.fullAttentionInterval;
+        const uint32_t slot = interval > 1u ? layer / interval : layer;
+        if (!hostKvReady_ || slot < hostKvBaseSlot_) {
+            // Only reachable from a debug dump taken before any forward, or by
+            // addressing a layer the host does not own.
+            std::fprintf(stderr,
+                         "[TinyCoder] hostKvSlot(%u) with no host K/V for it "
+                         "(base %u, count %u)\n",
+                         layer, hostKvBaseSlot_, hostKvCount_);
+            return 0;
+        }
+        const uint32_t idx = slot - hostKvBaseSlot_;
+        if (idx >= hostKvCount_) {
+            // A slot-map mismatch used to alias the last slot, which corrupts
+            // attention and returns plausible garbage -- the worst failure mode
+            // here.  Say it once per layer and use slot 0 so the session stays
+            // deterministic while the message names the defect.
+            std::fprintf(stderr,
+                         "[TinyCoder] hostKvSlot(%u): slot %u outside the host "
+                         "cache [%u, %u]; the host/device slot maps disagree\n",
+                         layer, slot, hostKvBaseSlot_,
+                         hostKvBaseSlot_ + hostKvCount_);
+            return 0;
+        }
+        return idx;
+    }
+
     bool Model::initKVCache() {
-        uint32_t maxSeq = config_.maxSeqLen;
         uint32_t nLayers = config_.numLayers;
-        uint32_t nKVHeads = config_.numKVHeads;
-        uint32_t headDim = config_.headDim;
         // Qwen35 layers are hybrids: full-attention layers use the KV cache,
         // recurrent (gated-delta-net) layers use the SSM/conv state. The KV
         // cache for the recurrent layers is unused (they don't store K/V); only
         // the full-attention layers (and the MTP block) read/write it. Allocate
         // the full numLayers x maxSeq cache anyway to keep the indexing simple.
 
-        uint64_t cacheMemBytes = static_cast<uint64_t>(nLayers) * maxSeq * nKVHeads *
-                                 headDim * sizeof(float) * 2;
-
-        std::cout << "[TinyCoder] KV cache: " << nLayers << " layers x " << maxSeq
-                  << " seq x " << nKVHeads << " heads x " << headDim
-                  << " dim = " << (cacheMemBytes / (1024 * 1024)) << " MB"
-                  << std::endl;
-
-        kvCache_.k = np::Array<float>(np::Shape{nLayers, maxSeq, nKVHeads, headDim});
-        kvCache_.v = np::Array<float>(np::Shape{nLayers, maxSeq, nKVHeads, headDim});
+        // The host K/V cache is NOT allocated here: a GPU session never runs a
+        // CPU attention layer, and a CPU-only session only needs the layers it
+        // actually runs (and, on a qwen35 hybrid, only their full-attention
+        // ones).  ensureHostKv() allocates it on the first CPU-path forward,
+        // sized from the granted window.
         kvCache_.pos = 0;
 
         // ---- Qwen35/Qwen35MoE (gated delta net) recurrent state ----
@@ -1490,6 +1706,9 @@ namespace {
     void Model::clearKVCache() {
         // Clear KV cache position and reset RNG state
         kvCache_.pos = 0;
+        // A cleared window is usable again.
+        contextFull_ = false;
+        gpuContextFull_ = false;
         // Reset RNG state so generation is reproducible from a clean cache
         rngInitialized_ = false;
 
@@ -1526,6 +1745,9 @@ namespace {
         // -> gpuClearKV() -> adapter->clearKVCache() would deadlock.
         kvCache_.pos = 0;
         rngInitialized_ = false;
+        // An empty cache is not full: the latches describe the last forward.
+        contextFull_ = false;
+        gpuContextFull_ = false;
         std::fill(kvCache_.k.data(), kvCache_.k.data() + kvCache_.k.size(), 0.0f);
         std::fill(kvCache_.v.data(), kvCache_.v.data() + kvCache_.v.size(), 0.0f);
         for (auto &buf: kvCache_.ssmConvBuf) {

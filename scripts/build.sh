@@ -14,6 +14,11 @@
 # machine without nvcc/CUDA, pass --no-cuda (or --cpu) to request a CPU-only
 # build instead of failing the configure.
 #
+# ENABLE_AVX512 defaults to ON only when the host CPU reports AVX-512 support
+# (CMakeLists.txt reads /proc/cpuinfo), because a build that enables kernels the
+# build machine cannot execute dies with SIGILL at startup; --avx512 / --no-avx512
+# still force either way for a cross-build.
+#
 # SIMD flags: each SIMD feature is a separate --feature/--no-feature pair that
 # is translated into a -DENABLE_* CMake cache entry and appended to
 # EXTRA_CMAKE_ARGS, so you can select the instruction sets without editing

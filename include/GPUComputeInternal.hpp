@@ -13920,7 +13920,12 @@ namespace tinycoder::gpu {
                 ks[dbase] = sk;
                 vs[dbase] = sv;
             }
-            const uint32_t outBase = (dstTokenBase + t) * nKV * hd + h * hd;
+            // 64-bit: (dstTokenBase + t) * nKVHeads * headDim reaches 2^32 for a
+            // 1M window with wide K/V heads, and this kernel now runs at every
+            // window the planner can grant.
+            const size_t outBase =
+                    (static_cast<size_t>(dstTokenBase) + t) * nKV * hd +
+                    static_cast<size_t>(h) * hd;
             for (uint32_t i = lane; i < hd; i += blockDim.x) {
                 const long qk = lrintf(k[base + i] / sk);
                 const long qv = lrintf(v[base + i] / sv);
@@ -15573,6 +15578,156 @@ namespace tinycoder::gpu {
             if (!active) return;
             const float invL = 1.0f / l;
             float *oPtr = out + (static_cast<size_t>(s) * nHeads + head0) * HD;
+#pragma unroll
+            for (uint32_t i = 0; i < NV; ++i) oPtr[lane + i * 32] = acc[i] * invL;
+        }
+
+        // ---- int8 K/V store: prefill attention over the quantized cache ----
+        // Same math as the f32 kernels above; the row is dequantized as
+        // int8 * scale[token][kvHead].  The store (kQ35QuantKV8) runs first, so
+        // these read exactly what they wrote.  Used when the planned window is
+        // granted only with an int8 K/V store; the whole point is that the row
+        // costs 1 byte instead of 4 at every position, so a 64k window fits.
+        // One block per (query token, kv head): every warp of the block owns one
+        // QUERY head of that kv head's group, so the row staged into shared
+        // memory is the one all of them need.  The first version of this kernel
+        // spread a block over `W` arbitrary query heads (like the f32 kernel it
+        // was copied from), which mixes kv heads inside one block whenever
+        // nHeads/nKVHeads does not divide W — on Bonsai (24 heads / 4 kv, group
+        // 6, W=8) heads 6..7 of block 0 were attending block 0's staging of kv
+        // head 0 and the model answered "000000: routine maintenance log entry"
+        // instead of the access code.  The f32 original never hit it because it
+        // is opt-in (TINYCODER_ATTN_MMA) and defaults off.
+        // The block shape is (32 lanes, one warp per query head of the kv
+        // head's group), so there is no compile-time warp count to specialize
+        // on -- the group comes from nHeads/nKVHeads at launch.
+        template<uint32_t HD>
+        __global__ void kQ35PrefillAttnSharedKV8(
+                const float *__restrict__ q, const int8_t *__restrict__ kCache8,
+                const int8_t *__restrict__ vCache8, const float *__restrict__ ks,
+                const float *__restrict__ vs, float *__restrict__ out,
+                uint32_t seqLen, uint32_t nHeads, uint32_t nKVHeads,
+                uint32_t cachePos, const uint32_t *__restrict__ dpos,
+                float invSqrt) {
+            static_assert(HD == 256, "qwen35 uses headDim=256");
+            constexpr uint32_t NV = HD / 32;
+            extern __shared__ float sh[];
+            float *shK = sh;// HD floats
+            float *shV = sh + HD;
+            if (dpos != nullptr) cachePos = dpos[0];
+            const uint32_t s = blockIdx.x;
+            const uint32_t kvHead = blockIdx.y;
+            const uint32_t group = nHeads / nKVHeads;
+            const uint32_t head0 = kvHead * group + threadIdx.y;
+            const uint32_t lane = threadIdx.x;
+            if (s >= seqLen) return;
+            const bool active = threadIdx.y < group;
+            const uint32_t csEnd = cachePos + s;
+            const float *qPtr =
+                    q + (static_cast<size_t>(s) * nHeads + head0) * HD;
+            float acc[NV];
+#pragma unroll
+            for (uint32_t i = 0; i < NV; ++i) acc[i] = 0.0f;
+            float m = -1e30f, l = 0.0f;
+            for (uint32_t cs = 0; cs <= csEnd; ++cs) {
+                // One warp stages the row, dequantizing on the way into shared
+                // memory so the head warps' inner loop is identical to f32.
+                if (threadIdx.y == 0) {
+                    const int8_t *kPtr =
+                            kCache8 + (static_cast<size_t>(cs) * nKVHeads + kvHead) *
+                                              HD;
+                    const int8_t *vPtr =
+                            vCache8 + (static_cast<size_t>(cs) * nKVHeads + kvHead) *
+                                              HD;
+                    const float sk = ks[static_cast<size_t>(cs) * nKVHeads + kvHead];
+                    const float sv = vs[static_cast<size_t>(cs) * nKVHeads + kvHead];
+#pragma unroll
+                    for (uint32_t i = 0; i < NV; ++i) {
+                        shK[lane + i * 32] = static_cast<float>(kPtr[lane + i * 32]) * sk;
+                        shV[lane + i * 32] = static_cast<float>(vPtr[lane + i * 32]) * sv;
+                    }
+                }
+                __syncthreads();
+                if (active) {
+                    float sc = 0.0f;
+#pragma unroll
+                    for (uint32_t i = 0; i < NV; ++i)
+                        sc = fmaf(qPtr[lane + i * 32], shK[lane + i * 32], sc);
+                    sc = kWarpReduceSum(sc) * invSqrt;
+                    if (sc > m) {
+                        const float alpha = exp2f((m - sc) * LOG2E);
+                        for (uint32_t i = 0; i < NV; ++i) acc[i] *= alpha;
+                        l *= alpha;
+                        m = sc;
+                    }
+                    const float p = exp2f((sc - m) * LOG2E);
+                    l += p;
+#pragma unroll
+                    for (uint32_t i = 0; i < NV; ++i)
+                        acc[i] = fmaf(p, shV[lane + i * 32], acc[i]);
+                }
+                __syncthreads();
+            }
+            if (!active) return;
+            const float invL = 1.0f / l;
+            float *oPtr = out + (static_cast<size_t>(s) * nHeads + head0) * HD;
+#pragma unroll
+            for (uint32_t i = 0; i < NV; ++i) oPtr[lane + i * 32] = acc[i] * invL;
+        }
+
+        template<uint32_t HD, uint32_t W>
+        __global__ void kQ35WarpAttention8Prefill(
+                const float *__restrict__ q, const int8_t *__restrict__ k8,
+                const int8_t *__restrict__ v8, const float *__restrict__ ks,
+                const float *__restrict__ vs, float *__restrict__ out,
+                uint32_t seqLen, uint32_t nHeads, uint32_t nKVHeads,
+                uint32_t cachePos, const uint32_t *__restrict__ dpos,
+                float invSqrt) {
+            if (dpos != nullptr) cachePos = dpos[0];
+            static_assert(HD == 256, "qwen35 uses headDim=256");
+            constexpr uint32_t NV = HD / 32;
+            const uint32_t s = blockIdx.x;
+            const uint32_t warpId = blockIdx.y * W + threadIdx.y;
+            const uint32_t lane = threadIdx.x;
+            if (s >= seqLen || warpId >= nHeads) return;
+            const uint32_t qHead = warpId;
+            const uint32_t kvHead = qHead / (nHeads / nKVHeads);
+            const uint32_t csEnd = cachePos + s;
+            const float *qPtr = q + (static_cast<size_t>(s) * nHeads + qHead) * HD;
+            float acc[NV];
+#pragma unroll
+            for (uint32_t i = 0; i < NV; ++i) acc[i] = 0.0f;
+            float m = -1e30f, l = 0.0f;
+            for (uint32_t cs = 0; cs <= csEnd; ++cs) {
+                const int8_t *kPtr =
+                        k8 + (static_cast<size_t>(cs) * nKVHeads + kvHead) * HD;
+                const int8_t *vPtr =
+                        v8 + (static_cast<size_t>(cs) * nKVHeads + kvHead) * HD;
+                const float sk = ks[static_cast<size_t>(cs) * nKVHeads + kvHead];
+                const float sv = vs[static_cast<size_t>(cs) * nKVHeads + kvHead];
+                float sc = 0.0f;
+#pragma unroll
+                for (uint32_t i = 0; i < NV; ++i) {
+                    sc = fmaf(qPtr[lane + i * 32],
+                              static_cast<float>(kPtr[lane + i * 32]) * sk, sc);
+                }
+                sc = kWarpReduceSum(sc) * invSqrt;
+                if (sc > m) {
+                    const float alpha = exp2f((m - sc) * LOG2E);
+                    for (uint32_t i = 0; i < NV; ++i) acc[i] *= alpha;
+                    l *= alpha;
+                    m = sc;
+                }
+                const float p = exp2f((sc - m) * LOG2E);
+                l += p;
+#pragma unroll
+                for (uint32_t i = 0; i < NV; ++i) {
+                    acc[i] = fmaf(p, static_cast<float>(vPtr[lane + i * 32]) * sv,
+                                  acc[i]);
+                }
+            }
+            const float invL = 1.0f / l;
+            float *oPtr = out + (static_cast<size_t>(s) * nHeads + qHead) * HD;
 #pragma unroll
             for (uint32_t i = 0; i < NV; ++i) oPtr[lane + i * 32] = acc[i] * invL;
         }

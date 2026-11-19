@@ -89,8 +89,11 @@ namespace tinycoder {
         uint32_t numLayers = 28;         // 0.5B: 24, 1.5B: 28, 7B: 28
         uint32_t numAttentionHeads = 12; // 0.5B: 16, 1.5B: 12, 7B: 28
         uint32_t numKVHeads = 2;         // 0.5B: 4, 1.5B: 2, 7B: 4 (GQA)
-        uint32_t maxSeqLen =
-                2048;// Max context length (reduced from 8192 to save memory)
+        /// Context window.  0 = auto: Model::load grants 2048 (today's
+        /// default) unless memory cannot hold it, and reports the
+        /// memory-derived maximum.  Set it with Model::setContextLength
+        /// before load, or it arrives through tc_engine_load's max_seq_len.
+        uint32_t maxSeqLen = 0;
         float ropeTheta = 1000000.0f;
         uint32_t headDim = 128;// hiddenSize / numAttentionHeads
 
@@ -162,8 +165,10 @@ namespace tinycoder {
             uint64_t numEmbedBlocks = (numEmbedElements + 255) / 256;
             uint64_t embedBytes = numEmbedBlocks * 170;
 
-            // KV cache (F32)
-            uint64_t kvCacheBytes = static_cast<uint64_t>(numLayers) * maxSeqLen *
+            // KV cache (F32).  maxSeqLen == 0 means "auto": estimate at the
+            // 2048 default, which is what load() resolves to when it can.
+            const uint64_t seqLen = maxSeqLen ? maxSeqLen : 2048u;
+            uint64_t kvCacheBytes = static_cast<uint64_t>(numLayers) * seqLen *
                                     numKVHeads * headDim * sizeof(float) * 2;
 
             // Norms (F32)

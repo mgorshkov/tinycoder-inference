@@ -242,11 +242,11 @@ namespace tinycoder {
         // Store K, V into the KV cache (MRoPE already applied).
         const uint32_t maxSeqLen = config_.maxSeqLen;
         float *kCacheLayer =
-                kvCache_.k.data() + static_cast<size_t>(layer) * maxSeqLen *
-                                            nKVHeads * headDim;
+                kvCache_.k.data() + static_cast<size_t>(hostKvSlot(layer)) *
+                                            maxSeqLen * nKVHeads * headDim;
         float *vCacheLayer =
-                kvCache_.v.data() + static_cast<size_t>(layer) * maxSeqLen *
-                                            nKVHeads * headDim;
+                kvCache_.v.data() + static_cast<size_t>(hostKvSlot(layer)) *
+                                            maxSeqLen * nKVHeads * headDim;
         for (uint32_t s = 0; s < seqLen; ++s) {
             std::memcpy(kCacheLayer + static_cast<size_t>(cachePos + s) * nKVHeads * headDim,
                         k + static_cast<size_t>(s) * nKVHeads * headDim,

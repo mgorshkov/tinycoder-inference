@@ -133,6 +133,17 @@ namespace tinycoder::gpu {
         uint32_t attentionValueLength = 0;
         uint32_t ropeDimensionCount = 0;// MRoPE n_rot (64); 0 = use headDim
         uint32_t ropeDimensionSections[4] = {0, 0, 0, 0};
+        /// K/V in the int8 pool as the STORE (not a decode-only mirror): the
+        /// prefill writes int8 + per-(token, kv-head) scales and both prefill
+        /// and decode attend over the quantized rows.  Arch 1 only; the f32
+        /// K/V buffers are not allocated in this mode.
+        uint32_t kvStoreI8 = 0;
+        /// 1 = the plan charged the decode-time int8 MIRROR on top of the f32
+        /// store (rung 1).  0 means the granted window was charged for the f32
+        /// store alone (rung 2), so the mirror must not be allocated: it costs
+        /// 2*kvHeads*(headDim+4) bytes per token per slot, exactly the 25% the
+        /// plan shed to fit the window.
+        uint32_t kvMirror = 0;
         uint32_t fullAttentionInterval = 0;// 0 = all layers full-attention
         uint32_t ssmInnerSize = 0;         // dInner (6144)
         uint32_t ssmStateSize = 0;         // headK (128)
@@ -249,6 +260,9 @@ namespace tinycoder::gpu {
 
         /// @brief Zero the GPU KV cache and reset the cache position.
         void clearKVCache();
+
+        /// @brief True when the last forward was refused for lack of window.
+        bool contextFull() const { return contextFull_; }
 
         /// @brief Number of layers actually offloaded to the GPU (as resolved
         /// in upload() from geom.numGpuLayers, clamped to numLayers).
@@ -840,6 +854,10 @@ namespace tinycoder::gpu {
         // the first decode token it is converted to an int8 pool + per-head
         // scales, and decode reads the int8 pool.
         bool kv8_ = false;
+        /// The int8 pool is the STORE: prefill quantizes into it and no f32 K/V
+        /// buffer exists (TINYCODER_KV8 is decode-only and keeps f32 for
+        /// prefill).  Set from ModelGeometry::kvStoreI8 at upload.
+        bool kvStoreI8_ = false;
         // Rows present in the int8 pool, PER KV SLOT (kvSlots_ entries).
         //
         // This used to be a single bool ("kv8Ready_"), but the rebuild it
@@ -1097,6 +1115,9 @@ namespace tinycoder::gpu {
         // (all expert matrices uploaded).
         MoeCpuFn moeCpuFn_;
         size_t kvPos_ = 0;
+        /// Set when a forward was refused because kvPos_ + seqLen would exceed
+        /// maxSeqLen; cleared on upload and by clearKVCache().
+        bool contextFull_ = false;
         bool scratchAlloc_ = false;
 
         // ---- CUDA-graph decode acceleration (TINYCODER_GPU_GRAPH=1) ---- The

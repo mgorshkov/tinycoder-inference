@@ -10,7 +10,7 @@ cmake_minimum_required(VERSION 3.18.0)
 # via FetchContent.
 #
 # Standalone build (static lib + tests + bench):
-#   cmake -B build -DCMAKE_BUILD_TYPE=Release [-DENABLE_CUDA=ON] [-DBUILD_TESTS=...]
+#   cmake -B build -DCMAKE_BUILD_TYPE=Release [-DENABLE_CUDA=OFF] [-DBUILD_TESTS=...]
 #   cmake --build build --config Release
 #   ctest --test-dir build            # when BUILD_TESTS=ON
 # ---------------------------------------------------------------------------
@@ -18,9 +18,38 @@ project(tinycoder_inference VERSION 0.5.0 DESCRIPTION "High-Performant local inf
 enable_testing()
 
 # ---- Options ----
-option(ENABLE_CUDA "Enable CUDA GPU acceleration" OFF)
+# CUDA defaults to ON when nvcc is present: a plain `cmake -B build` on a GPU box
+# should produce the offload build, and a CPU-only default was a trap -- it built
+# a `tinycoder_bench` that answers `--gpu` with "unknown option: --gpu", which
+# reads like a typo rather than a build choice.  -DENABLE_CUDA=OFF still forces
+# the CPU build, and a box without nvcc falls back to it automatically.
+include(CheckLanguage)
+check_language(CUDA)
+if(CMAKE_CUDA_COMPILER)
+    set(TINYCODER_CUDA_DEFAULT ON)
+else()
+    set(TINYCODER_CUDA_DEFAULT OFF)
+endif()
+option(ENABLE_CUDA "Enable CUDA GPU acceleration (default: ON when nvcc is available)"
+        ${TINYCODER_CUDA_DEFAULT})
 option(ENABLE_AVX2 "Enable AVX2 optimizations" OFF)
-option(ENABLE_AVX512 "Enable AVX-512 optimizations" ON)
+# AVX-512 defaults to ON only when the BUILD HOST can run it.  It used to default
+# ON unconditionally, and `cmake -B build` on a Broadwell-class Xeon (the
+# reference box: E5-2686 v4, AVX2 but no AVX-512 at all) therefore produced a
+# binary that dies with SIGILL at startup -- including `tinycoder_bench --gpu`,
+# which looked like a GPU problem.  A default build has to run where it was
+# built; -DENABLE_AVX512=ON still forces it for a cross-build or a container
+# whose /proc/cpuinfo describes a different machine.
+set(TINYCODER_HOST_AVX512 OFF)
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND EXISTS "/proc/cpuinfo")
+    file(READ "/proc/cpuinfo" TINYCODER_CPUINFO LIMIT 131072)
+    string(FIND "${TINYCODER_CPUINFO}" "avx512f" TINYCODER_AVX512_FOUND)
+    if(NOT TINYCODER_AVX512_FOUND EQUAL -1)
+        set(TINYCODER_HOST_AVX512 ON)
+    endif()
+endif()
+option(ENABLE_AVX512 "Enable AVX-512 optimizations (default: ON when the host CPU has it)"
+        ${TINYCODER_HOST_AVX512})
 # AVX-512 sub-features (Ice Lake+ only; OPT-IN because the runtime dispatch
 # cannot protect code compiled with these flags — a CPU without them will
 # SIGILL). ENABLE_AVX512 alone enables only the base set (F/DQ/BW/VL) which
@@ -307,7 +336,13 @@ message(STATUS "  AVX-512 VBMI:  ${ENABLE_AVX512_VBMI}")
 message(STATUS "  AVX-512 VBMI2: ${ENABLE_AVX512_VBMI2}")
 message(STATUS "  AMX:           ${ENABLE_AMX}")
 message(STATUS "  OpenMP:        ${ENABLE_OPENMP}")
-message(STATUS "  CUDA:          ${ENABLE_CUDA}")
+if(ENABLE_CUDA)
+    message(STATUS "  CUDA:          ON (${CMAKE_CUDA_COMPILER})")
+elseif(CMAKE_CUDA_COMPILER)
+    message(STATUS "  CUDA:          OFF by request (-DENABLE_CUDA=OFF; nvcc is available)")
+else()
+    message(STATUS "  CUDA:          OFF (no nvcc found)")
+endif()
 message(STATUS "  Tests:         ${BUILD_TESTS}")
 message(STATUS "  C++ Standard:  ${CMAKE_CXX_STANDARD}")
 message(STATUS "  np library:    ${np_SOURCE_DIR}")

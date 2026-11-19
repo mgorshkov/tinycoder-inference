@@ -321,8 +321,30 @@ namespace tinycoder::gpu {
             } else if (geom_.numAttentionHeads == 12 && geom_.headDim == 128) {
                 attnChunk_ = 32;
             }
+            // Long windows raise the chunk instead of the chunk count.  The
+            // partials cost nq * attnChunks_ * headDim floats (Bonsai's 96
+            // q-heads x 2048 chunks x 256 would be 200 MB at 64k), and the
+            // combine kernel's grouping is per chunk; 512 windows is the
+            // invariant, so a 64k window uses 128-row chunks and a 256k window
+            // 512-row ones.  Decode parallelism is heads x chunks, unchanged in
+            // practice (>= 24 x 512 warps).
+            const uint32_t minChunk =
+                    ((geom_.maxSeqLen + 511u) / 512u + 31u) / 32u * 32u;
+            if (minChunk > attnChunk_) attnChunk_ = minChunk;
             attnChunks_ = (geom_.maxSeqLen + attnChunk_ - 1) / attnChunk_;
             if (attnChunks_ == 0) attnChunks_ = 1;
+            if (attnChunks_ > 512u) {
+                std::fprintf(stderr,
+                             "[gpu] split-KV invariant broken: chunk=%u chunks=%u "
+                             "(maxSeqLen=%u)\n",
+                             attnChunk_, attnChunks_, geom_.maxSeqLen);
+                destroyScratch();
+                return false;
+            }
+            if (geom_.maxSeqLen >= 32768u) {
+                std::fprintf(stderr, "[gpu] split-KV: chunk=%u chunks=%u\n",
+                             attnChunk_, attnChunks_);
+            }
             // The split-KV path is decode-only (seqLen == 1); both the split and
             // combine kernels index the partials by (token, head, chunk) with
             // token always 0 (kWarpAttentionSplit grid.x is seqLen).  Sizing the
@@ -1245,22 +1267,40 @@ namespace tinycoder::gpu {
             kvSlots_ = (nGpu + geom_.fullAttentionInterval - 1u) /
                        geom_.fullAttentionInterval;
         }
-        const uint64_t kvAllocBytes =
-                static_cast<uint64_t>(kvSlots_) * kvLayerStride_;
-        if (!allocRaw(&kvK_, static_cast<size_t>(kvAllocBytes), "kvK") ||
-            !allocRaw(&kvV_, static_cast<size_t>(kvAllocBytes), "kvV"))
-            return false;
-        cudaMemsetAsync(kvK_, 0, static_cast<size_t>(kvAllocBytes), g_stream);
-        cudaMemsetAsync(kvV_, 0, static_cast<size_t>(kvAllocBytes), g_stream);
+        // int8 K/V as the STORE (planned window): the f32 buffers are not
+        // allocated at all, which is the 4x that makes a 64k+ window fit.  The
+        // row count and slot geometry stay identical (kvLayerStride_ remains the
+        // f32 slot size so kvLayerOffset()/kvSlots_ keep their meaning).
+        kvStoreI8_ = (geom_.kvStoreI8 != 0u) && geom_.architecture == 1u;
+        if (!kvStoreI8_) {
+            const uint64_t kvAllocBytes =
+                    static_cast<uint64_t>(kvSlots_) * kvLayerStride_;
+            if (!allocRaw(&kvK_, static_cast<size_t>(kvAllocBytes), "kvK") ||
+                !allocRaw(&kvV_, static_cast<size_t>(kvAllocBytes), "kvV"))
+                return false;
+            cudaMemsetAsync(kvK_, 0, static_cast<size_t>(kvAllocBytes), g_stream);
+            cudaMemsetAsync(kvV_, 0, static_cast<size_t>(kvAllocBytes), g_stream);
+        }
 
         // Decode-only int8 KV pool (TINYCODER_KV8=1).  F32 KV stays for prefill;
         // the first decode token converts it, then decode reads int8 + scales.
         {
             const char *k8e = std::getenv("TINYCODER_KV8");
-            // Default ON for the dense qwen35 decode (measured +0.4% at pp512,
-            // +1.6% at pp2048, +1.7% at pp4096); TINYCODER_KV8=0 opts out.
+            // The mirror follows the PLAN, not a default: geom_.kvMirror is 1
+            // only when the granted rung charged its 2*kvHeads*(headDim+4)
+            // bytes per token (rung 1).  Allocating it on rung 2 would make the
+            // planner charge 25% less than the device takes, and that rung
+            // exists precisely to shed the mirror.
+            // TINYCODER_KV8=1 forces it back on for an experiment (and then the
+            // window is no longer the one the plan charged); =0 disables it when
+            // the plan allowed it (slightly faster decode, larger f32 traffic).
+            const bool envForce = k8e != nullptr && k8e[0] == '1';
+            const bool envOff = k8e != nullptr && k8e[0] == '0';
             kv8_ = (geom_.architecture == 1u) &&
-                   !(k8e != nullptr && k8e[0] == '0');
+                   (envForce || (geom_.kvMirror != 0u && !envOff));
+            // The store mode needs the pool whether or not the decode mirror is
+            // enabled, and the two cannot disagree about which one holds truth.
+            if (kvStoreI8_) kv8_ = true;
             // Nothing is in the int8 pool yet: every slot starts with 0 rows.
             kv8Rows_.assign(kvSlots_, 0u);
             if (kv8_) {
@@ -1406,6 +1446,7 @@ namespace tinycoder::gpu {
         }
 
         kvPos_ = 0;
+        contextFull_ = false;
         allocated_ = true;
         cudaStreamSynchronize(g_stream);
         if (std::getenv("TINYCODER_MEMTRACE")) {// TEMP

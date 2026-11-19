@@ -3360,6 +3360,16 @@ namespace tinycoder::gpu {
             return false;
         }
         if (tokens.empty()) return true;
+        // The device K/V is a fixed [kvSlots_][maxSeqLen] allocation: a request
+        // that would grow kvPos_ past the window must be refused here, before
+        // any kernel writes, instead of running off the end of the cache.
+        if (static_cast<uint64_t>(kvPos_) + tokens.size() > geom_.maxSeqLen) {
+            contextFull_ = true;
+            errMsg = "context full: " + std::to_string(kvPos_) + " cached + " +
+                     std::to_string(tokens.size()) + " new > " +
+                     std::to_string(geom_.maxSeqLen) + "-token window";
+            return false;
+        }
         auto t0 = std::chrono::steady_clock::now();
 #define TIMING_TAG(what)                                               \
     do {                                                               \
@@ -5029,6 +5039,16 @@ namespace tinycoder::gpu {
     // forwards stay eager.
     bool GPUModel::captureDecodeGraph(uint32_t pos) {
         if (graphBuilt_ || graphCaptureFailed_) return graphBuilt_;
+        // The int8-STORE decode branch quantises the new row at a position baked
+        // into the kernel argument from the host (`kQ35QuantKV8 dstTokenBase=pos`
+        // in GPUComputeMoE.cu).  A replayed graph would write row pos_capture
+        // forever and never store the real last token: silently wrong decode,
+        // not an error.  The mirror path avoids this with the device-pos
+        // variants; the store path has no equivalent yet, so it stays eager.
+        if (kvStoreI8_) {
+            graphCaptureFailed_ = true;
+            return false;
+        }
         if (!ensureGraphScratch()) {
             graphCaptureFailed_ = true;
             return false;
@@ -5152,14 +5172,19 @@ namespace tinycoder::gpu {
     }
 
     void GPUModel::clearKVCache() {
+        contextFull_ = false;
         if (!allocated_) return;
         uint32_t nGpu = geom_.numGpuLayers;
         // Zero only the slots actually allocated (qwen35/MoE skip the recurrent
         // layers; kvSlots_ == nGpu for the dense arch and <= nGpu otherwise).
         const uint64_t kvAllocBytes =
                 static_cast<uint64_t>(kvSlots_) * kvLayerStride_;
-        cudaMemsetAsync(kvK_, 0, static_cast<size_t>(kvAllocBytes), g_stream);
-        cudaMemsetAsync(kvV_, 0, static_cast<size_t>(kvAllocBytes), g_stream);
+        // int8-store sessions allocate no f32 cache; the int8 row counts below
+        // are the whole reset (the next prefill re-quantizes from row 0).
+        if (!kvStoreI8_) {
+            cudaMemsetAsync(kvK_, 0, static_cast<size_t>(kvAllocBytes), g_stream);
+            cudaMemsetAsync(kvV_, 0, static_cast<size_t>(kvAllocBytes), g_stream);
+        }
         // Qwen35 / Qwen35MoE: also reset the persistent gated-delta-net + conv1d
         // state so a fresh session starts from an empty recurrent state (matches
         // the CPU kvCache_.q35ConvState / q35GdnState zeroing on clearKVCache).
