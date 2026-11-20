@@ -570,11 +570,11 @@ namespace tinycoder::gpu {
             // matrix and its softmaxed fp16 twin.  The score matrix is seqLen^2
             // PER HEAD, so the buffers are capped at kAttnGemmMaxSeq tokens and
             // the warp kernel keeps the longer prefills.
-            uint16_t *attnQ16 = nullptr;  // [cap][qHeads*headDim]
-            uint16_t *attnKV16 = nullptr; // 2 * [cap][kHeads*headDim] (K then V)
-            float *attnScores = nullptr;  // [qHeads][cap][cap]
-            uint16_t *attnP16 = nullptr;  // [qHeads][cap][cap]
-            uint32_t attnGemmCap = 0;     // token cap the four buffers cover
+            uint16_t *attnQ16 = nullptr; // [cap][qHeads*headDim]
+            uint16_t *attnKV16 = nullptr;// 2 * [cap][kHeads*headDim] (K then V)
+            float *attnScores = nullptr; // [qHeads][cap][cap]
+            uint16_t *attnP16 = nullptr; // [qHeads][cap][cap]
+            uint32_t attnGemmCap = 0;    // token cap the four buffers cover
             // ---- Qwen35MoE (qwen35moe) MoE FFN scratch ----
             // DOUBLE-BUFFERED DEVICE SNAPSHOT of s.norm for the CPU-expert
             // hybrid handoff.  The CPU callback must read the post-attn norm of

@@ -62,6 +62,12 @@ namespace tinycoder {
             return np::Array<float>{};
         }
 
+        // Every kernel below resolves ThreadPool::current(), so bind this model's
+        // own pool for the duration of the call. Two resident models each keep
+        // their dispatch state private instead of racing the shared singleton.
+        // No-op when the model has no pool yet (forward before load()).
+        ThreadPoolBinding poolBinding(pool_.get());
+
         // GPU-offload continuation state for the qwen35 hybrid (partial
         // offload): when the GPU runs only the first N layers ($TINYCODER_NGL),
         // the CPU path below resumes from layer N on the GPU-produced hidden
@@ -232,8 +238,8 @@ namespace tinycoder {
             if (seqLen == 1) {
                 func(0);
             } else {
-                ThreadPool::instance().parallelFor(0, seqLen,
-                                                   std::forward<decltype(func)>(func));
+                ThreadPool::current().parallelFor(0, seqLen,
+                                                  std::forward<decltype(func)>(func));
             }
         };
 
@@ -935,7 +941,7 @@ namespace tinycoder {
                 }
             } else {
                 // Consolidated single parallelFor over the requested (token, vocab) pairs
-                ThreadPool::instance().parallelFor(0, logitCount * vocabSize, [&](uint32_t flatIdx) {
+                ThreadPool::current().parallelFor(0, logitCount * vocabSize, [&](uint32_t flatIdx) {
                     uint32_t s = logitStart + flatIdx / vocabSize;
                     uint32_t i = flatIdx % vocabSize;
                     const float *hPtr = hiddenData + s * hiddenSize;
@@ -980,7 +986,7 @@ namespace tinycoder {
                 for (uint32_t s = logitStart; s < logitStart + logitCount; ++s) {
                     const float *hPtr = hiddenData + s * hiddenSize;
                     float *logitRow = logitsData + s * vocabSize;
-                    ThreadPool::instance().parallelFor(0, vocabSize, [&](uint32_t i) {
+                    ThreadPool::current().parallelFor(0, vocabSize, [&](uint32_t i) {
                         const uint8_t *embRow =
                                 quantizedEmbeddings_.data.data() + static_cast<uint64_t>(i) * rowStride;
                         // Software prefetch the next row's weight data to hide DRAM
@@ -1016,7 +1022,7 @@ namespace tinycoder {
                     static std::vector<Q8KBlock> q8Hidden;
                     q8Hidden.resize(blocksPerRow);
                     GGMLDequantize::quantizeQ8K(hPtr, hiddenSize, q8Hidden.data());
-                    ThreadPool::instance().parallelFor(0, vocabSize, [&](uint32_t i) {
+                    ThreadPool::current().parallelFor(0, vocabSize, [&](uint32_t i) {
                         const Q8KBlock *embRow = q8kData + static_cast<uint64_t>(i) * blocksPerRow;
                         // Software prefetch the next row's weight data to hide DRAM
                         // latency on the large embedding matrix (vocabSize × hiddenSize).
@@ -1031,7 +1037,7 @@ namespace tinycoder {
                     });
                 }
             } else if (!dequantizedEmbeddings_.dataF16.empty()) {
-                ThreadPool::instance().parallelFor(0, logitCount * vocabSize, [&](uint32_t flatIdx) {
+                ThreadPool::current().parallelFor(0, logitCount * vocabSize, [&](uint32_t flatIdx) {
                     uint32_t s = logitStart + flatIdx / vocabSize;
                     uint32_t i = flatIdx % vocabSize;
                     const float *hPtr = hiddenData + s * hiddenSize;
@@ -1040,7 +1046,7 @@ namespace tinycoder {
                     logitRow[i] = dotProductFMA_F16(hPtr, embRow, hiddenSize);
                 });
             } else if (!dequantizedEmbeddings_.empty()) {
-                ThreadPool::instance().parallelFor(0, logitCount * vocabSize, [&](uint32_t flatIdx) {
+                ThreadPool::current().parallelFor(0, logitCount * vocabSize, [&](uint32_t flatIdx) {
                     uint32_t s = logitStart + flatIdx / vocabSize;
                     uint32_t i = flatIdx % vocabSize;
                     const float *hPtr = hiddenData + s * hiddenSize;
@@ -1049,7 +1055,7 @@ namespace tinycoder {
                     logitRow[i] = dotProductFMA(hPtr, embRow, hiddenSize);
                 });
             } else {
-                ThreadPool::instance().parallelFor(0, logitCount * vocabSize, [&](uint32_t flatIdx) {
+                ThreadPool::current().parallelFor(0, logitCount * vocabSize, [&](uint32_t flatIdx) {
                     uint32_t s = logitStart + flatIdx / vocabSize;
                     uint32_t i = flatIdx % vocabSize;
                     const float *hPtr = hiddenData + s * hiddenSize;
@@ -1084,7 +1090,7 @@ namespace tinycoder {
             // final else: dequantize each vocab row block and dot with FMA. This
             // path always produces correct logits regardless of host SIMD support.
             auto computeLogitsScalar = [&](uint32_t startRow, uint32_t count) {
-                ThreadPool::instance().parallelFor(0, count * vocabSize, [&](uint32_t flatIdx) {
+                ThreadPool::current().parallelFor(0, count * vocabSize, [&](uint32_t flatIdx) {
                     uint32_t s = startRow + flatIdx / vocabSize;
                     uint32_t i = flatIdx % vocabSize;
                     const float *hPtr = hiddenData + s * hiddenSize;
@@ -1122,7 +1128,7 @@ namespace tinycoder {
                     const float *hRow = hiddenData + s * hiddenSize;
                     const float *hs = applyPrismTransform(hRow, hiddenSize, false);
                     float *logitRow = logitsData + s * vocabSize;
-                    ThreadPool::instance().parallelFor(0, vocabSize, [&](uint32_t i) {
+                    ThreadPool::current().parallelFor(0, vocabSize, [&](uint32_t i) {
                         const uint8_t *row = lmHead_.data.data() +
                                              static_cast<uint64_t>(i) * nb * ts;
                         double dot = 0.0;
@@ -1202,7 +1208,7 @@ namespace tinycoder {
                     static std::vector<Q8KBlock> q8Hidden;
                     q8Hidden.resize(blocksPerRow);
                     GGMLDequantize::quantizeQ8K(hPtr, hiddenSize, q8Hidden.data());
-                    ThreadPool::instance().parallelFor(0, vocabSize, [&](uint32_t i) {
+                    ThreadPool::current().parallelFor(0, vocabSize, [&](uint32_t i) {
                         const Q8KBlock *embRow = q8kData + static_cast<uint64_t>(i) * blocksPerRow;
                         if (i + 1 < vocabSize) {
                             prefetchRow(embRow + blocksPerRow);
@@ -1321,7 +1327,7 @@ namespace tinycoder {
         topKScratchBounds_.resize(static_cast<size_t>(vocabSize) * 2);
         float *boundsRow2 = topKScratchBounds_.data();
         const float *browBase = bounds.data();
-        ThreadPool::instance().parallelFor(0, vocabSize, [&](uint32_t i) {
+        ThreadPool::current().parallelFor(0, vocabSize, [&](uint32_t i) {
             const float *rb = browBase + static_cast<size_t>(i) * subgroupStride * 2;
             float lo = 0.0f, hi = 0.0f;
             for (uint32_t sg = 0; sg < subgroupStride; ++sg) {
@@ -1377,7 +1383,7 @@ namespace tinycoder {
         // Parallelized over candidates via the thread pool; each task writes a
         // distinct logitsOut[i].
         std::fill(logitsOut, logitsOut + vocabSize, kPrunedLogitSentinel);
-        ThreadPool::instance().parallelFor(0, candCount, [&](uint32_t c) {
+        ThreadPool::current().parallelFor(0, candCount, [&](uint32_t c) {
             uint32_t i = topKCandidates_[c];
             float dot = 0.0f;
             for (uint32_t b = 0; b < blocksPerRow; ++b) {

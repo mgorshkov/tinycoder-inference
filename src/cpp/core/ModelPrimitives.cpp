@@ -255,92 +255,92 @@ namespace tinycoder {
         // positions and improves cache reuse of K/V.
         constexpr uint32_t BLOCK = 32;
 
-        ThreadPool::instance().parallelFor2D(seqLen, nKVHeads,
-                                             [&](uint32_t s, uint32_t g) {
-                                                 // Causal mask: this query token can attend to cache positions
-                                                 // up to (cachePos + s): its own position in the cache.
-                                                 uint32_t csEnd = cachePos + s;// inclusive end position
+        ThreadPool::current().parallelFor2D(seqLen, nKVHeads,
+                                            [&](uint32_t s, uint32_t g) {
+                                                // Causal mask: this query token can attend to cache positions
+                                                // up to (cachePos + s): its own position in the cache.
+                                                uint32_t csEnd = cachePos + s;// inclusive end position
 
-                                                 for (uint32_t h = 0; h < nGroups; ++h) {
-                                                     uint32_t qHead = g * nGroups + h;
-                                                     const float *qPtr =
-                                                             q + (s * nHeads * headDim + qHead * headDim);
+                                                for (uint32_t h = 0; h < nGroups; ++h) {
+                                                    uint32_t qHead = g * nGroups + h;
+                                                    const float *qPtr =
+                                                            q + (s * nHeads * headDim + qHead * headDim);
 
-                                                     // FlashAttention online-softmax accumulators.
-                                                     float o[MAX_HEAD_DIM];
-                                                     for (uint32_t d = 0; d < headDim; ++d) {
-                                                         o[d] = 0.0f;
-                                                     }
-                                                     float m = -std::numeric_limits<float>::infinity();
-                                                     float l = 0.0f;
+                                                    // FlashAttention online-softmax accumulators.
+                                                    float o[MAX_HEAD_DIM];
+                                                    for (uint32_t d = 0; d < headDim; ++d) {
+                                                        o[d] = 0.0f;
+                                                    }
+                                                    float m = -std::numeric_limits<float>::infinity();
+                                                    float l = 0.0f;
 
-                                                     uint32_t cs = 0;
-                                                     // Blocked main loop.
-                                                     for (; cs + BLOCK <= csEnd + 1; cs += BLOCK) {
-                                                         float scores[BLOCK];
-                                                         for (uint32_t b = 0; b < BLOCK; ++b) {
-                                                             const float *kPtr = kCache +
-                                                                                 ((cs + b) * nKVHeads * headDim +
-                                                                                  g * headDim);
-                                                             scores[b] =
-                                                                     dotProductFMA(qPtr, kPtr, headDim) *
-                                                                     invSqrtHeadDim;
-                                                         }
-                                                         // Block-local max, then rescale accumulated output/sum.
-                                                         float blockMax = scores[0];
-                                                         for (uint32_t b = 1; b < BLOCK; ++b) {
-                                                             blockMax = std::max(blockMax, scores[b]);
-                                                         }
-                                                         float mNew = std::max(m, blockMax);
-                                                         float alpha = std::exp2f((m - mNew) * LOG2E);
-                                                         if (alpha != 1.0f) {
-                                                             // o = o * alpha, implemented as o += (alpha - 1) * o
-                                                             accumulateFMA(o, o, alpha - 1.0f, headDim);
-                                                         }
-                                                         l *= alpha;
-                                                         for (uint32_t b = 0; b < BLOCK; ++b) {
-                                                             const float *vPtr = vCache +
-                                                                                 ((cs + b) * nKVHeads * headDim +
-                                                                                  g * headDim);
-                                                             float p = std::exp2f((scores[b] - mNew) * LOG2E);
-                                                             l += p;
-                                                             // o += p * v (vectorized via dispatched accumulateFMA)
-                                                             accumulateFMA(o, vPtr, p, headDim);
-                                                         }
-                                                         m = mNew;
-                                                     }
-                                                     // Scalar tail (partial block / final positions).
-                                                     for (; cs <= csEnd; ++cs) {
-                                                         const float *kPtr = kCache +
-                                                                             (cs * nKVHeads * headDim +
-                                                                              g * headDim);
-                                                         float score = dotProductFMA(qPtr, kPtr, headDim) *
-                                                                       invSqrtHeadDim;
-                                                         if (score > m) {
-                                                             float mNew = score;
-                                                             float alpha = std::exp2f((m - mNew) * LOG2E);
-                                                             if (alpha != 1.0f) {
-                                                                 accumulateFMA(o, o, alpha - 1.0f, headDim);
-                                                             }
-                                                             l *= alpha;
-                                                             m = mNew;
-                                                         }
-                                                         const float *vPtr = vCache +
-                                                                             (cs * nKVHeads * headDim +
-                                                                              g * headDim);
-                                                         float p = std::exp2f((score - m) * LOG2E);
-                                                         l += p;
-                                                         accumulateFMA(o, vPtr, p, headDim);
-                                                     }
+                                                    uint32_t cs = 0;
+                                                    // Blocked main loop.
+                                                    for (; cs + BLOCK <= csEnd + 1; cs += BLOCK) {
+                                                        float scores[BLOCK];
+                                                        for (uint32_t b = 0; b < BLOCK; ++b) {
+                                                            const float *kPtr = kCache +
+                                                                                ((cs + b) * nKVHeads * headDim +
+                                                                                 g * headDim);
+                                                            scores[b] =
+                                                                    dotProductFMA(qPtr, kPtr, headDim) *
+                                                                    invSqrtHeadDim;
+                                                        }
+                                                        // Block-local max, then rescale accumulated output/sum.
+                                                        float blockMax = scores[0];
+                                                        for (uint32_t b = 1; b < BLOCK; ++b) {
+                                                            blockMax = std::max(blockMax, scores[b]);
+                                                        }
+                                                        float mNew = std::max(m, blockMax);
+                                                        float alpha = std::exp2f((m - mNew) * LOG2E);
+                                                        if (alpha != 1.0f) {
+                                                            // o = o * alpha, implemented as o += (alpha - 1) * o
+                                                            accumulateFMA(o, o, alpha - 1.0f, headDim);
+                                                        }
+                                                        l *= alpha;
+                                                        for (uint32_t b = 0; b < BLOCK; ++b) {
+                                                            const float *vPtr = vCache +
+                                                                                ((cs + b) * nKVHeads * headDim +
+                                                                                 g * headDim);
+                                                            float p = std::exp2f((scores[b] - mNew) * LOG2E);
+                                                            l += p;
+                                                            // o += p * v (vectorized via dispatched accumulateFMA)
+                                                            accumulateFMA(o, vPtr, p, headDim);
+                                                        }
+                                                        m = mNew;
+                                                    }
+                                                    // Scalar tail (partial block / final positions).
+                                                    for (; cs <= csEnd; ++cs) {
+                                                        const float *kPtr = kCache +
+                                                                            (cs * nKVHeads * headDim +
+                                                                             g * headDim);
+                                                        float score = dotProductFMA(qPtr, kPtr, headDim) *
+                                                                      invSqrtHeadDim;
+                                                        if (score > m) {
+                                                            float mNew = score;
+                                                            float alpha = std::exp2f((m - mNew) * LOG2E);
+                                                            if (alpha != 1.0f) {
+                                                                accumulateFMA(o, o, alpha - 1.0f, headDim);
+                                                            }
+                                                            l *= alpha;
+                                                            m = mNew;
+                                                        }
+                                                        const float *vPtr = vCache +
+                                                                            (cs * nKVHeads * headDim +
+                                                                             g * headDim);
+                                                        float p = std::exp2f((score - m) * LOG2E);
+                                                        l += p;
+                                                        accumulateFMA(o, vPtr, p, headDim);
+                                                    }
 
-                                                     float invL = 1.0f / l;
-                                                     float *outPtr =
-                                                             output + (s * nHeads * headDim + qHead * headDim);
-                                                     for (uint32_t d = 0; d < headDim; ++d) {
-                                                         outPtr[d] = o[d] * invL;
-                                                     }
-                                                 }
-                                             });
+                                                    float invL = 1.0f / l;
+                                                    float *outPtr =
+                                                            output + (s * nHeads * headDim + qHead * headDim);
+                                                    for (uint32_t d = 0; d < headDim; ++d) {
+                                                        outPtr[d] = o[d] * invL;
+                                                    }
+                                                }
+                                            });
     }
 
     void Model::siluInPlace(float *x, uint32_t n) {

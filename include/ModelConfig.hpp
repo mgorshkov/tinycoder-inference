@@ -150,7 +150,10 @@ namespace tinycoder {
         bool prismGdnVGrouped = false;// ssm_out needs the tiled→grouped perm
 
         // Runtime
-        uint32_t nThreads = 4;// OpenMP threads
+        // CPU worker threads for this model's own pool; 0 = auto (inherit the
+        // already-initialized process pool, else all logical CPUs). Set by the
+        // loader/frontend (tc_engine_load) and by bench --threads.
+        uint32_t nThreads = 0;
 
         /// @brief Estimate total memory needed to load this model.
         /// @return Estimated memory in bytes

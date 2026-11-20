@@ -580,7 +580,9 @@ namespace tinycoder {
             // fitting and being reduced by the planner.
             geom.kvStoreI8 =
                     (m.contextPlan().seqLen > 0 &&
-                     m.contextPlan().kv == detail::KvPrecision::I8) ? 1u : 0u;
+                     m.contextPlan().kv == detail::KvPrecision::I8)
+                            ? 1u
+                            : 0u;
             // The mirror is only free if the grant paid for it.  Rung 2 exists
             // to shed it, and an unplanned mirror allocation is a window the
             // planner charged 25% too little for.

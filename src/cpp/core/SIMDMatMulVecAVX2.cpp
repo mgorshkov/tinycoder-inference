@@ -1058,7 +1058,7 @@ namespace tinycoder::simd {
         // Each tile of 8 rows is independent; the Q8_K x-vector data (q8) is
         // shared read-only across threads.
         uint32_t numTiles = (rows + BATCH_SIZE - 1) / BATCH_SIZE;
-        ThreadPool::instance().parallelForSlab(0, numTiles, [&](uint32_t tile) {
+        ThreadPool::current().parallelForSlab(0, numTiles, [&](uint32_t tile) {
             uint32_t rowStart = tile * BATCH_SIZE;
             uint32_t batchSize = std::min(BATCH_SIZE, rows - rowStart);
 
@@ -1528,7 +1528,7 @@ namespace tinycoder::simd {
         // Each tile of 8 rows is independent; the Q8_K x-vector data (q8) is
         // shared read-only across threads.
         uint32_t numTiles = (rows + BATCH_SIZE - 1) / BATCH_SIZE;
-        ThreadPool::instance().parallelForSlab(0, numTiles, [&](uint32_t tile) {
+        ThreadPool::current().parallelForSlab(0, numTiles, [&](uint32_t tile) {
             uint32_t rowStart = tile * BATCH_SIZE;
             uint32_t batchSize = std::min(BATCH_SIZE, rows - rowStart);
 
@@ -1844,7 +1844,7 @@ namespace tinycoder::simd {
 
         // Process rows in tiles of BATCH_SIZE, parallelized over tiles.
         uint32_t numTiles = (rows + BATCH_SIZE - 1) / BATCH_SIZE;
-        ThreadPool::instance().parallelForSlab(0, numTiles, [&](uint32_t tile) {
+        ThreadPool::current().parallelForSlab(0, numTiles, [&](uint32_t tile) {
             uint32_t rowStart = tile * BATCH_SIZE;
             uint32_t batchSize = std::min(BATCH_SIZE, rows - rowStart);
 
@@ -2159,7 +2159,7 @@ namespace tinycoder::simd {
         const __m256i mask3 = _mm256_set1_epi8(0x03);
 
         uint32_t numTiles = (rows + BATCH_SIZE - 1) / BATCH_SIZE;
-        ThreadPool::instance().parallelForSlab(0, numTiles, [&](uint32_t tile) {
+        ThreadPool::current().parallelForSlab(0, numTiles, [&](uint32_t tile) {
             uint32_t rowStart = tile * BATCH_SIZE;
             uint32_t batchSize = std::min(BATCH_SIZE, rows - rowStart);
 
@@ -2518,7 +2518,7 @@ namespace tinycoder::simd {
 
         uint32_t totalRows = qRows + kRows;
         uint32_t numTiles = (totalRows + BATCH_SIZE - 1) / BATCH_SIZE;
-        ThreadPool::instance().parallelForSlab(0, numTiles, [&](uint32_t tile) {
+        ThreadPool::current().parallelForSlab(0, numTiles, [&](uint32_t tile) {
             uint32_t rowStart = tile * BATCH_SIZE;
             uint32_t batchSize = std::min(BATCH_SIZE, totalRows - rowStart);
 
@@ -2840,7 +2840,7 @@ namespace tinycoder::simd {
 
         // Process rows in tiles of BATCH_SIZE, parallelized over tiles.
         uint32_t numTiles = (rows + BATCH_SIZE - 1) / BATCH_SIZE;
-        ThreadPool::instance().parallelForSlab(0, numTiles, [&](uint32_t tile) {
+        ThreadPool::current().parallelForSlab(0, numTiles, [&](uint32_t tile) {
             uint32_t rowStart = tile * BATCH_SIZE;
             uint32_t batchSize = std::min(BATCH_SIZE, rows - rowStart);
 
@@ -2997,7 +2997,7 @@ namespace tinycoder::simd {
             const uint32_t vecGroups = cols >> 3;
             const uint32_t tail = cols & 7u;
             const float *xrow = X;
-            ThreadPool::instance().parallelForSlab(0, rows, [&](uint32_t row) {
+            ThreadPool::current().parallelForSlab(0, rows, [&](uint32_t row) {
                 const float *wrow = W_f32 + static_cast<size_t>(row) * cols;
                 __m256 acc0 = _mm256_setzero_ps();
                 __m256 acc1 = _mm256_setzero_ps();
@@ -3036,7 +3036,7 @@ namespace tinycoder::simd {
         }
 
         uint32_t numTiles = (rows + BATCH_SIZE - 1) / BATCH_SIZE;
-        ThreadPool::instance().parallelForSlab(0, numTiles, [&](uint32_t tile) {
+        ThreadPool::current().parallelForSlab(0, numTiles, [&](uint32_t tile) {
             uint32_t rowStart = tile * BATCH_SIZE;
             uint32_t batchSize = std::min(BATCH_SIZE, rows - rowStart);
 
@@ -3131,7 +3131,7 @@ namespace tinycoder::simd {
 
         // Process rows in tiles of BATCH_SIZE, parallelized over tiles.
         uint32_t numTiles = (rows + BATCH_SIZE - 1) / BATCH_SIZE;
-        ThreadPool::instance().parallelForSlab(0, numTiles, [&](uint32_t tile) {
+        ThreadPool::current().parallelForSlab(0, numTiles, [&](uint32_t tile) {
             uint32_t rowStart = tile * BATCH_SIZE;
             uint32_t batchSize = std::min(BATCH_SIZE, rows - rowStart);
 
@@ -3393,7 +3393,7 @@ namespace tinycoder::simd {
 
         // Process rows in tiles of BATCH_SIZE, parallelized over tiles.
         uint32_t numTiles = (rows + BATCH_SIZE - 1) / BATCH_SIZE;
-        ThreadPool::instance().parallelForSlab(0, numTiles, [&](uint32_t tile) {
+        ThreadPool::current().parallelForSlab(0, numTiles, [&](uint32_t tile) {
             uint32_t rowStart = tile * BATCH_SIZE;
             uint32_t batchSize = std::min(BATCH_SIZE, rows - rowStart);
 
@@ -3648,7 +3648,7 @@ namespace tinycoder::simd {
         // seqLen==1.
         if (seqLen == 1) {
             const tinycoder::Q8KBlock *q8 = q8All.data();
-            ThreadPool::instance().parallelForSlab(0, rows, [&](uint32_t row) {
+            ThreadPool::current().parallelForSlab(0, rows, [&](uint32_t row) {
                 const uint8_t *rp =
                         W_q4k + static_cast<uint64_t>(row) * rowStride;
                 float sum = 0.0f;
@@ -3717,7 +3717,7 @@ namespace tinycoder::simd {
 
         // Process rows in tiles of BATCH_SIZE, parallelized over tiles.
         uint32_t numTiles = (rows + BATCH_SIZE - 1) / BATCH_SIZE;
-        ThreadPool::instance().parallelForSlab(0, numTiles, [&](uint32_t tile) {
+        ThreadPool::current().parallelForSlab(0, numTiles, [&](uint32_t tile) {
             uint32_t rowStart = tile * BATCH_SIZE;
             uint32_t batchSize = std::min(BATCH_SIZE, rows - rowStart);
 
@@ -3863,7 +3863,7 @@ namespace tinycoder::simd {
         const __m256i lowmask = _mm256_set1_epi8(0x0F);
 
         uint32_t numTiles = (rows + BATCH_SIZE - 1) / BATCH_SIZE;
-        ThreadPool::instance().parallelForSlab(0, numTiles, [&](uint32_t tile) {
+        ThreadPool::current().parallelForSlab(0, numTiles, [&](uint32_t tile) {
             uint32_t rowStart = tile * BATCH_SIZE;
             uint32_t batchSize = std::min(BATCH_SIZE, rows - rowStart);
 
@@ -4008,7 +4008,7 @@ namespace tinycoder::simd {
         const __m256i one16 = _mm256_set1_epi16(1);
 
         uint32_t numTiles = (rows + BATCH_SIZE - 1) / BATCH_SIZE;
-        ThreadPool::instance().parallelForSlab(0, numTiles, [&](uint32_t tile) {
+        ThreadPool::current().parallelForSlab(0, numTiles, [&](uint32_t tile) {
             uint32_t rowStart = tile * BATCH_SIZE;
             uint32_t batchSize = std::min(BATCH_SIZE, rows - rowStart);
 
@@ -4137,7 +4137,7 @@ namespace tinycoder::simd {
         };
 
         uint32_t numTiles = (rows + BATCH_SIZE - 1) / BATCH_SIZE;
-        ThreadPool::instance().parallelForSlab(0, numTiles, [&](uint32_t tile) {
+        ThreadPool::current().parallelForSlab(0, numTiles, [&](uint32_t tile) {
             uint32_t rowStart = tile * BATCH_SIZE;
             uint32_t batchSize = std::min(BATCH_SIZE, rows - rowStart);
 
@@ -4284,7 +4284,7 @@ namespace tinycoder::simd {
         const __m256i one16 = _mm256_set1_epi16(1);
 
         uint32_t numTiles = (rows + BATCH_SIZE - 1) / BATCH_SIZE;
-        ThreadPool::instance().parallelForSlab(0, numTiles, [&](uint32_t tile) {
+        ThreadPool::current().parallelForSlab(0, numTiles, [&](uint32_t tile) {
             uint32_t rowStart = tile * BATCH_SIZE;
             uint32_t batchSize = std::min(BATCH_SIZE, rows - rowStart);
 
@@ -4578,7 +4578,7 @@ namespace tinycoder::simd {
 
         // Process rows in tiles of BATCH_SIZE, parallelized over tiles.
         uint32_t numTiles = (rows + BATCH_SIZE - 1) / BATCH_SIZE;
-        ThreadPool::instance().parallelForSlab(0, numTiles, [&](uint32_t tile) {
+        ThreadPool::current().parallelForSlab(0, numTiles, [&](uint32_t tile) {
             uint32_t rowStart = tile * BATCH_SIZE;
             uint32_t batchSize = std::min(BATCH_SIZE, rows - rowStart);
 
@@ -4941,7 +4941,7 @@ namespace tinycoder::simd {
 
         // Process rows in tiles of BATCH_SIZE, parallelized over tiles.
         uint32_t numTiles = (rows + BATCH_SIZE - 1) / BATCH_SIZE;
-        ThreadPool::instance().parallelForSlab(0, numTiles, [&](uint32_t tile) {
+        ThreadPool::current().parallelForSlab(0, numTiles, [&](uint32_t tile) {
             uint32_t rowStart = tile * BATCH_SIZE;
             uint32_t batchSize = std::min(BATCH_SIZE, rows - rowStart);
 
@@ -5559,10 +5559,10 @@ namespace tinycoder::simd {
             uint32_t phase2NumTiles = (hRows + BATCH_SIZE - 1) / BATCH_SIZE;
 #if defined(TINYCODER_USE_FFN_STEAL)
             // Phase 2 steals 4 tiles at a time.
-            ThreadPool::instance().parallelForSteal2(
+            ThreadPool::current().parallelForSteal2(
                     0, numTiles, /*chunk1=*/TINYCODER_STEAL_CHUNK,
 #else
-            ThreadPool::instance().parallelForSlab2(
+            ThreadPool::current().parallelForSlab2(
                     0, numTiles,
 #endif
                     [&](uint32_t tile) {

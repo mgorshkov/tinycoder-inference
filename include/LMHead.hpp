@@ -61,7 +61,7 @@ namespace tinycoder {
         static void computeCPU(const float *hidden, const float *embedData,
                                uint32_t vocabSize, uint32_t hiddenSize, float *logits) {
             // Parallel over vocabulary, SIMD dot product inside
-            ThreadPool::instance().parallelFor(0, vocabSize, [&](uint32_t i) {
+            ThreadPool::current().parallelFor(0, vocabSize, [&](uint32_t i) {
                 const float *embRow = embedData + static_cast<uint64_t>(i) * hiddenSize;
                 // SIMD-accelerated dot product: dot = sum(hidden[0..hiddenSize) * embRow[0..hiddenSize))
                 float dot = dotProductFMA(hidden, embRow, hiddenSize);
@@ -82,7 +82,7 @@ namespace tinycoder {
         /// @param logits      Output logits vector (size vocabSize, pre-allocated)
         static void computeCPUF16(const float *hidden, const uint16_t *embedData,
                                   uint32_t vocabSize, uint32_t hiddenSize, float *logits) {
-            ThreadPool::instance().parallelFor(0, vocabSize, [&](uint32_t i) {
+            ThreadPool::current().parallelFor(0, vocabSize, [&](uint32_t i) {
                 const uint16_t *embRow = embedData + static_cast<uint64_t>(i) * hiddenSize;
                 logits[i] = dotProductFMA_F16(hidden, embRow, hiddenSize);
             });
@@ -115,7 +115,7 @@ namespace tinycoder {
             q8Hidden.resize(blocksPerRow);
             GGMLDequantize::quantizeQ8K(hidden, hiddenSize, q8Hidden.data());
 
-            ThreadPool::instance().parallelFor(0, vocabSize, [&](uint32_t i) {
+            ThreadPool::current().parallelFor(0, vocabSize, [&](uint32_t i) {
                 const Q8KBlock *embRow = embedData + static_cast<uint64_t>(i) * blocksPerRow;
                 // Software prefetch the next row's weight data to hide DRAM latency
                 // on the large embedding matrix (vocabSize × hiddenSize).
@@ -197,14 +197,14 @@ namespace tinycoder {
 
                 if (dotFunc && n == blockSize) {
                     // Fast path: pre-resolved fused dot product for full blocks
-                    ThreadPool::instance().parallelFor(0, vocabSize, [&](uint32_t i) {
+                    ThreadPool::current().parallelFor(0, vocabSize, [&](uint32_t i) {
                         const uint8_t *blockData = embedData + static_cast<uint64_t>(i) * rowStrideBytes + static_cast<uint64_t>(b) * typeSize;
                         logits[i] += dotFunc(blockData, xBlock);
                     });
                 } else {
                     // Fallback: general fused dot product (handles partial blocks
                     // or types without a dedicated fast path)
-                    ThreadPool::instance().parallelFor(0, vocabSize, [&](uint32_t i) {
+                    ThreadPool::current().parallelFor(0, vocabSize, [&](uint32_t i) {
                         const uint8_t *blockData = embedData + static_cast<uint64_t>(i) * rowStrideBytes + static_cast<uint64_t>(b) * typeSize;
                         logits[i] += GGMLDequantize::dotProductFused(embedType, blockData, xBlock, n);
                     });

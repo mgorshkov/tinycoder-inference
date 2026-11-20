@@ -46,6 +46,8 @@
 
 namespace tinycoder {
 
+    class ThreadPool;
+
     /// @brief Stores a quantized weight matrix and provides quantized matrix-vector
     /// multiplication. Weights are kept in their native GGML quantization format
     /// and dequantized on-the-fly during computation, saving significant memory
@@ -843,6 +845,14 @@ namespace tinycoder {
             std::vector<uint64_t> kvStrideV;
         };
         KVCache kvCache_;
+
+        // Thread pool owned by this model (created in load() from
+        // config_.nThreads). Model::forward binds it via
+        // ThreadPool::bindCurrent so every kernel in this model's call tree
+        // dispatches to this pool instead of the process-wide singleton. Without
+        // it, two resident models in one process share dispatch state and cannot
+        // both run. Empty until load(); kernels then fall back to the singleton.
+        std::unique_ptr<ThreadPool> pool_;
 
         // ---- Static resident-expert profiling (Option D) ----
         // When TINYCODER_MOE_PROFILE=1 the CPU/GPU hybrid records per-layer

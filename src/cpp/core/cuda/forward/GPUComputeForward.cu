@@ -4024,7 +4024,8 @@ namespace tinycoder::gpu {
                         return false;
                     }
                 }
-            } else if (kvHalf_) TC_KV_RUN(__half);
+            } else if (kvHalf_)
+                TC_KV_RUN(__half);
             else
                 TC_KV_RUN(float);
 #undef TC_KV_RUN
@@ -4656,7 +4657,7 @@ namespace tinycoder::gpu {
         if (finalNorm_) {
             if (headNormQ81) {
                 kResidualNormQ81<<<seqLen, 1024, 1024 * sizeof(float),
-                                   g_stream>>>(s.hidden, nullptr, s.hidden,
+                                   g_stream>>>(s.hidden, nullptr, nullptr,
                                                finalNorm_, q8k_, H, seqLen,
                                                1e-6f);
             } else {

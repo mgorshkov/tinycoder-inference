@@ -24,6 +24,8 @@ SOFTWARE.
 
 #include "Model.hpp"
 
+#include "ThreadPool.hpp"// complete type for the Model-owned pool_ member
+
 namespace tinycoder {
 
     Model::Model() = default;

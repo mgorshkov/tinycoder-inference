@@ -88,6 +88,29 @@ namespace tinycoder {
     public:
         static ThreadPool &instance();
 
+        /// @brief The pool bound to the calling thread, or instance() when
+        /// nothing is bound.
+        ///
+        /// Kernels call this instead of instance() so a Model can own its own
+        /// pool: Model::forward binds its pool for the duration of the call, and
+        /// each worker binds its owner at thread start. With nothing bound (the
+        /// bench, unit tests, single-model deployments) it degrades to the
+        /// process-wide instance().
+        static ThreadPool &current();
+
+        /// @brief Bind the pool returned by current() on this thread. nullptr
+        /// restores the instance() fallback. Per-thread; worker threads bind
+        /// themselves in workerMain.
+        static void bindCurrent(ThreadPool *pool);
+
+        /// @brief The pool bound on this thread, or nullptr when none is bound.
+        static ThreadPool *boundCurrent();
+
+        /// @brief Construct a caller-owned pool. Threads are created by
+        /// initialize(); the pool must outlive them.
+        ThreadPool() = default;
+        ~ThreadPool();
+
         void initialize(size_t numThreads);
         size_t numThreads() const { return numThreads_; }
         bool isInitialized() const { return initialized_; }
@@ -201,8 +224,6 @@ namespace tinycoder {
                 const std::function<void(uint32_t)> &phase2);
 
     private:
-        ThreadPool() = default;
-        ~ThreadPool();
         ThreadPool(const ThreadPool &) = delete;
         ThreadPool &operator=(const ThreadPool &) = delete;
         void workerMain(size_t workerIndex);
@@ -316,6 +337,27 @@ namespace tinycoder {
         // (either waiting for work or waiting for the ack). The main thread
         // checks this to decide whether a cv_.notify_all() is required.
         std::atomic<uint32_t> blockedWorkers_{0};
+    };
+
+    /// @brief RAII binding of a Model's pool to the calling thread.
+    ///
+    /// Construct it at the top of Model::forward / Model::generate. A null pool
+    /// (model not loaded yet) leaves the existing binding untouched, so nested
+    /// scopes inside a model restore correctly on the way out.
+    class ThreadPoolBinding {
+    public:
+        explicit ThreadPoolBinding(ThreadPool *pool)
+            : prev_(ThreadPool::boundCurrent()) {
+            if (pool != nullptr) {
+                ThreadPool::bindCurrent(pool);
+            }
+        }
+        ~ThreadPoolBinding() { ThreadPool::bindCurrent(prev_); }
+        ThreadPoolBinding(const ThreadPoolBinding &) = delete;
+        ThreadPoolBinding &operator=(const ThreadPoolBinding &) = delete;
+
+    private:
+        ThreadPool *prev_;
     };
 
 }// namespace tinycoder

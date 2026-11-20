@@ -41,9 +41,28 @@
 
 namespace tinycoder {
 
+    namespace {
+        // Pool bound to this OS thread by Model::forward / generate (or by a
+        // worker at start-up). Null means "use the process-wide instance()",
+        // which keeps the bench and unit tests on the old single-pool path.
+        thread_local ThreadPool *tlsCurrent = nullptr;
+    }// namespace
+
     ThreadPool &ThreadPool::instance() {
         static ThreadPool pool;
         return pool;
+    }
+
+    ThreadPool &ThreadPool::current() {
+        return tlsCurrent != nullptr ? *tlsCurrent : instance();
+    }
+
+    void ThreadPool::bindCurrent(ThreadPool *pool) {
+        tlsCurrent = pool;
+    }
+
+    ThreadPool *ThreadPool::boundCurrent() {
+        return tlsCurrent;
     }
 
     size_t ThreadPool::recommendedThreadCount() {
@@ -356,6 +375,9 @@ namespace tinycoder {
     }
 
     void ThreadPool::workerMain(size_t workerIndex) {
+        // Kernels this worker runs through parallelFor must resolve current() to
+        // the pool that owns this thread, not to whatever the main thread bound.
+        bindCurrent(this);
         pinWorkerToCpu(workerIndex);
 
         // The generation of the last task this worker processed. Starts at 0,

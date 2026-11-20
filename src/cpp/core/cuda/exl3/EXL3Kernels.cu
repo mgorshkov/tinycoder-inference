@@ -1356,7 +1356,6 @@ namespace tinycoder::exl3gpu {
             const int group = warp / SPLIT;
             const int wi = warp % SPLIT;
             const uint32_t pair = blockIdx.x * TPB + group;
-            const uint32_t c = static_cast<uint32_t>(lane) & 15u;
             // One warp-group handles ONE 16-column output tile; all its lanes
             // decode that tile cooperatively (SPLIT warps split k).
             const uint32_t ni = pair;
@@ -1364,13 +1363,6 @@ namespace tinycoder::exl3gpu {
             const uint32_t kChunk = k / SPLIT;
             const uint32_t kStart = wi * kChunk;
             const uint32_t kEnd = kStart + kChunk;
-            const uint32_t nWords = 8u * K;
-            const uint32_t mask = (K >= 32u) ? 0xFFFFFFFFu : ((1u << K) - 1u);
-            // Column-major bit window for this lane's output column c: all 16
-            // row codes are contiguous at bit c*16*K.
-            const uint32_t startBit = c * 16u * K;
-            const uint32_t sw = startBit >> 5;
-            const uint32_t sh0 = startBit & 31u;
 
             __shared__ float sX[8][128];  // input Hadamard (per warp)
             __shared__ float sDec[8][256];// decoded 16x16 tile (per warp)
@@ -1902,7 +1894,6 @@ namespace tinycoder::exl3gpu {
                 for (uint32_t cc = 0; cc < nC; ++cc) {
                     if (cc + 1u < nC) EXL3_LOAD_CHUNK(wn, cc + 1u);
                     const float *xs = sX[cc];
-                    const uint32_t kt0 = (c0 + cc) * 8u;
 #pragma unroll
                     for (int kk = 0; kk < KT; ++kk) {
                         const uint32_t t = static_cast<uint32_t>(wi + kk * SPLIT);

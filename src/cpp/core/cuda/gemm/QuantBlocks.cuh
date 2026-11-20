@@ -79,7 +79,7 @@ enum tc_type {
     TC_TYPE_BF16 = 30,
     TC_TYPE_MXFP4 = 39,
     TC_TYPE_NVFP4 = 40,
-    TC_TYPE_PQ2_0 = 142,// Prism PQ2_0 ternary, 34 B per 128 weights
+    TC_TYPE_PQ2_0 = 142, // Prism PQ2_0 ternary, 34 B per 128 weights
     TC_TYPE_PTQ1_0 = 143,// Prism native ternary, 28 B per 128 weights
 };
 

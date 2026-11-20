@@ -16,44 +16,44 @@
 
 using tinycoder::detail::ContextPlan;
 using tinycoder::detail::ContextRequest;
-using tinycoder::detail::KvPrecision;
 using tinycoder::detail::kvBytesPerToken;
+using tinycoder::detail::KvPrecision;
 using tinycoder::detail::planContext;
 
 namespace {
 
-constexpr uint64_t MiB = 1024ull * 1024ull;
-constexpr uint64_t GiB = 1024ull * MiB;
+    constexpr uint64_t MiB = 1024ull * 1024ull;
+    constexpr uint64_t GiB = 1024ull * MiB;
 
-// G27 — Ternary-Bonsai-2-27B / Qwen3.8-27B: 64 layers, 16 full-attention
-// layers (interval 4), 4 K/V heads of 256, and 64 MRoPE dims on top of the
-// 256 text dims (the cos/sin row width is 320, i.e. 1280 B/token).
-ContextRequest g27() {
-    ContextRequest r;
-    r.modelMax = 262144;
-    r.numLayers = 64;
-    r.numAttentionLayers = 16;
-    r.numKVHeads = 4;
-    r.headDim = 256;
-    r.ropeDims = 320;
-    r.int8KvSupported = true;
-    return r;
-}
+    // G27 — Ternary-Bonsai-2-27B / Qwen3.8-27B: 64 layers, 16 full-attention
+    // layers (interval 4), 4 K/V heads of 256, and 64 MRoPE dims on top of the
+    // 256 text dims (the cos/sin row width is 320, i.e. 1280 B/token).
+    ContextRequest g27() {
+        ContextRequest r;
+        r.modelMax = 262144;
+        r.numLayers = 64;
+        r.numAttentionLayers = 16;
+        r.numKVHeads = 4;
+        r.headDim = 256;
+        r.ropeDims = 320;
+        r.int8KvSupported = true;
+        return r;
+    }
 
-// G9 — Ornith-1.5-9B: 32 layers, 8 full-attention layers, same K/V shape.
-ContextRequest g9() {
-    ContextRequest r;
-    r.modelMax = 262144;
-    r.numLayers = 32;
-    r.numAttentionLayers = 8;
-    r.numKVHeads = 4;
-    r.headDim = 256;
-    r.ropeDims = 320;
-    r.int8KvSupported = true;
-    return r;
-}
+    // G9 — Ornith-1.5-9B: 32 layers, 8 full-attention layers, same K/V shape.
+    ContextRequest g9() {
+        ContextRequest r;
+        r.modelMax = 262144;
+        r.numLayers = 32;
+        r.numAttentionLayers = 8;
+        r.numKVHeads = 4;
+        r.headDim = 256;
+        r.ropeDims = 320;
+        r.int8KvSupported = true;
+        return r;
+    }
 
-}  // namespace
+}// namespace
 
 // ---------------------------------------------------------------------------
 // Byte accounting.  These four numbers are what every window decision in this
@@ -206,7 +206,7 @@ TEST(ContextPlan, NoGpuUsesRam) {
     auto r = g27();
     r.weightBytes = 5 * GiB;
     r.availableRam = 40 * GiB;
-    r.requested = 65536;  // freeVram stays 0
+    r.requested = 65536;// freeVram stays 0
     const auto p = planContext(r);
     EXPECT_FALSE(p.kvOnGpu);
     EXPECT_EQ(p.kv, KvPrecision::F32);
@@ -237,7 +237,7 @@ TEST(ContextPlan, FloorAccepted) {
 TEST(ContextPlan, NothingFitsAtAll) {
     auto r = g27();
     r.weightBytes = 1 * GiB;
-    r.freeVram = 700 * MiB;  // below gpuFixedOverhead + safety margin
+    r.freeVram = 700 * MiB;// below gpuFixedOverhead + safety margin
     const auto p = planContext(r);
     EXPECT_EQ(p.seqLen, 0u);
     EXPECT_EQ(p.maxAllowed, 0u);
@@ -308,9 +308,28 @@ TEST(ContextPlan, ResultIsAlwaysRoundedAndBounded) {
     };
     const auto r = g27();
     check(r);
-    auto a = r; a.requested = 3000; a.weightBytes = 4 * GiB; a.freeVram = 12 * GiB; check(a);
-    auto b = r; b.requested = 262144; b.weightBytes = 4 * GiB; b.freeVram = 12 * GiB; check(b);
-    auto c = r; c.weightBytes = 4 * GiB; c.freeVram = 8 * GiB; c.requested = 524288; check(c);
-    auto d = r; d.availableRam = 40 * GiB; d.requested = 65536; check(d);
-    auto e = r; e.modelMax = 0; e.weightBytes = 1 * GiB; e.freeVram = 40 * GiB; check(e);
+    auto a = r;
+    a.requested = 3000;
+    a.weightBytes = 4 * GiB;
+    a.freeVram = 12 * GiB;
+    check(a);
+    auto b = r;
+    b.requested = 262144;
+    b.weightBytes = 4 * GiB;
+    b.freeVram = 12 * GiB;
+    check(b);
+    auto c = r;
+    c.weightBytes = 4 * GiB;
+    c.freeVram = 8 * GiB;
+    c.requested = 524288;
+    check(c);
+    auto d = r;
+    d.availableRam = 40 * GiB;
+    d.requested = 65536;
+    check(d);
+    auto e = r;
+    e.modelMax = 0;
+    e.weightBytes = 1 * GiB;
+    e.freeVram = 40 * GiB;
+    check(e);
 }
