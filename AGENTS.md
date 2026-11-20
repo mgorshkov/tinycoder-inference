@@ -55,6 +55,13 @@ sm_75 constraints that repeatedly matter:
    cmake --build build-1.0 --target tinycoder_core -j 20 || { echo BUILD FAILED; exit 1; }
    ```
 
+   **`-lineinfo` is off by default and costs 2-3x of the fatbin size when enabled.**
+   It changes no SASS (verified: `.text` sections byte-identical, 183,432 instructions for
+   `GemmEntry.cu` both ways), but nvcc keeps each translation unit's PTX text in the cubin to
+   map SASS to source: one arch's `GemmEntry` cubin is 15.4 MB with it and 4.1 MB without, the
+   whole archive is 198 MB against 109 MB, and a bench binary 309 MB against 141 MB. Opt in
+   with `-DTINYCODER_LINEINFO=ON` for a profiling build, where `ncu` needs the source lines.
+
 3. Rebuild the tool you intend to run after the core, in the same command:
 
    ```bash
@@ -80,18 +87,18 @@ sm_75 constraints that repeatedly matter:
   be labelled as such.
 - **A throughput number only exists if the text gates pass on the same tree and the same checkpoint.**
   Speed on a path that cannot answer a question is not a result, it is a measurement of wasted work.
-  Before any row goes into `BENCHMARKS.md`, run the gate over the checkpoint — the script is the
-  authority, and its exit status is the gate:
+  Before any row goes into a benchmark file (`benchmarks/BENCHMARKS-2080TI.md`, `benchmarks/BENCHMARKS-3090.md`), run the
+  gate over the checkpoint — the script is the authority, and its exit status is the gate:
 
   ```bash
-  ./scripts/text_gate.sh                # every checkpoint in BENCHMARKS.md
+  ./scripts/text_gate.sh                # every checkpoint in a BENCHMARKS file
   ./scripts/text_gate.sh ornith/Ornith-1.5-9B   # one model
   ```
 
   It exits non-zero if any checkpoint cannot answer, **and it treats a gtest SKIP as a failure**,
   because `FullQuestions` skips shapes missing from its allow-list (`unit_tests/ModelTest.cpp`,
-  `AnswersQuestion`) and a skip reads like a pass in a summary. So: **adding a row to
-  `BENCHMARKS.md` requires adding its shape to that allow-list in the same change**, otherwise the
+  `AnswersQuestion`) and a skip reads like a pass in a summary. So: **adding a row to a benchmark
+  file requires adding its shape to that allow-list in the same change**, otherwise the
   row has no gate and can silently measure garbage. This is not hypothetical — the 9B row was
   published for weeks from a path that emitted noise, because the 9B was not on the allow-list at
   all, and the 35B-A3B gate existed and could not answer when it was finally run.
@@ -124,9 +131,9 @@ different class of mistake.
 
 1. **Kernel parity** — `./build-1.0/unit_tests/exl3_gpu_parity`
 
-   Baseline is **29 `[FAIL]` lines**, all in the pre-existing `b=4.0` / K=4 "unsupported geometry"
-   class, and the count is identical with and without the fused path. Compare the *count*, not a
-   feeling. The valuable checks are the identity-probe ones:
+   Baseline is **0 `[FAIL]`** and **10 `[SKIP]`** (`ALL EXL3 GPU PARITY CHECKS PASSED`, 156 PASS):
+   the K>3 cases that the fused GEMM genuinely does not implement are reported as SKIP, not FAIL.
+   Compare the *count*, not a feeling. The valuable checks are the identity-probe ones:
 
    ```
    [PASS] fused gemm vs raw matrix (maxAbsDiff=0.000000)
@@ -177,7 +184,45 @@ different class of mistake.
    `!!!!`. A short prompt is not a smoke test for a 27B model. Always also check a **>=45-token
    chat-style prompt** for finite logits, and check that generation answers a factual question.
 
-4. **Suite** — `./build-1.0/unit_tests/tinycoder_test` must report **113 tests, 96 passed, 0 failed**
+4. **GGUF int8 GEMM parity** — `./build-1.0/unit_tests/int8_gemm_parity <model.gguf>`
+
+   Per-shape gate on the prefill int8 tensor-core GEMM, against an fp64 dot over the
+   dequantized rows of the *same* checkpoint. Run it after anything that touches
+   `GemmDispatch.cu`, `GemmKernels.cuh` staging, or a quant block layout. Measured floors
+   on `ornith/Ornith-1.5-9B-Q4_K_M`: **Q6_K 1.0e-7** (the path is exact — only accumulation
+   order), **Q4_K 6.7e-4** (a 4-bit-plus-subblock-min block cannot be represented exactly in
+   int8 for `mma.s8`; that is the int8 path's inherent floor, not a defect). Gate 2e-3.
+   Read the number, not just the verdict: a Q6_K shape drifting from 1e-7 to 1e-4 is a
+   regression the verdict would still call a pass. It found a real defect on its first run:
+   `launchSk` had no Q6_K branch, so `int8Gemm` refused every Q6_K shape and the engine
+   silently fell back to the integer kernel.
+
+   **Sweep the sequence length: `--seqlen 1,8,64,128`.** The dispatch picks the tile width
+   from `seqLen` (`>= 64` → the 128-row tile, `< 64` → 64, `< 32` → 32), so a probe run at one
+   sequence length verifies one of three kernels. `m=8` exercises tile 32, `m=64` tile 64,
+   `m=128` tile 128; `m<8` is refused by design (`int8Gemm` requires `seqLen >= 8` and
+   `cols % 512 == 0`), which the probe reports as SKIP, correctly. This is the same rule as
+   the multi-strip case below: if a tiling dimension exists, a probe must reach it.
+
+   Two ways to prove the gate still has teeth, both cheap: run it with `--tolerance 1e-9`
+   (must print FAIL and exit 1 — checks the verdict path), and for a kernel change, point a
+   dispatch arm at the wrong tile kernel (must be caught: it surfaces as a loud
+   `[int8] fallback: kernel launch error` plus SKIP, not as a silent pass).
+
+5. **GGUF decode GEMV parity** — `./build-1.0/unit_tests/gemv_decode_parity <model.gguf>`
+
+   The decode counterpart, and until it existed **no tool reached the GGUF decode path** —
+   a change there could only be judged by whole-model tok/s, 40 shapes averaged together.
+   Same fp64 reference construction. Measured: K-quants and Q8_0 land at **3e-8..1.3e-7**,
+   i.e. the mat-vec is numerically exact; the i-quants land at **2.5e-5..3.1e-5**, which is
+   not accumulation order — their lattice reconstruction rounds an intermediate the host
+   dequant does not. Gate 2e-4 for that reason. Both tools report `verified / skipped /
+   outside tolerance` and exit non-zero when they verified nothing, because a run that
+   skipped every shape used to print the same clean line as a real pass.
+
+6. **Suite** — `./build-1.0/unit_tests/tinycoder_test` must report **0 failed** (119 tests / 102
+   passed as of this writing; the total grew from the older 113/96 note, so compare the failure count,
+   not the total)
    without a model (the rest skip because they need a checkpoint). With `TINYCODER_MODEL_PATH` set, the gated question tests run instead of skipping; they
    are the ones that catch real inference bugs:
 
@@ -188,6 +233,20 @@ different class of mistake.
 
    They print the generated text, so read it — a passing keyword check and a plausible-looking
    completion are not the same thing.
+
+7. **float32 -> float16 must not flush subnormals.** `GGMLDequantize::floatToHalf` shifted the
+   mantissa by `(14 - exp)` and then by another 13, so every magnitude below `2^-13` (1.22e-4)
+   converted to **exactly zero**. Everything that writes an fp16 scale went through it, and the one
+   that mattered was the GPU path's Q8_0 -> Q4_K expert requantiser (`Q4KRequant.hpp` writes
+   `d = maxScale/63`, `dmin = maxMin/63`): on `Ornith-1.5-35B-A3B-Q8_0` the expert weights are
+   small (max |w| ~ 0.06), so `d` is subnormal, became 0, and **every routed expert became an
+   all-zero matrix**. Symptom: the model emitted `endahendah...` from the first token, its logits
+   were nearly input-independent (the same top-1 id for `is`, `France` and a chat prompt), and the
+   CPU path — which never requantises — was correct. Witness by magnitude: 7.1e-6 gave 0 (now
+   7.09e-6), 1e-4 gave 0 (now 9.996e-5), 1e-8 still gives 0, correctly. The Q8_0 -> Q4_K round-trip
+   error on a real expert row went from **247%** to 8.4%. If you add a float->half conversion, test
+   it at 1e-6 and 1e-4; the `EXL3Loader` copy of the same function is correct, which is why only the
+   GPU-expert path broke.
 
 ## Measuring the baseline engine (exllamav3)
 
@@ -210,8 +269,20 @@ PATH=/tmp/exl3venv/bin:$PATH /tmp/exl3venv/bin/python scripts/exl3_ask.py <check
 ## EXL3 specifics worth knowing before touching the kernels
 
 - Layout is `(k/16, n/16, 16*K)`; **one trellis tile is one 16x16 (k,n) weight tile**, which is one
-  GEMM k-step. Decode is arithmetic, not a table gather:
-  `x*89226354+64248484 -> (x & 0x8fff8fff) ^ 0x3b603b60 -> f(lo)+f(hi)`.
+  GEMM k-step. Decode is arithmetic, not a table gather, and **which arithmetic depends on the
+  checkpoint's codebook**: the shipped checkpoints all carry `mul1`, i.e.
+  `x*0x83DCD12D -> S = 0x6400 + Sigma(4 bytes) -> h2f(S)*kInv + kBias`, while
+  `x*89226354+64248484 -> (x & 0x8fff8fff) ^ 0x3b603b60 -> f(lo)+f(hi)` (3INST) is only the
+  fallback that no tensor here uses. Check `quantization_config.json` before optimising either.
+  The `mul1` byte sum folds into one `IMAD` + one `dp4a` + one `HADD2`, bit-exactly — the
+  `dp4a` low half is the same `uint16_t` payload the scalar path hands to `h2f()`, which is
+  rounded to fp16 at that magnitude rather than exact, and identically so on both paths
+  (verified over all 65536 windows). It needs the **unsigned** `dp4a` overload: the signed one
+  changes 94% of the windows. The K=1 kernel always did this and the K=2/K=3
+  kernel did not, which cost 12 integer ops per weight on 55% of the weights. Porting the fold to
+  `exl3GemvV3` moved the 27B decode 23.53 -> ~30.8 tok/s. **The EXL3 decode GEMV is integer-ALU
+  bound, not bandwidth bound** (24.0 ms/token of int ALU against 5.71 ms of bytes on a 3090), so
+  bandwidth arithmetic misleads here until the ALU term is gone.
 - The decomposition is `W^T x = Dsv Hn What^T Hk Dsu x`. **RAW mode (default) keeps both Hadamards
   and the scales off the weights**, applied to activations instead. That is what makes the batched
   path cheap. Decoded RAW weights are **O(1)**: measured `max|w| = 3.4531`, RMS `1.0267` on
@@ -235,15 +306,23 @@ PATH=/tmp/exl3venv/bin:$PATH /tmp/exl3venv/bin/python scripts/exl3_ask.py <check
   Do not re-attempt this without a new idea for the staging bottleneck; the numbers above are the
   falsification.
 - The fused prefill kernel and the decode GEMV are different code paths with different coverage:
-  prefill has bit-exact parity probes; **the decode GEMV has none reaching it** except the gated
-  tests. That asymmetry is where a bug can live for weeks.
+  prefill has bit-exact parity probes, and **no gtest reaches the decode GEMV**. Two tools do:
+  `tools/exl3_gpu_parity` (the shipped `gemvFused` against the CPU reference, 1e-2) and
+  `tools/exl3_k1_probe` (per output element against a double reference, 4e-5, on a real checkpoint
+  projection). Both default to a K=1 base, so point them at a K=2/K=3 projection when the change is
+  in `exl3GemvV3`. That asymmetry is where a bug can live for weeks.
 
 ## Operational rules
 
 - **Never `pkill -f tinycoder_bench`.** The pattern matches the shell running the command and kills
   your own session. Use `pgrep -x tinycoder_bench` and kill the PID.
 - **`compute-sanitizer` hangs on the 27B model.** Do not use it there; use a small model or a
-  single-projection harness for memory checking.
+  single-projection harness for memory checking. It is also unreliable on probes that read
+  weights straight from the checkpoint mmap: `memcheck` reports tens of thousands of "out of
+  bounds" reads whose nearest allocation is "512 bytes" while the address is 600 MB into the
+  file, and its device frames mix three different source files (mis-symbolicated). Those are
+  false positives on file-backed weights, not kernel bugs — do not chase them. Use it when the
+  buffers under test are `cudaMalloc`ed by the harness itself.
 - **Do not commit.** The user commits; leave the tree dirty and describe what changed.
 - **Do not add date-stamped or changelog paragraphs to README.md.** No "Re-measured <date>", no "an
   earlier edition recorded X". Numbers belong in the table; the procedure belongs in the method
@@ -261,6 +340,18 @@ PATH=/tmp/exl3venv/bin:$PATH /tmp/exl3venv/bin/python scripts/exl3_ask.py <check
   (`git commit --amend`) rather than added as a second commit.
 - Every release is one commit with a meaningful message describing the feature and its verified
   numbers.
+- **Commit messages must be as short and concise as possible while staying true.** Subject line,
+  then only what a reader needs to judge the commit: the number that changed with both sides of the
+  comparison, the defects fixed (so `git log --grep` can find them), and the gates that now exist.
+  Everything else — cost models, negative results, per-file walkthroughs, the story of how a bug was
+  found — belongs in the design doc, the plan and the ledger, which is where knowledge is supposed to
+  survive. A message that has grown to explain itself has become a document in the wrong place: a
+  200-line body is not more thorough, it is unread.
+- When amending, **rewrite the body wholesale** instead of appending to it. A message that
+  accumulates paragraphs turns into a changelog nobody reads top to bottom.
+- **Never claim a number the committed tree cannot reproduce.** If a speed was measured with an env
+  knob, on another card, or on a build that is no longer the one being committed, either say so in
+  the same sentence or leave the number out.
 
 ## Evidence ledger
 

@@ -131,6 +131,37 @@ namespace tinycoder::exl3gpu {
             const float kBias = h2f(0xc931);
             return h2f(static_cast<uint16_t>(sum)) * kInv + kBias;
         }
+        // decodeMul1, folded to one IMAD + one dp4a.
+        //
+        // mul1's value is h2f(0x6400 + S) with S the four-byte sum of
+        // w*0x83DCD12D.  A dp4a with a 0x01010101 multiplicand and a 0x6400
+        // accumulator computes S + 0x6400 in 32 bits, so its low half is
+        // exactly the uint16_t payload decodeMul1() passes to h2f().  The same
+        // fold has been in the K=1 kernel since it was written
+        // (decodeWindowK1<2> below); this exposes it to the K=2/K=3 path.
+        //
+        // Bit-identical to decodeMul1() above for all 65536 windows of `w`
+        // (checked exhaustively, /tmp-verified with this file's flags): the two
+        // paths differ only in how they reach that payload.
+        //
+        // Two details this depends on, neither of them incidental:
+        //  * the UNSIGNED __dp4a overload, which reads each byte as 0..255.
+        //    With the signed overload the negative bytes subtract 256 each and
+        //    61437 of 65536 windows decode to a different value -- measured,
+        //    not assumed.  The overload is picked by argument type, so `w` must
+        //    stay uint32_t.
+        //  * 0x6400 + S is NOT exactly representable in fp16 (S <= 1020 puts it
+        //    at 25600..26620, where fp16 has 16-ulp spacing); it is *rounded*,
+        //    identically on both paths, which is all bit-identity needs.  An
+        //    earlier version of this comment claimed exactness -- the fold was
+        //    right, the reason was wrong.
+        //
+        // --use_fast_math contracts f*kInv + kBias to FFMA, which is what
+        // fmaf() is.
+        __device__ __forceinline__ float decodeMul1Fold(uint32_t w) {
+            const uint32_t bits = __dp4a(w * 0x83DCD12Du, 0x01010101u, 0x6400u);
+            return fmaf(h2f(static_cast<uint16_t>(bits)), h2f(0x1eee), h2f(0xc931));
+        }
         __device__ __forceinline__ float decodeCode(uint32_t code, int codebook) {
             if (codebook == 1) return decodeMcG(code);
             if (codebook == 2) return decodeMul1(code);
@@ -1343,7 +1374,7 @@ namespace tinycoder::exl3gpu {
             for (int i = 0; i < 8; ++i) f[i] = decodeCode(w[i] & 0xffffu, CB);
         }
 
-        template<int CB, int SPLIT>
+        template<int CB, int SPLIT, bool GENERIC>
         __global__ void exl3FusedMatVec(const uint16_t *__restrict__ trellis,
                                         const float *__restrict__ suh,
                                         uint32_t k, uint32_t K,
@@ -1442,7 +1473,20 @@ namespace tinycoder::exl3gpu {
                     const uint16_t *tp = trellis +
                                          (static_cast<size_t>(kt) * tilesN + ni) * tileU16;
                     const uint32_t *p32 = reinterpret_cast<const uint32_t *>(tp);
-                    if ((lane & 4) == 0) {
+                    if (GENERIC) {
+                        // K>=4 has no lane fragment (those tables are 1/2/3
+                        // bit; a 4-bit layout read as 3-bit codes gave
+                        // fused-vs-cpu 46-48 on the parity probe).  Decode with
+                        // the generic unpacker and scatter to the (r,c) the
+                        // permutation dictates -- the same map the CPU
+                        // reference and decodeTilesInt use.
+                        for (int i = 0; i < 8; ++i) {
+                            const uint32_t j = static_cast<uint32_t>(lane) * 8u +
+                                               static_cast<uint32_t>(i);
+                            sDec[warp][c_perm[j]] =
+                                    decodeCode(unpackCode(tp, K, j), CB);
+                        }
+                    } else if ((lane & 4) == 0) {
                         float f[8], nb[8];
                         exl3LaneFrag<CB>(p32, K, lane, f);
                         exl3LaneFrag<CB>(p32, K, lane + 4, nb);
@@ -1534,15 +1578,22 @@ namespace tinycoder::exl3gpu {
         void launchFusedSplit(int split, const Exl3FusedLinear &lin,
                               const float *xDev, float *yDev,
                               cudaStream_t stream) {
+            const bool generic = lin.K >= 4u;
             const uint32_t tilesN = lin.n / 16u;
             const uint32_t tileU16 = lin.tileU16;
             const uint32_t gridTiles = lin.n / 16u;// tiles total
 #define LAUNCH_SPLIT(SP)                                                         \
     do {                                                                         \
         const uint32_t grid = gridTiles / (8u / (SP));                           \
-        exl3FusedMatVec<CB, SP><<<grid, 256, 0, stream>>>(                       \
-                reinterpret_cast<const uint16_t *>(lin.trellis), lin.suh, lin.k, \
-                lin.K, tilesN, tileU16, xDev, yDev);                             \
+        if (generic) {                                                           \
+            exl3FusedMatVec<CB, SP, true><<<grid, 256, 0, stream>>>(             \
+                    reinterpret_cast<const uint16_t *>(lin.trellis), lin.suh,   \
+                    lin.k, lin.K, tilesN, tileU16, xDev, yDev);                  \
+        } else {                                                                 \
+            exl3FusedMatVec<CB, SP, false><<<grid, 256, 0, stream>>>(            \
+                    reinterpret_cast<const uint16_t *>(lin.trellis), lin.suh,   \
+                    lin.k, lin.K, tilesN, tileU16, xDev, yDev);                  \
+        }                                                                        \
     } while (0)
             switch (split) {
                 case 8:
@@ -1753,9 +1804,10 @@ namespace tinycoder::exl3gpu {
                         for (int i = 0; i < 8; ++i) {
                             // 16-bit window of the per-lane stream: same value
                             // as exl3LaneFrag's w[i] for every codebook.
-                            const float f = decodeCode(
-                                    static_cast<uint32_t>((m >> bp) & 0xffffu),
-                                    CB);
+                            // mul1 (CB == 2) is every tensor in the shipped checkpoints,
+                            // so this fold is what actually runs on the decode path.
+                            const uint32_t win = static_cast<uint32_t>((m >> bp) & 0xffffu);
+                            const float f = (CB == 2) ? decodeMul1Fold(win) : decodeCode(win, CB);
                             bp -= K;
                             const float xv = xsr[exl3RowOff(i & 3)];
                             if (i < 4) {
@@ -1814,7 +1866,10 @@ namespace tinycoder::exl3gpu {
         // are unchanged), so the output stays bit-identical to V2.
         // -------------------------------------------------------------------
         template<int CB, int SPLIT, int TT, int KSPLIT = 1>
-        __global__ void exl3GemvV3(const uint16_t *__restrict__ trellis,
+        // 256 threads x 4 blocks needs <= 64 registers.  V3 sat at 67 (3 blocks,
+        // 24 of 48 warps) -- three registers away from a whole residency slot --
+        // and the K=1 kernel next to it has carried (256,4) since it was written.
+        __global__ __launch_bounds__(256, 4) void exl3GemvV3(const uint16_t *__restrict__ trellis,
                                    const float *__restrict__ suh,
                                    uint32_t k, uint32_t K,
                                    uint32_t tilesN, uint32_t tileU16,
@@ -1909,8 +1964,10 @@ namespace tinycoder::exl3gpu {
                             float aA = 0.0f, aB = 0.0f;
 #pragma unroll
                             for (int i = 0; i < 8; ++i) {
-                                const float f = decodeCode(
-                                        static_cast<uint32_t>((m >> bp) & 0xffffu), CB);
+                                // mul1 (CB == 2) is every tensor in the shipped checkpoints,
+                                // so this fold is what actually runs on the decode path.
+                                const uint32_t win = static_cast<uint32_t>((m >> bp) & 0xffffu);
+                                const float f = (CB == 2) ? decodeMul1Fold(win) : decodeCode(win, CB);
                                 bp -= K;
                                 const float xv = xsr[exl3RowOff(i & 3)];
                                 if (i < 4) {
@@ -2009,9 +2066,12 @@ namespace tinycoder::exl3gpu {
                                                         float kInv, float kBias) {
             const uint32_t w = shifted & 0xffffu;
             if (CB == 2) {
-                // dp4a accumulates into 0x6400, so its 16-bit result IS the bit
-                // pattern of the exact fp16 h2f(0x6400+S) mul1 multiplies by
-                // kInv (S <= 1020, 1024+S <= 2044 is exact in fp16).
+                // dp4a accumulates into 0x6400, so its 16-bit result IS the
+                // payload h2f() takes on the decodeMul1 path (S <= 1020, so
+                // 0x6400+S stays inside uint16_t; it is rounded to fp16 at that
+                // magnitude, identically on both paths -- see decodeMul1Fold).
+                // The unsigned overload is required: the signed one reads bytes
+                // as -128..127 and changes 94% of the windows.
                 const uint32_t bits = __dp4a(w * 0x83DCD12Du, 0x01010101u, 0x6400u);
                 const float f = __half2float(__ushort_as_half(static_cast<uint16_t>(bits)));
                 return fmaf(f, kInv, kBias);
@@ -2369,22 +2429,37 @@ namespace tinycoder::exl3gpu {
         // (138.7 -> 133.3).  Same story for the V3 kernel used by the K=3
         // shapes: 6144x5120 fields 160 blocks and goes 155.7 -> 181.0 GB/s at
         // ks=2 (181.1 at 8), while 5120x10240 at 160 blocks does not want it.
-        // So: give blocks only to a grid under 192 (below 3 per SM), and only
-        // up to 4 per SM.
+        // So: give blocks only to a grid under 3 per SM, and only up to 4 per
+        // SM.  Both constants were measured at 68 SMs (192 = 2.8/SM, 272 =
+        // 4/SM); they are scaled by the device's SM count so that a 82-SM card
+        // gets the same blocks *per SM* instead of 17% fewer.  On the 68-SM
+        // card this evaluates to exactly the old integers.
         inline int pickKsplit(uint32_t grid, uint32_t chunks, bool allow) {
             if (!allow) return 1;
             int ks = 1;
+            static const uint32_t nsm = [] {
+                int n = 0;
+                int dev = 0;
+                if (cudaGetDevice(&dev) != cudaSuccess ||
+                    cudaDeviceGetAttribute(&n, cudaDevAttrMultiProcessorCount, dev) !=
+                            cudaSuccess || n <= 0)
+                    n = 68;
+                return static_cast<uint32_t>(n);
+            }();
+            const uint32_t gridLow = 192u * nsm / 68u;
+            const uint32_t gridFull = 272u * nsm / 68u;
+            const uint32_t gridCap = 136u * 8u * nsm / 68u;
             const int want = gemvKsplitEnv();
             if (want >= 2) {
                 ks = want;
-            } else if (want == 0 && grid < 192u) {
+            } else if (want == 0 && grid < gridLow) {
                 ks = 2;
-                while (grid * static_cast<uint32_t>(ks) < 272u && ks < 8) ks *= 2;
+                while (grid * static_cast<uint32_t>(ks) < gridFull && ks < 8) ks *= 2;
             }
             // At least one full round of eight chunks per block, or the
             // whole-round prefetch just pays the prologue.
             while (ks > 1 && chunks < 8u * static_cast<uint32_t>(ks)) ks >>= 1;
-            while (ks > 1 && grid * static_cast<uint32_t>(ks) > 136u * 8u) ks >>= 1;
+            while (ks > 1 && grid * static_cast<uint32_t>(ks) > gridCap) ks >>= 1;
             return ks;
         }
 
