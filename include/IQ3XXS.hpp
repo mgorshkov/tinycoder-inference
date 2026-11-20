@@ -107,7 +107,7 @@ namespace tinycoder {
             uint32_t cols = w.cols;
             uint32_t bpr = w.blocksPerRow();
 
-            ThreadPool::instance().parallelFor(0, rows, [&](uint32_t r) {
+            ThreadPool::current().parallelFor(0, rows, [&](uint32_t r) {
                 const Block *rowBlks = w.rowBlocks(r);
                 float sum = 0.0f;
 
@@ -179,7 +179,7 @@ namespace tinycoder {
         static np::Array<float> dequantize(const Block *blocks, uint32_t numBlocks) {
             std::vector<float> result(numBlocks * BLOCK_SIZE);
 
-            ThreadPool::instance().parallelFor(0, numBlocks, [&](uint32_t b) {
+            ThreadPool::current().parallelFor(0, numBlocks, [&](uint32_t b) {
                 auto deq = dequantizeBlock(blocks[b]);
                 std::memcpy(&result[b * BLOCK_SIZE], deq.data(),
                             BLOCK_SIZE * sizeof(float));
@@ -195,7 +195,7 @@ namespace tinycoder {
 
             std::vector<float> result(rows * cols);
 
-            ThreadPool::instance().parallelFor(0, rows, [&](uint32_t r) {
+            ThreadPool::current().parallelFor(0, rows, [&](uint32_t r) {
                 for (uint32_t bc = 0; bc < blocksPerRow; ++bc) {
                     uint32_t blockIdx = r * blocksPerRow + bc;
                     auto deq = dequantizeBlock(blocks[blockIdx]);

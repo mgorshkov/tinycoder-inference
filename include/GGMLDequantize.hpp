@@ -2212,7 +2212,7 @@ namespace tinycoder {
             }
             quantizeQ8K(x, cols, q8);
 
-            ThreadPool::instance().parallelFor(0, rows, [&](uint32_t j) {
+            ThreadPool::current().parallelFor(0, rows, [&](uint32_t j) {
                 const uint8_t *rowData = data + static_cast<uint64_t>(j) * rowStrideBytes;
                 float sumf = 0.0f;
                 for (uint32_t b = 0; b < blocksPerRow; ++b) {
@@ -2252,7 +2252,7 @@ namespace tinycoder {
                 }
             }
 
-            ThreadPool::instance().parallelFor(0, rows, [&](uint32_t j) {
+            ThreadPool::current().parallelFor(0, rows, [&](uint32_t j) {
                 const uint8_t *rowData = data + static_cast<uint64_t>(j) * rowStrideBytes;
                 for (uint32_t s = 0; s < seqLen; ++s) {
                     const Q8KBlock *q8 = q8All.data() + static_cast<size_t>(s) * blocksPerRow;
@@ -2505,7 +2505,7 @@ namespace tinycoder {
             // the outer token-level parallelFor is bypassed, making this the only
             // source of parallelism (uses all threads). For seqLen>1 the ThreadPool
             // re-entrancy guard runs this sequentially.
-            ThreadPool::instance().parallelFor(0, rows, [&](uint32_t j) {
+            ThreadPool::current().parallelFor(0, rows, [&](uint32_t j) {
                 const uint8_t *rowData = data + static_cast<uint64_t>(j) * rowStrideBytes;
                 double dot = 0.0;
                 for (uint32_t b = 0; b < blocksPerRow; ++b) {
@@ -2958,7 +2958,7 @@ namespace tinycoder {
             quantizeQ8K(x, cols, q8);
 
             // Parallelize over output rows.
-            ThreadPool::instance().parallelFor(0, rows, [&](uint32_t j) {
+            ThreadPool::current().parallelFor(0, rows, [&](uint32_t j) {
                 const uint8_t *rowData = prepackedData + static_cast<uint64_t>(j) * rowStrideBytes;
                 double dot = 0.0;
 
@@ -3026,7 +3026,7 @@ namespace tinycoder {
             std::vector<Q8KBlock> q8(blocksPerRow);
             quantizeQ8K(x, cols, q8.data());
 
-            ThreadPool::instance().parallelFor(0, rows, [&](uint32_t j) {
+            ThreadPool::current().parallelFor(0, rows, [&](uint32_t j) {
                 const uint8_t *gateRow = gatePrepacked + static_cast<uint64_t>(j) * rowStrideBytes;
                 const uint8_t *upRow = upPrepacked + static_cast<uint64_t>(j) * rowStrideBytes;
                 double gateDot = 0.0;
@@ -3112,7 +3112,7 @@ namespace tinycoder {
             std::vector<Q8KBlock> q8(blocksPerRow);
             quantizeQ8K(x, cols, q8.data());
 
-            ThreadPool::instance().parallelFor(0, rows, [&](uint32_t j) {
+            ThreadPool::current().parallelFor(0, rows, [&](uint32_t j) {
                 const uint8_t *gateRow = gateData + static_cast<uint64_t>(j) * rowStrideBytes;
                 const uint8_t *upRow = upData + static_cast<uint64_t>(j) * rowStrideBytes;
                 double gateDot = 0.0;

@@ -236,7 +236,7 @@ namespace tinycoder {
 
     inline void Int8Pack::pack(const uint8_t *src, uint32_t numBlocks,
                                PackedBlock *dst) {
-        ThreadPool::instance().parallelFor(0, numBlocks, [&](uint32_t b) {
+        ThreadPool::current().parallelFor(0, numBlocks, [&](uint32_t b) {
             packBlock(src + static_cast<size_t>(b) * SRC_BLOCK_BYTES, dst[b]);
         });
     }
@@ -330,7 +330,7 @@ namespace tinycoder {
         //   k-row = (lane % 4) * 4 + i,  n-col = lane / 4,  i = 0..3
         // i.e. lane L holds W[n0 + (L>>2)][k0 + (L&3)*4 + i].  With B[k][n] =
         // W[n][k] this is the col-major B for the row-major GEMM y = x @ W^T.
-        ThreadPool::instance().parallelFor(0, n8Tiles * k16Tiles, [&](uint32_t t) {
+        ThreadPool::current().parallelFor(0, n8Tiles * k16Tiles, [&](uint32_t t) {
             const uint32_t nt = t / k16Tiles;
             const uint32_t kt = t % k16Tiles;
             const uint32_t n0 = nt * MMA_N;
@@ -490,7 +490,7 @@ namespace tinycoder {
         const uint32_t blocksPerRow = (cols + BLOCK_SIZE - 1) / BLOCK_SIZE;
 
         // Per (n8, k16) tile: the q B-cell, plus the per-row dsc/dmn.
-        ThreadPool::instance().parallelFor(0, n8Tiles * k16Tiles, [&](uint32_t t) {
+        ThreadPool::current().parallelFor(0, n8Tiles * k16Tiles, [&](uint32_t t) {
             const uint32_t nt = t / k16Tiles;
             const uint32_t kt = t % k16Tiles;
             const uint32_t n0 = nt * MMA_N;

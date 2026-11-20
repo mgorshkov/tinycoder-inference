@@ -188,7 +188,7 @@ namespace tinycoder::gpu {
         constexpr int kTypeQ5K_ = 13;
         constexpr int kTypeQ6K_ = 14;
         constexpr int kTypeQ8_0_ = 8;
-        constexpr int kTypePQ2_0_ = 142;// Prism PQ2_0 ternary
+        constexpr int kTypePQ2_0_ = 142; // Prism PQ2_0 ternary
         constexpr int kTypePTQ1_0_ = 143;// Prism native ternary, 28 B/128
         constexpr int kTypeQ2K_ = 10;
         constexpr int kTypeQ3K_ = 11;

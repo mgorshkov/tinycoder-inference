@@ -45,77 +45,77 @@ namespace tinycoder {
 
     // ---- Model loading ----
 
-namespace {
-    // ------------------------------------------------------------------
-    // PTQ1_0 (Prism ternary, group 128, 28 B/block) -> PQ2_0 (34 B/block).
-    //
-    // The two packs carry the SAME ternary values and the same fp16 group
-    // scale; they differ only in bit packing, so this is lossless and lets the
-    // whole PQ2_0 pipeline (ternary GEMV, Hadamard fold on activations, fp16
-    // twin prefill, latent embedding) serve both files.  Block layouts, taken
-    // from the reference implementation (PrismML-Eng/llama.cpp,
-    // ggml-quants.c:dequantize_row_ptq1_0):
-    //
-    //   PTQ1_0: qs[24] (5 trits/byte) + qh[2] (4 trits/byte) + d(fp16) = 28 B
-    //           element  16*n + m      = trit n of qs[m],      m <  16, n < 5
-    //           element  80 + 8*n + m  = trit n of qs[16+m],   m <   8, n < 5
-    //           element 120 + 2*n + h  = trit n of qh[h],      h <   2, n < 4
-    //           trit n = ((uint16_t)(qs*pow3[n] as uint8) * 3) >> 8
-    //   PQ2_0:  d(fp16) + qs[32]; element j at byte j/4, bits 2*(j%4); code q
-    //           in 0..2 and value = (q - 1) * d in both packs.
-    //
-    // Verified by decoding a real PTQ1_0 block and comparing the recovered
-    // symbols against the reference order above; the end-to-end check is that
-    // the transcoded file reproduces the native PQ2_0 file's logits.
-    // ------------------------------------------------------------------
-    void transcodePTQ1_0ToPQ2_0(const uint8_t *src, uint8_t *dst, size_t blocks) {
-        static const uint8_t pow3[5] = {1, 3, 9, 27, 81};
-        for (size_t b = 0; b < blocks; ++b) {
-            const uint8_t *s = src + b * 28u;
-            uint8_t *o = dst + b * 34u;
-            o[0] = s[26];// d (fp16), same value in both packs
-            o[1] = s[27];
-            std::memset(o + 2, 0, 32);
-            uint8_t code[128];
-            uint32_t idx = 0;
-            for (uint32_t n = 0; n < 5; ++n) {
-                for (uint32_t m = 0; m < 16; ++m) {
-                    const uint8_t q = static_cast<uint8_t>(s[m] * pow3[n]);
-                    code[idx++] =
-                            static_cast<uint8_t>((static_cast<uint16_t>(q) * 3u) >> 8);
+    namespace {
+        // ------------------------------------------------------------------
+        // PTQ1_0 (Prism ternary, group 128, 28 B/block) -> PQ2_0 (34 B/block).
+        //
+        // The two packs carry the SAME ternary values and the same fp16 group
+        // scale; they differ only in bit packing, so this is lossless and lets the
+        // whole PQ2_0 pipeline (ternary GEMV, Hadamard fold on activations, fp16
+        // twin prefill, latent embedding) serve both files.  Block layouts, taken
+        // from the reference implementation (PrismML-Eng/llama.cpp,
+        // ggml-quants.c:dequantize_row_ptq1_0):
+        //
+        //   PTQ1_0: qs[24] (5 trits/byte) + qh[2] (4 trits/byte) + d(fp16) = 28 B
+        //           element  16*n + m      = trit n of qs[m],      m <  16, n < 5
+        //           element  80 + 8*n + m  = trit n of qs[16+m],   m <   8, n < 5
+        //           element 120 + 2*n + h  = trit n of qh[h],      h <   2, n < 4
+        //           trit n = ((uint16_t)(qs*pow3[n] as uint8) * 3) >> 8
+        //   PQ2_0:  d(fp16) + qs[32]; element j at byte j/4, bits 2*(j%4); code q
+        //           in 0..2 and value = (q - 1) * d in both packs.
+        //
+        // Verified by decoding a real PTQ1_0 block and comparing the recovered
+        // symbols against the reference order above; the end-to-end check is that
+        // the transcoded file reproduces the native PQ2_0 file's logits.
+        // ------------------------------------------------------------------
+        void transcodePTQ1_0ToPQ2_0(const uint8_t *src, uint8_t *dst, size_t blocks) {
+            static const uint8_t pow3[5] = {1, 3, 9, 27, 81};
+            for (size_t b = 0; b < blocks; ++b) {
+                const uint8_t *s = src + b * 28u;
+                uint8_t *o = dst + b * 34u;
+                o[0] = s[26];// d (fp16), same value in both packs
+                o[1] = s[27];
+                std::memset(o + 2, 0, 32);
+                uint8_t code[128];
+                uint32_t idx = 0;
+                for (uint32_t n = 0; n < 5; ++n) {
+                    for (uint32_t m = 0; m < 16; ++m) {
+                        const uint8_t q = static_cast<uint8_t>(s[m] * pow3[n]);
+                        code[idx++] =
+                                static_cast<uint8_t>((static_cast<uint16_t>(q) * 3u) >> 8);
+                    }
                 }
-            }
-            for (uint32_t n = 0; n < 5; ++n) {
-                for (uint32_t m = 0; m < 8; ++m) {
-                    const uint8_t q =
-                            static_cast<uint8_t>(s[16u + m] * pow3[n]);
-                    code[idx++] =
-                            static_cast<uint8_t>((static_cast<uint16_t>(q) * 3u) >> 8);
+                for (uint32_t n = 0; n < 5; ++n) {
+                    for (uint32_t m = 0; m < 8; ++m) {
+                        const uint8_t q =
+                                static_cast<uint8_t>(s[16u + m] * pow3[n]);
+                        code[idx++] =
+                                static_cast<uint8_t>((static_cast<uint16_t>(q) * 3u) >> 8);
+                    }
                 }
-            }
-            for (uint32_t n = 0; n < 4; ++n) {
-                for (uint32_t h = 0; h < 2; ++h) {
-                    const uint8_t q =
-                            static_cast<uint8_t>(s[24u + h] * pow3[n]);
-                    code[idx++] =
-                            static_cast<uint8_t>((static_cast<uint16_t>(q) * 3u) >> 8);
+                for (uint32_t n = 0; n < 4; ++n) {
+                    for (uint32_t h = 0; h < 2; ++h) {
+                        const uint8_t q =
+                                static_cast<uint8_t>(s[24u + h] * pow3[n]);
+                        code[idx++] =
+                                static_cast<uint8_t>((static_cast<uint16_t>(q) * 3u) >> 8);
+                    }
                 }
-            }
-            for (uint32_t j = 0; j < 128; ++j) {
-                o[2u + (j >> 2)] |=
-                        static_cast<uint8_t>((code[j] & 3u) << (2u * (j & 3u)));
+                for (uint32_t j = 0; j < 128; ++j) {
+                    o[2u + (j >> 2)] |=
+                            static_cast<uint8_t>((code[j] & 3u) << (2u * (j & 3u)));
+                }
             }
         }
-    }
 
-    bool ptq1NativeEnabled() {
-        static const bool on = [] {
-            const char *e = std::getenv("TINYCODER_PT_NATIVE");
-            return e != nullptr && e[0] == '1';
-        }();
-        return on;
-    }
-}// namespace
+        bool ptq1NativeEnabled() {
+            static const bool on = [] {
+                const char *e = std::getenv("TINYCODER_PT_NATIVE");
+                return e != nullptr && e[0] == '1';
+            }();
+            return on;
+        }
+    }// namespace
 
     namespace {
         void requantIQ2XSGateUpToQ4K(std::vector<Model::LayerWeights> &layers) {
@@ -641,23 +641,28 @@ namespace {
             return false;
         }
 
-        // Initialize the shared CPU thread pool from the configured thread
-        // count so the per-layer / per-block parallelFor dispatches actually run
-        // on multiple workers. Without this the pool is never created and every
-        // parallel region silently runs serially on the calling thread (the
-        // observed 0% multi-core utilisation). ThreadPool::initialize is
-        // idempotent (the first call wins), so an explicit tc_engine_set_threads
-        // wins when it ran first.
-        {
-            auto &pool = ThreadPool::instance();
-            if (!pool.isInitialized()) {
-                size_t n = config_.nThreads > 0
-                                   ? static_cast<size_t>(config_.nThreads)
-                                   : ThreadPool::recommendedThreadCount();
-                pool.initialize(n);
-                std::cout << "[TinyCoder] CPU thread pool initialized with " << n
-                          << " threads" << std::endl;
+        // Create this model's own CPU thread pool. One pool per Model (rather
+        // than the process-wide singleton) is what lets two resident models in
+        // the same process dispatch work without clobbering each other's task
+        // publication, and it makes n_threads a per-model setting.
+        //
+        // Size: config_.nThreads when set. Otherwise inherit the size of the
+        // process-wide instance() if a caller already initialized it (the bench
+        // and unit tests do, so --threads keeps working), else the recommended
+        // logical-CPU count.
+        if (!pool_) {
+            size_t n = 0;
+            if (config_.nThreads > 0) {
+                n = static_cast<size_t>(config_.nThreads);
+            } else if (ThreadPool::instance().isInitialized()) {
+                n = ThreadPool::instance().numThreads();
+            } else {
+                n = ThreadPool::recommendedThreadCount();
             }
+            pool_ = std::make_unique<ThreadPool>();
+            pool_->initialize(n);
+            std::cout << "[TinyCoder] CPU thread pool initialized with " << n
+                      << " threads" << std::endl;
         }
 
         loaded_ = true;
@@ -1407,7 +1412,8 @@ namespace {
                       << " MiB, but only " << (ramAvail >> 20)
                       << " MiB of RAM is available (GPU offload leaves no host "
                          "cache room): request a smaller window or offload more "
-                         "layers" << std::endl;
+                         "layers"
+                      << std::endl;
             return false;
         }
         try {
@@ -1540,62 +1546,116 @@ namespace {
 
         auto t0 = std::chrono::high_resolution_clock::now();
 
-        // Full dequantization of the embedding matrix
-        auto deqData = GGMLDequantize::dequantize(
-                quantizedEmbeddings_.type,
-                quantizedEmbeddings_.data.data(),
-                embedElements);
+        // Which host-side table to build.  The LM-head dispatch in
+        // ModelForward tries, in this order: direct quantized block dot (Q2_K),
+        // Q8_K, FP16, F32 -- so at most ONE of the three tables is ever read.
+        // All three used to be resident for the whole process: for
+        // 248320 x 5120 that is 5.1 GB (F32) + 2.5 GB (FP16) + 1.3 GB (Q8_K)
+        // = 8.9 GB of anonymous RSS, which is why a 6.9 GB checkpoint showed
+        // 9.7 GiB of heap (Bonsai pq2_0) and an 8.6 GB one showed 18.2 GiB
+        // (Qwen3.8 27B EXL3).  Build only the table the chain selects; the
+        // others are dead weight.  The chain's last resort (the generic
+        // per-block dequantize at the end of the dispatch) reads the quantized
+        // source directly, so no table is required for correctness.
+        //   TINYCODER_EMB_TABLE=f32   also build the F32 table
+        //   TINYCODER_EMB_TABLE=f16   also build the FP16 table
+        //   TINYCODER_EMB_TABLE=all   build all three (legacy behaviour)
+        const char *embEnv = std::getenv("TINYCODER_EMB_TABLE");
+        const std::string embSel = (embEnv != nullptr) ? embEnv : "";
+        const bool embAll = (embSel == "all");
+        const bool embWantF32 = embAll || embSel == "f32";
+        const bool embWantF16 = embAll || embSel == "f16";
+        const bool embQ8K = quantizedEmbeddings_.type != GGML_TYPE_PQ2_0 &&
+                            quantizedEmbeddings_.type != GGML_TYPE_BF16;
 
-        if (deqData.empty()) {
-            std::cerr << "[TinyCoder] Failed to dequantize embeddings" << std::endl;
-            return false;
-        }
-
-        // Move data into persistent buffer
-        dequantizedEmbeddings_.data = std::move(deqData);
         dequantizedEmbeddings_.vocabSize = vocabSize;
         dequantizedEmbeddings_.hiddenSize = hiddenSize;
-        // Hint 2 MB huge pages for the ~890 MB F32 embedding table (streamed
-        // every token by the LM head; collapses the dTLB working set — see
-        // plans/generation_optimizations.md §6.10).
-        tinycoder::adviseHugePages(dequantizedEmbeddings_.data.data(),
-                                   dequantizedEmbeddings_.data.size() * sizeof(float));
 
-        // Build an FP16 copy of the embedding matrix. The LM head mat-vec reads the
-        // entire matrix every token (vocabSize x hiddenSize = ~933 MB for Qwen2.5-Coder).
-        // Storing it as FP16 halves that memory traffic. Since the source embeddings
-        // are Q2_K (~2-bit), FP16 is lossless (see BENCHMARK_REPORT §7.2).
-        auto deqF16 = GGMLDequantize::dequantizeToF16(
-                quantizedEmbeddings_.type,
-                quantizedEmbeddings_.data.data(),
-                embedElements);
-        if (!deqF16.empty()) {
-            dequantizedEmbeddings_.dataF16 = std::move(deqF16);
-            tinycoder::adviseHugePages(dequantizedEmbeddings_.dataF16.data(),
-                                       dequantizedEmbeddings_.dataF16.size() * sizeof(uint16_t));
+        // F32 table: opt-in only.  With Q8_K available it is never selected
+        // (Q8_K wins on bandwidth), and with PQ2_0/BF16 the FP16 table below is
+        // selected ahead of it -- so it is the third choice in every case.
+        if (embWantF32) {
+            auto deqData = GGMLDequantize::dequantize(
+                    quantizedEmbeddings_.type,
+                    quantizedEmbeddings_.data.data(),
+                    embedElements);
+
+            if (deqData.empty()) {
+                std::cerr << "[TinyCoder] Failed to dequantize embeddings" << std::endl;
+                return false;
+            }
+
+            dequantizedEmbeddings_.data = std::move(deqData);
+            // Hint 2 MB huge pages for the F32 embedding table (streamed every
+            // token by the LM head; collapses the dTLB working set — see
+            // plans/generation_optimizations.md §6.10).
+            tinycoder::adviseHugePages(dequantizedEmbeddings_.data.data(),
+                                       dequantizedEmbeddings_.data.size() * sizeof(float));
         }
 
-        // Build a Q8_K copy of the embedding matrix. This is the fastest LM head
-        // path: it cuts memory bandwidth ~2× vs FP16 and ~4× vs F32 (the LM head
-        // mat-vec is the largest single memory read per token). Each 256-element
-        // block stores 256 int8 values + a block scale, and the dot product uses
-        // _mm256_maddubs_epi16 int8 kernels. Since the source embeddings are Q2_K
-        // (~2-bit), Q8_K is lossless.
-        // PQ2_0 (Prism type 142) has 128-wide blocks and no Q8_K dot kernel;
-        // skip the Q8_K build so the LM head uses the generic per-block path
-        // (and for a separate head the Q8_K block-build below is skipped too).
-        if (quantizedEmbeddings_.type != GGML_TYPE_PQ2_0 &&
-            quantizedEmbeddings_.type != GGML_TYPE_BF16) {
-            uint32_t blocksPerRow = (hiddenSize + 255) / 256;
+        // FP16 table: the selected fallback for types with no Q8_K dot kernel
+        // (PQ2_0, BF16), otherwise opt-in only.  The LM head reads the whole
+        // matrix every token, and FP16 halves that traffic versus F32.
+        if (embWantF16 || !embQ8K) {
+            auto deqF16 = GGMLDequantize::dequantizeToF16(
+                    quantizedEmbeddings_.type,
+                    quantizedEmbeddings_.data.data(),
+                    embedElements);
+            if (!deqF16.empty()) {
+                dequantizedEmbeddings_.dataF16 = std::move(deqF16);
+                tinycoder::adviseHugePages(dequantizedEmbeddings_.dataF16.data(),
+                                           dequantizedEmbeddings_.dataF16.size() * sizeof(uint16_t));
+            }
+        }
+
+        // Q8_K table: the chain's preference whenever the type supports it.  It
+        // cuts bandwidth ~2x versus FP16 and ~4x versus F32 (each 256-element
+        // block is 257 bytes), and since the source embeddings are Q2_K/EXL3
+        // (~2 bit) the quantisation is lossless in practice.
+        //
+        // Rows are dequantized into one reusable F32 row buffer instead of into
+        // a full [vocabSize][hiddenSize] matrix: the previous order built the
+        // 5.1 GB F32 table only to throw it away when Q8_K replaced it, which
+        // doubled the load-time peak for nothing.
+        if (embQ8K) {
+            const uint32_t srcBlockSize = ggmlBlockSize(quantizedEmbeddings_.type);
+            const uint32_t srcTypeSize = ggmlTypeSize(quantizedEmbeddings_.type);
+            const uint64_t srcBlocksPerRow = (hiddenSize + srcBlockSize - 1) / srcBlockSize;
+            const uint32_t blocksPerRow = (hiddenSize + 255) / 256;
             std::vector<Q8KBlock> q8k(static_cast<size_t>(vocabSize) * blocksPerRow);
-            // Quantize each row independently (Q8_K blocks are per-row).
-            // NOTE: deqData was moved into dequantizedEmbeddings_.data above, so
-            // read from the persistent buffer (deqData is now empty/moved-from).
-            const float *deqBase = dequantizedEmbeddings_.data.data();
-            for (uint32_t r = 0; r < vocabSize; ++r) {
-                const float *row = deqBase + static_cast<uint64_t>(r) * hiddenSize;
-                GGMLDequantize::quantizeQ8K(row, hiddenSize,
-                                            q8k.data() + static_cast<uint64_t>(r) * blocksPerRow);
+            // A block never crosses a row boundary (ggml lays the matrix out as
+            // rows of whole blocks), so per-row dequantisation is bit-identical
+            // to dequantising the whole matrix and slicing it.
+            if ((hiddenSize % srcBlockSize) == 0) {
+                std::vector<float> rowF32(hiddenSize);
+                for (uint32_t r = 0; r < vocabSize; ++r) {
+                    const uint8_t *rowSrc = quantizedEmbeddings_.data.data() +
+                                            static_cast<uint64_t>(r) * srcBlocksPerRow * srcTypeSize;
+                    for (uint64_t b = 0; b < srcBlocksPerRow; ++b) {
+                        GGMLDequantize::dequantizeBlock(
+                                quantizedEmbeddings_.type, rowSrc + b * srcTypeSize,
+                                rowF32.data() + b * srcBlockSize, srcBlockSize);
+                    }
+                    GGMLDequantize::quantizeQ8K(
+                            rowF32.data(), hiddenSize,
+                            q8k.data() + static_cast<uint64_t>(r) * blocksPerRow);
+                }
+            } else {
+                // Odd geometry (hidden size not a whole number of source
+                // blocks): fall back to the whole-matrix dequantise.
+                auto deq = GGMLDequantize::dequantize(
+                        quantizedEmbeddings_.type,
+                        quantizedEmbeddings_.data.data(),
+                        embedElements);
+                if (deq.empty()) {
+                    std::cerr << "[TinyCoder] Failed to dequantize embeddings" << std::endl;
+                    return false;
+                }
+                for (uint32_t r = 0; r < vocabSize; ++r) {
+                    GGMLDequantize::quantizeQ8K(
+                            deq.data() + static_cast<uint64_t>(r) * hiddenSize, hiddenSize,
+                            q8k.data() + static_cast<uint64_t>(r) * blocksPerRow);
+                }
             }
             dequantizedEmbeddings_.dataQ8K = std::move(q8k);
             tinycoder::adviseHugePages(dequantizedEmbeddings_.dataQ8K.data(),

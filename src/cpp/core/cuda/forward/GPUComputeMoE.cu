@@ -1441,21 +1441,21 @@ namespace tinycoder::gpu {
                     static_cast<uint8_t *>(pq2Wq8_), nb);
         }
         const bool ok = ptq1NativeGemm
-                                 ? int8Gemm(static_cast<int>(kTypePTQ1_0), m.q,
-                                            pq2Xf_, y, seqLen, m.rows, m.cols,
-                                            m.blocksPerRow, g_stream)
-                                 : m.type == kTypePTQ1_0
-                                 ? int8Gemm(static_cast<int>(kTypePQ2_0),
-                                            pq2Wq8_, pq2Xf_, y, seqLen,
-                                            m.rows, m.cols, m.blocksPerRow,
-                                            g_stream)
-                                 : nativePq2
-                                 ? int8Gemm(static_cast<int>(m.type), m.q, pq2Xf_,
-                                            y, seqLen, m.rows, m.cols,
-                                            m.blocksPerRow, g_stream)
-                                 : int8Gemm(static_cast<int>(kTypeQ8_0), pq2Wq8_,
-                                            pq2Xf_, y, seqLen, m.rows, m.cols,
-                                            m.cols / 32u, g_stream);
+                                ? int8Gemm(static_cast<int>(kTypePTQ1_0), m.q,
+                                           pq2Xf_, y, seqLen, m.rows, m.cols,
+                                           m.blocksPerRow, g_stream)
+                        : m.type == kTypePTQ1_0
+                                ? int8Gemm(static_cast<int>(kTypePQ2_0),
+                                           pq2Wq8_, pq2Xf_, y, seqLen,
+                                           m.rows, m.cols, m.blocksPerRow,
+                                           g_stream)
+                        : nativePq2
+                                ? int8Gemm(static_cast<int>(m.type), m.q, pq2Xf_,
+                                           y, seqLen, m.rows, m.cols,
+                                           m.blocksPerRow, g_stream)
+                                : int8Gemm(static_cast<int>(kTypeQ8_0), pq2Wq8_,
+                                           pq2Xf_, y, seqLen, m.rows, m.cols,
+                                           m.cols / 32u, g_stream);
         if (i8Prof) {
             cudaEventRecord(i8Ev[2], g_stream);
             cudaEventSynchronize(i8Ev[2]);
@@ -1893,15 +1893,14 @@ namespace tinycoder::gpu {
         //     same lesson (see forwardQwen35MoE's gemv comment) — dense qwen35
         //     must behave identically, which is why the new batched GEMM keeps
         //     the integer Q8_K math instead of fp16 tensor cores.
-        const bool gemmPrefill = (seqLen > 1) && (geom_.prismFold == 0);
         // Batched-prefill gate for weights that are NOT Hadamard-folded.  On a
-        // Prism model (prismFold != 0) the folded PQ2_0 weights are excluded from
-        // gemmPrefill above, but the F32 ssm_alpha / ssm_beta projections are NOT
+        // Prism model (prismFold != 0) the folded PQ2_0 weights stay on the
+        // per-token loop, but the F32 ssm_alpha / ssm_beta projections are NOT
         // folded and must still batch: leaving them on the per-token loop costs
         // 2 launches x seqLen x 48 GDN layers (49,248 launches on a 512-token
         // prefill, measured 0.28 s of the 1.07 s prefill before this gate).
         // Every branch below that uses it is additionally guarded by !folded, so
-        // for a non-Prism model this is identical to gemmPrefill.
+        // for a non-Prism model this is simply "seqLen > 1".
         const bool batchPrefill = (seqLen > 1);
         // ---- Per-projection profiler (TINYCODER_PROF=1) ----
         // Accumulates wall time per `what` label (projection name) so the prefill
@@ -1913,18 +1912,6 @@ namespace tinycoder::gpu {
         static int g_pCnt = 0;
         static long g_pTotal = 0;
         static long g_pEnter = 0;
-        auto profSlot = [](const char *nm) -> int {
-            if (nm == nullptr) nm = "?";
-            for (int i = 0; i < g_pCnt; ++i)
-                if (std::strcmp(g_pName[i], nm) == 0) return i;
-            if (g_pCnt < 32) {
-                g_pName[g_pCnt] = nm;
-                g_pMs[g_pCnt] = 0;
-                g_pN[g_pCnt] = 0;
-                return g_pCnt++;
-            }
-            return 0;
-        };
         // Event pairs are RECORDED only and reduced in one batch after a single
         // stream sync: synchronising per call (the first version) serialised the
         // stream and inflated the small projections' measured share.
@@ -2023,7 +2010,7 @@ namespace tinycoder::gpu {
                 if (!pq2Q8Enabled() || prismXq_ == nullptr || prismXd_ == nullptr)
                     return false;
                 prismFoldToQ8(x, nCols, false);
-                                                return true;
+                return true;
             }
             // Prefill: fold the whole batch to fp32 into pq2Xf_, the buffer
             // gemmPQ2Int8's own fold would fill, so both projections of a pair
@@ -2065,8 +2052,9 @@ namespace tinycoder::gpu {
             static const uint32_t v = [] {
                 const char *e = std::getenv("TINYCODER_PT_FOLD_T");
                 const int n = e != nullptr ? std::atoi(e) : 0;
-                return n == 128 ? 128u : n == 256 ? 256u : n == 512 ? 512u
-                                                                  : 1024u;
+                return n == 128 ? 128u : n == 256 ? 256u
+                                 : n == 512       ? 512u
+                                                  : 1024u;
             }();
             return v;
         };
@@ -2083,7 +2071,7 @@ namespace tinycoder::gpu {
                         bool *siluDone = nullptr,
                         bool preFolded = false) -> bool {
             if (m.q == nullptr || nRows == 0) return true;
-                        ProfScope ps(what);
+            ProfScope ps(what);
             if (g_prof && g_pEnter < 80) {
                 std::fprintf(stderr, "[proj] %-12s rows=%u cols=%u type=%d seq=%u\n",
                              what, nRows, nCols, static_cast<int>(m.type), seqLen);
@@ -2340,8 +2328,8 @@ namespace tinycoder::gpu {
                         std::fprintf(stderr,
                                      "[pq2dbg] type=%d rows=%u cols=%u folded=%d "
                                      "gdnPerm=%d\n",
-                                     (int)m.type, nRows, nCols, (int)folded,
-                                     (int)gdnPerm);
+                                     (int) m.type, nRows, nCols, (int) folded,
+                                     (int) gdnPerm);
                         ++dbgPQ2;
                     }
                     // siluMul != nullptr means the caller left x in its pre-
@@ -2362,14 +2350,14 @@ namespace tinycoder::gpu {
                                             y + static_cast<size_t>(st) * nRows,
                                             nRows, nCols, m.rowBytes,
                                             m.blocksPerRow);
-                                            } else {
+                    } else {
                         launchQGemvPQ2_0Q8(static_cast<const uint8_t *>(m.q),
                                            prismXq_, prismXd_,
                                            y + static_cast<size_t>(st) * nRows,
                                            nRows, nCols, m.rowBytes,
                                            m.blocksPerRow);
                     }
-                                        continue;
+                    continue;
                 }
                 if (m.type == kTypePTQ1_0 && ptq1GenericEnabled()) {
                     // Fused fold+quantize (A2): one launch instead of fold +
@@ -2417,7 +2405,9 @@ namespace tinycoder::gpu {
                         }();
                         if (cacheDbg) {
                             static uint32_t nHit = 0, nMiss = 0;
-                            if (foldHit) ++nHit; else ++nMiss;
+                            if (foldHit) ++nHit;
+                            else
+                                ++nMiss;
                             if ((nHit + nMiss) % 401u == 0u) {
                                 std::fprintf(stderr,
                                              "[foldcache] hit=%u miss=%u\n",
@@ -2865,7 +2855,7 @@ namespace tinycoder::gpu {
                     }
                 }
                 // Gated RMSNorm (per value-head) × silu(z) over the batch.
-                q35Mark(9 + 4 * L);   // after the scan / attention, before the gated norm
+                q35Mark(9 + 4 * L);// after the scan / attention, before the gated norm
                 kQ35GatedRmsNormHeads<<<dim3(seqLen, nVHeads), 128, 0, g_stream>>>(
                         s.q35z, s.gdnOut, w.ssmNorm, headV, nVHeads, seqLen);
                 if (tprof) {
@@ -3584,9 +3574,13 @@ namespace tinycoder::gpu {
                 const bool gdn = (geom_.fullAttentionInterval == 0) ||
                                  ((L + 1) % geom_.fullAttentionInterval != 0);
                 cudaEventElapsedTime(&ms, q35Ev[8 + 4 * L], q35Ev[9 + 4 * L]);
-                if (gdn) midG += ms; else midA += ms;
+                if (gdn) midG += ms;
+                else
+                    midA += ms;
                 cudaEventElapsedTime(&ms, q35Ev[9 + 4 * L], q35Ev[10 + 4 * L]);
-                if (gdn) postG += ms; else postA += ms;
+                if (gdn) postG += ms;
+                else
+                    postA += ms;
                 cudaEventElapsedTime(&ms, q35Ev[10 + 4 * L], q35Ev[11 + 4 * L]);
                 ffn += ms;
             }

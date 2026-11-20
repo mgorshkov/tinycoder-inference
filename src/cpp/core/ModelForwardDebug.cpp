@@ -401,7 +401,7 @@ namespace tinycoder {
         if (lmHeadTied_) {
             if (!dequantizedEmbeddings_.empty()) {
                 // Consolidated single parallelFor over all (token, vocab) pairs
-                ThreadPool::instance().parallelFor(0, seqLen * vocabSize, [&](uint32_t flatIdx) {
+                ThreadPool::current().parallelFor(0, seqLen * vocabSize, [&](uint32_t flatIdx) {
                     uint32_t s = flatIdx / vocabSize;
                     uint32_t i = flatIdx % vocabSize;
                     const float *hPtr = hiddenData + s * hiddenSize;
@@ -410,7 +410,7 @@ namespace tinycoder {
                     logitRow[i] = dotProductFMA(hPtr, embRow, hiddenSize);
                 });
             } else {
-                ThreadPool::instance().parallelFor(0, seqLen * vocabSize, [&](uint32_t flatIdx) {
+                ThreadPool::current().parallelFor(0, seqLen * vocabSize, [&](uint32_t flatIdx) {
                     uint32_t s = flatIdx / vocabSize;
                     uint32_t i = flatIdx % vocabSize;
                     const float *hPtr = hiddenData + s * hiddenSize;
@@ -433,7 +433,7 @@ namespace tinycoder {
             }
         } else {
             // Separate LM head: consolidated single parallelFor
-            ThreadPool::instance().parallelFor(0, seqLen * vocabSize, [&](uint32_t flatIdx) {
+            ThreadPool::current().parallelFor(0, seqLen * vocabSize, [&](uint32_t flatIdx) {
                 uint32_t s = flatIdx / vocabSize;
                 uint32_t i = flatIdx % vocabSize;
                 const float *hPtr = hiddenData + s * hiddenSize;

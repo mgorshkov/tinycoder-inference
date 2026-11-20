@@ -32,22 +32,34 @@ else()
 endif()
 option(ENABLE_CUDA "Enable CUDA GPU acceleration (default: ON when nvcc is available)"
         ${TINYCODER_CUDA_DEFAULT})
-option(ENABLE_AVX2 "Enable AVX2 optimizations" OFF)
-# AVX-512 defaults to ON only when the BUILD HOST can run it.  It used to default
-# ON unconditionally, and `cmake -B build` on a Broadwell-class Xeon (the
-# reference box: E5-2686 v4, AVX2 but no AVX-512 at all) therefore produced a
-# binary that dies with SIGILL at startup -- including `tinycoder_bench --gpu`,
-# which looked like a GPU problem.  A default build has to run where it was
-# built; -DENABLE_AVX512=ON still forces it for a cross-build or a container
-# whose /proc/cpuinfo describes a different machine.
+# Both SIMD defaults follow the BUILD HOST, from /proc/cpuinfo.  A default build
+# has to run where it was built, and it also has to be the configuration the
+# benchmarks describe.  Both defaults have been wrong in opposite directions:
+#   * ENABLE_AVX512 used to default ON unconditionally, so `cmake -B build` on a
+#     Broadwell-class Xeon (the reference box: E5-2686 v4, AVX2 but no AVX-512)
+#     produced a binary that died with SIGILL at startup -- including
+#     `tinycoder_bench --gpu`, which looked like a GPU problem.
+#   * ENABLE_AVX2 used to default OFF, so that same default build compiled
+#     SIMDMatMulVecAVX2.cpp into an empty TU (its body is one __AVX2__ guard) and
+#     ran scalar matvec: correct, but several times slower on the CPU path, and
+#     not the configuration any published row was measured with.
+# -DENABLE_AVX2=... / -DENABLE_AVX512=... still force either way, for a
+# cross-build or a container whose /proc/cpuinfo describes a different machine.
+set(TINYCODER_HOST_AVX2 OFF)
 set(TINYCODER_HOST_AVX512 OFF)
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND EXISTS "/proc/cpuinfo")
     file(READ "/proc/cpuinfo" TINYCODER_CPUINFO LIMIT 131072)
+    string(FIND "${TINYCODER_CPUINFO}" "avx2" TINYCODER_AVX2_FOUND)
+    if(NOT TINYCODER_AVX2_FOUND EQUAL -1)
+        set(TINYCODER_HOST_AVX2 ON)
+    endif()
     string(FIND "${TINYCODER_CPUINFO}" "avx512f" TINYCODER_AVX512_FOUND)
     if(NOT TINYCODER_AVX512_FOUND EQUAL -1)
         set(TINYCODER_HOST_AVX512 ON)
     endif()
 endif()
+option(ENABLE_AVX2 "Enable AVX2 optimizations (default: ON when the host CPU has it)"
+        ${TINYCODER_HOST_AVX2})
 option(ENABLE_AVX512 "Enable AVX-512 optimizations (default: ON when the host CPU has it)"
         ${TINYCODER_HOST_AVX512})
 # AVX-512 sub-features (Ice Lake+ only; OPT-IN because the runtime dispatch

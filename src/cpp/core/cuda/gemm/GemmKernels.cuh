@@ -823,9 +823,9 @@ static __device__ __forceinline__ void load_tiles_q8_0(
 // decode the reference's tile loader uses.
 __device__ __forceinline__ uint32_t pq2Decode4(const uint32_t b) {
     constexpr uint32_t LUT = 0x020100FFu;
-    const uint32_t ev = __byte_perm(LUT, LUT, b);       // dec(c0), dec(c2)
-    const uint32_t od = __byte_perm(LUT, LUT, b >> 2);  // dec(c1), dec(c3)
-    return __byte_perm(ev, od, 0x5140);                 // c0, c1, c2, c3
+    const uint32_t ev = __byte_perm(LUT, LUT, b);     // dec(c0), dec(c2)
+    const uint32_t od = __byte_perm(LUT, LUT, b >> 2);// dec(c1), dec(c3)
+    return __byte_perm(ev, od, 0x5140);               // c0, c1, c2, c3
 }
 
 // PTQ1_0: decode one int (four columns 4p..4p+3) of a native 28-byte block.
@@ -839,7 +839,7 @@ __device__ __forceinline__ uint32_t ptq1Decode4(const uint8_t *blk, int p) {
         // 3^plane as a select chain: the static array compiles to a
         // constant-memory load with a thread-dependent index, which serialises
         // on the 5 distinct addresses a warp holds.
-        const uint32_t p3 = plane == 0 ? 1u
+        const uint32_t p3 = plane == 0   ? 1u
                             : plane == 1 ? 3u
                             : plane == 2 ? 9u
                             : plane == 3 ? 27u
@@ -919,7 +919,6 @@ static __device__ __forceinline__ void load_tiles_pq2_0(
     constexpr int threads_per_row = 32;
     constexpr int nrows = warp_size / threads_per_row;
     const int txi = warp_size > threads_per_row ? threadIdx.x % threads_per_row : threadIdx.x;
-    const int kqsx = txi % QI8_0;         // 4-weight group within a 32-weight unit
 
 #pragma unroll
     for (int i0 = 0; i0 < tile_y; i0 += nrows * nwarps) {

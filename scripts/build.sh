@@ -14,10 +14,13 @@
 # machine without nvcc/CUDA, pass --no-cuda (or --cpu) to request a CPU-only
 # build instead of failing the configure.
 #
-# ENABLE_AVX512 defaults to ON only when the host CPU reports AVX-512 support
-# (CMakeLists.txt reads /proc/cpuinfo), because a build that enables kernels the
-# build machine cannot execute dies with SIGILL at startup; --avx512 / --no-avx512
-# still force either way for a cross-build.
+# ENABLE_AVX2 and ENABLE_AVX512 both default to ON only when the host CPU reports
+# the feature (CMakeLists.txt reads /proc/cpuinfo).  Both directions matter: a
+# build that enables kernels the build machine cannot execute dies with SIGILL at
+# startup, and a build that silently leaves AVX2 off compiles the AVX2 matvec TU
+# to nothing and runs scalar kernels -- correct, but not comparable with the
+# published numbers.  --avx2 / --no-avx2 and --avx512 / --no-avx512 still force
+# either way for a cross-build; the resolved set is printed after configure.
 #
 # SIMD flags: each SIMD feature is a separate --feature/--no-feature pair that
 # is translated into a -DENABLE_* CMake cache entry and appended to
@@ -169,6 +172,21 @@ echo ""
 echo "--- Step 1/3: Configuring CMake ---"
 cmake -B "${BUILD_DIR}" -DCMAKE_BUILD_TYPE=Release ${CUDA_FLAGS} ${TESTS_FLAGS} \
     "${EXTRA_CMAKE_ARGS[@]}"
+
+# Report the SIMD set the configure actually resolved.  The defaults follow the
+# host, but a reused build tree keeps whatever its cache already holds, so a
+# build log that does not print this cannot explain its own benchmark numbers.
+if [[ -f "${BUILD_DIR}/CMakeCache.txt" ]]; then
+    echo ""
+    echo "SIMD configuration (from ${BUILD_DIR}/CMakeCache.txt):"
+    grep -E '^ENABLE_(AVX2|AVX512|AVX512_VBMI|AVX512_VBMI2):' \
+        "${BUILD_DIR}/CMakeCache.txt" | sed 's/^/  /' || true
+    if grep -q '^ENABLE_AVX2:BOOL=OFF' "${BUILD_DIR}/CMakeCache.txt"; then
+        echo "  WARNING: AVX2 kernels are OFF -- CPU matvec runs scalar;"
+        echo "           this build's CPU-path numbers are not comparable with"
+        echo "           the published ones (pass --avx2 to enable them)."
+    fi
+fi
 
 # ---- 2. Build ----
 echo ""

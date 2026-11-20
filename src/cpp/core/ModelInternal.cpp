@@ -108,7 +108,7 @@ namespace tinycoder::detail {
         // (seqLen==1) the outer token-level parallelFor is bypassed, making
         // this the only source of parallelism (uses all threads). For
         // seqLen>1 the ThreadPool re-entrancy guard runs this sequentially.
-        ThreadPool::instance().parallelFor(0, rows, [&](uint32_t j) {
+        ThreadPool::current().parallelFor(0, rows, [&](uint32_t j) {
             const uint16_t *Wrow = W_f16 + static_cast<size_t>(j) * cols;
             // Software prefetch the next row's weight data to hide DRAM latency
             // on the large FP16 weight matrix (rows × cols). Rows are handed out
@@ -194,7 +194,7 @@ namespace tinycoder::detail {
 
         // Combined row space: Q rows, then K rows, then V rows.
         uint32_t totalRows = qRows + kRows + vRows;
-        if (totalRows <= ThreadPool::instance().numThreads()) {
+        if (totalRows <= ThreadPool::current().numThreads()) {
             // Small combined matrix: keep the serial block-outer loop (avoids the
             // spin-barrier + atomic dispatch overhead on tiny ranges).
             if (q8kQ || q8kK) {
@@ -276,7 +276,7 @@ namespace tinycoder::detail {
         constexpr uint32_t kTileRows = 16;
         uint32_t numTiles = (totalRows + kTileRows - 1) / kTileRows;
 
-        ThreadPool::instance().parallelFor(0, numTiles, [&](uint32_t tile) {
+        ThreadPool::current().parallelFor(0, numTiles, [&](uint32_t tile) {
             uint32_t rowStart = tile * kTileRows;
             uint32_t rowEnd = std::min(rowStart + kTileRows, totalRows);
             for (uint32_t j = rowStart; j < rowEnd; ++j) {
@@ -368,7 +368,7 @@ namespace tinycoder::detail {
         constexpr uint32_t kTileRows = 8;
         uint32_t numRowTiles = (rows + kTileRows - 1) / kTileRows;
 
-        ThreadPool::instance().parallelFor(0, numRowTiles, [&](uint32_t tile) {
+        ThreadPool::current().parallelFor(0, numRowTiles, [&](uint32_t tile) {
             uint32_t rowStart = tile * kTileRows;
             uint32_t tRows = std::min(kTileRows, rows - rowStart);
 
@@ -447,7 +447,7 @@ namespace tinycoder::detail {
         constexpr uint32_t kTileRows = 8;
         uint32_t numRowTiles = (rows + kTileRows - 1) / kTileRows;
 
-        ThreadPool::instance().parallelFor(0, numRowTiles, [&](uint32_t tile) {
+        ThreadPool::current().parallelFor(0, numRowTiles, [&](uint32_t tile) {
             uint32_t rowStart = tile * kTileRows;
             uint32_t tRows = std::min(kTileRows, rows - rowStart);
             // P7: thread-local reusable accumulator (grows on demand, zeroed
@@ -521,7 +521,7 @@ namespace tinycoder::detail {
                                             q8All.data() + static_cast<size_t>(s) * blocksPerRow);
             }
 
-            ThreadPool::instance().parallelFor(0, rows, [&](uint32_t j) {
+            ThreadPool::current().parallelFor(0, rows, [&](uint32_t j) {
                 const uint8_t *rowData = W.prepackedData.data() + static_cast<size_t>(j) * rowStrideBytes;
                 if (j + 1 < rows) {
                     prefetchRow(rowData + rowStrideBytes);
@@ -556,7 +556,7 @@ namespace tinycoder::detail {
         if (blockSize == 0 || typeSize == 0) {
             // F32 (or unknown) fallback: direct float dot product.
             const float *Wf = reinterpret_cast<const float *>(W.data.data());
-            ThreadPool::instance().parallelFor(0, rows, [&](uint32_t j) {
+            ThreadPool::current().parallelFor(0, rows, [&](uint32_t j) {
                 const float *wrow = Wf + static_cast<size_t>(j) * cols;
                 for (uint32_t s = 0; s < seqLen; ++s) {
                     const float *xrow = X + static_cast<size_t>(s) * cols;
@@ -573,7 +573,7 @@ namespace tinycoder::detail {
         uint32_t blocksPerRow = (cols + blockSize - 1) / blockSize;
         uint64_t rowStrideBytes = static_cast<uint64_t>(blocksPerRow) * typeSize;
 
-        ThreadPool::instance().parallelFor(0, rows, [&](uint32_t j) {
+        ThreadPool::current().parallelFor(0, rows, [&](uint32_t j) {
             const uint8_t *rowData = W.data.data() + static_cast<size_t>(j) * rowStrideBytes;
             if (j + 1 < rows) {
                 prefetchRow(rowData + rowStrideBytes);
@@ -673,7 +673,7 @@ namespace tinycoder::detail {
                                             q8All.data() + static_cast<size_t>(s) * blocksPerRow);
             }
 
-            ThreadPool::instance().parallelFor(0, rows, [&](uint32_t j) {
+            ThreadPool::current().parallelFor(0, rows, [&](uint32_t j) {
                 const uint8_t *gateRow = gate.prepackedData.data() + static_cast<size_t>(j) * rowStrideBytes;
                 const uint8_t *upRow = up.prepackedData.data() + static_cast<size_t>(j) * rowStrideBytes;
                 if (j + 1 < rows) {

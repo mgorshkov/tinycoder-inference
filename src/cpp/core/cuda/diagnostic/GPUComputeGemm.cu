@@ -177,23 +177,6 @@ namespace tinycoder::gpu {
         return result;
     }
 
-    // Whether THIS device exposes the int8 m8n8k16 tensor-core mma the INT8
-    // kernel needs (Turing sm_75+).  Pre-Turing (sm_70/sm_72) has no int8 mma
-    // at all.  (The kernel itself is compiled only for archs in the gencode
-    // list; this is the runtime half of the gate.)
-    static bool int8S8Supported() {
-        int dev = 0;
-        if (cudaGetDevice(&dev) != cudaSuccess) return false;
-        int major = 0, minor = 0;
-        if (cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor,
-                                   dev) != cudaSuccess)
-            return false;
-        if (cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor,
-                                   dev) != cudaSuccess)
-            return false;
-        return (major > 7) || (major == 7 && minor >= 5);
-    }
-
     void GPUModel::debugQ8KBlocks(uint32_t type, const uint8_t *wRow,
                                   uint32_t blocksPerRow, const float *x,
                                   uint32_t cols, float *outBlk,

@@ -30,6 +30,8 @@ add_executable(tinycoder_test
     EXL3Test.cpp
     ReferenceCompareTest.cpp
     ThreadPoolReentrancyTest.cpp
+    ThreadPoolOwnershipTest.cpp
+    EmbeddingTableTest.cpp
     GPUCpuCompareTest.cpp
     Int8PackParityTest.cpp
     SharedTestEnv.cpp
