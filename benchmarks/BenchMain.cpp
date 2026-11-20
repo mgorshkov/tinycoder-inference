@@ -29,8 +29,10 @@
 //   tinycoder_bench [--model <path>] [--n-prompts 512] [--n-gen 128]
 //                   [--reps 5] [--threads N]
 //   TINYCODER_THREADS=N env var is honored by ThreadPool::recommendedThreadCount.
+//   TINYCODER_TOKEN_TIMES=1 prints per-token decode ms (tagged [tg-times]).
 // -----------------------------------------------------------------------------
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -91,11 +93,44 @@ namespace {
         int32_t tokens = 0; // generated tokens this rep
     };
 
+    // TINYCODER_TOKEN_TIMES=1: per-token decode timing. One summary line answers
+    // "is this run cold or just slow": first tokens slow and later tokens steady
+    // means a one-time cost inside the timed region (lazy kernel build, allocator
+    // growth, first touch); every token uniformly slow means clocks/bandwidth.
+    // The full series is emitted too so a run can be re-plotted or diffed.
+    void reportTokenTimes(const char *label, const std::vector<double> &ms) {
+        if (ms.empty()) return;
+        std::vector<double> sorted = ms;
+        std::sort(sorted.begin(), sorted.end());
+        auto pct = [&sorted](double p) {
+            const size_t i = static_cast<size_t>(p * static_cast<double>(sorted.size() - 1) + 0.5);
+            return sorted[i];
+        };
+        double mean = 0.0;
+        for (double v: ms) mean += v;
+        mean /= static_cast<double>(ms.size());
+        const size_t nf = std::min<size_t>(5, ms.size());
+        const size_t nl = std::min<size_t>(5, ms.size());
+        double first = 0.0, last = 0.0;
+        for (size_t i = 0; i < nf; ++i) first += ms[i];
+        for (size_t i = ms.size() - nl; i < ms.size(); ++i) last += ms[i];
+        first /= static_cast<double>(nf);
+        last /= static_cast<double>(nl);
+        std::fprintf(stderr,
+                     "[tg-times] %s: n=%zu mean=%.2f ms p50=%.2f p95=%.2f max=%.2f "
+                     "first%zu=%.2f last%zu=%.2f\n",
+                     label, ms.size(), mean, pct(0.50), pct(0.95), sorted.back(),
+                     nf, first, nl, last);
+        std::fprintf(stderr, "[tg-times] %s series_ms=", label);
+        for (double v: ms) std::fprintf(stderr, "%.2f,", v);
+        std::fprintf(stderr, "\n");
+    }
+
     // Prefill (untimed), then decode
     // nGen tokens greedily, timing ONLY the decode loop.
     RepResult runOneRep(tinycoder::Model &model, const std::vector<int32_t> &prompt,
                         int32_t nGen, double &prefillMsOut,
-                        const int32_t vocabSize) {
+                        const int32_t vocabSize, const char *label = "") {
         // Prefill on a cleared cache, timed separately as a diagnostic
         // (EXCLUDED from the decode rate).
         model.clearKVCache();
@@ -112,16 +147,24 @@ namespace {
         const char *dumpTok = std::getenv("TINYCODER_DUMP_TOKENS");
         const bool dump = dumpTok != nullptr && dumpTok[0] != '\0' &&
                           dumpTok[0] != '0';
+        const char *timesTok = std::getenv("TINYCODER_TOKEN_TIMES");
+        const bool tokenTimes = timesTok != nullptr && timesTok[0] != '\0' &&
+                                timesTok[0] != '0';
+        std::vector<double> tokenMs;
+        if (tokenTimes) tokenMs.reserve(static_cast<size_t>(nGen));
         if (dump) std::fprintf(stderr, "[tokens]");
         int32_t gen = 0;
         for (int32_t i = 0; i < nGen; ++i) {
             if (dump) std::fprintf(stderr, " %d", tok);
+            const double tTok0 = tokenTimes ? nowMs() : 0.0;
             logits = model.forward({tok}, false);
             tok = argmaxTop(logits.data(), vocabSize);
             ++gen;
+            if (tokenTimes) tokenMs.push_back(nowMs() - tTok0);
         }
         if (dump) std::fprintf(stderr, " %d\n", tok);
         double tDec1 = nowMs();
+        if (tokenTimes) reportTokenTimes(label, tokenMs);
 
         RepResult r;
         r.ms = tDec1 - tDec0;
@@ -142,6 +185,8 @@ namespace {
                      "  --gpu            use the CUDA offload engine (the default in a CUDA\n"
                      "                   build; overrides TINYCODER_GPU=0)\n"
                      "  --cpu, --no-gpu  force the CPU path (CPU baseline of the same run)\n"
+                     "  TINYCODER_TOKEN_TIMES=1  print per-token decode ms tagged\n"
+                     "                   [tg-times] (cold/warm diagnosis: first tokens vs rest)\n"
 #ifndef USE_CUDA
                      "                   NOTE: this binary was built WITHOUT CUDA, so --gpu\n"
                      "                   is unavailable: reconfigure with -DENABLE_CUDA=ON\n"
@@ -264,7 +309,7 @@ int main(int argc, char **argv) {
     double coldTg = 0.0, coldPp = 0.0;
     {
         double prefillMs = 0.0;
-        auto r = runOneRep(model, prompt, opt.nGen, prefillMs, vocab);
+        auto r = runOneRep(model, prompt, opt.nGen, prefillMs, vocab, "cold");
         coldTg = r.tokens / (r.ms / 1000.0);
         coldPp = opt.nPrompts / (prefillMs / 1000.0);
         std::fprintf(stderr,
@@ -280,7 +325,9 @@ int main(int argc, char **argv) {
     std::vector<double> prefillMsVec;
     for (int r = 0; r < opt.reps; ++r) {
         double prefillMs = 0.0;
-        auto res = runOneRep(model, prompt, opt.nGen, prefillMs, vocab);
+        char repLabel[32];
+        std::snprintf(repLabel, sizeof(repLabel), "rep %d", r + 1);
+        auto res = runOneRep(model, prompt, opt.nGen, prefillMs, vocab, repLabel);
         prefillMsVec.push_back(prefillMs);
         double rate = res.tokens / (res.ms / 1000.0);
         double ppRate = opt.nPrompts / (prefillMs / 1000.0);

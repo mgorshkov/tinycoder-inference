@@ -128,19 +128,19 @@ namespace tinycoder::gpu {
 
 
     namespace {
-#include "gpu/GpuAttentionKernels.hpp"
-#include "gpu/GpuBatchGemmKernels.hpp"
 #include "gpu/GpuCommon.hpp"
-#include "gpu/GpuDequantKernels.hpp"
 #include "gpu/GpuElementwiseKernels.hpp"
-#include "gpu/GpuGemmDispatch.hpp"
-#include "gpu/GpuGemvIQ.hpp"
-#include "gpu/GpuGemvIQInt8.hpp"
+#include "gpu/GpuAttentionKernels.hpp"
+#include "gpu/GpuDequantKernels.hpp"
 #include "gpu/GpuGemvPQ2_0.hpp"
 #include "gpu/GpuGemvPTQ1_0.hpp"
-#include "gpu/GpuGemvQ2KFused.hpp"
 #include "gpu/GpuGemvQ8_1.hpp"
+#include "gpu/GpuBatchGemmKernels.hpp"
 #include "gpu/GpuGemvRowKQuant.hpp"
+#include "gpu/GpuGemvQ2KFused.hpp"
+#include "gpu/GpuGemvIQ.hpp"
+#include "gpu/GpuGemvIQInt8.hpp"
+#include "gpu/GpuGemmDispatch.hpp"
 #include "gpu/GpuQwen35Kernels.hpp"
     }// namespace
 
