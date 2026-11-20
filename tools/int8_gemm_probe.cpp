@@ -149,7 +149,7 @@ namespace {
 
     // Qwen2.5-Coder-7B `iq3_xxs`: every projection is IQ3_XXS.  Compared
     // against kSevenB this isolates the quant type from the shape, because the
-    // rows/cols are the same inventory (see BENCHMARKS.md).
+    // rows/cols are the same inventory (see BENCHMARKS-2080TI.md).
     const Shape kSevenBIq3[] = {
             {"q   IQ3XXS 3584", GGML_TYPE_IQ3_XXS, 3584, 3584},
             {"k   IQ3XXS  512", GGML_TYPE_IQ3_XXS, 512, 3584},

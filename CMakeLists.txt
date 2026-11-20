@@ -151,11 +151,25 @@ if(ENABLE_CUDA)
     list(APPEND TINYCODER_CORE_SOURCES ${TINYCODER_CUDA_SOURCES})
     # The CUDA runtime needs explicit cuBLAS (already found below) plus the
     # shared library path for nvcc device-linking.
-    # -lineinfo gives line numbers in profiler traces.  Skip it in Debug
-    # builds: the shared cmake Config.cmake already adds --device-debug (-G),
-    # and nvcc warns that -G overrides -lineinfo for every .cu TU.
-    if(NOT CMAKE_BUILD_TYPE STREQUAL "Debug")
+    #
+    # -lineinfo gives line numbers in profiler traces.  It is not free: nvcc
+    # keeps every translation unit's PTX text in the cubin to map SASS back to
+    # source, so a fatbin built with it is roughly 2-3x larger.  Measured on this
+    # tree with 2077 kernels and arches 75;80;86, one arch's cubin is 164 MB and
+    # 90 MB of that is the `.nv_debug_ptx_txt` sections.  Neither the SASS nor
+    # its speed changes (-O3 code is identical), so it is OFF by default and
+    # opt-in for profiling, where ncu needs the source lines:
+    #   cmake -B build -DTINYCODER_LINEINFO=ON
+    #
+    # Debug builds are excluded regardless: the shared cmake Config.cmake
+    # already adds --device-debug (-G), and nvcc warns that -G overrides
+    # -lineinfo for every .cu TU.
+    option(TINYCODER_LINEINFO
+        "CUDA -lineinfo: profiler source lines, but each cubin keeps its TU's PTX text (2-3x larger fatbin)" OFF)
+    if(NOT CMAKE_BUILD_TYPE STREQUAL "Debug" AND TINYCODER_LINEINFO)
         set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -lineinfo")
+        message(STATUS "tinycoder: CUDA -lineinfo enabled (TINYCODER_LINEINFO=ON): "
+                       "ncu source lines at 2-3x fatbin size")
     endif()
     # Benign nvlink noise: CMake's separable-compilation device-link step
     # passes the host-only static archives (-ldl/-lrt/-lpthread pulled in via

@@ -72,13 +72,18 @@ namespace tinycoder {
                 if (mant != 0) {
                     h |= 0x200;// NaN with quiet bit
                 }
-            } else if (exp > -14) {
+            } else if (exp >= -14) {
                 // Normalized float16 value
                 h = (sign << 15) | ((static_cast<uint32_t>(exp + 15) & 0x1F) << 10) | (mant >> 13);
-            } else if (exp > -24) {
-                // Subnormal float16 value
-                mant = (mant | 0x800000) >> (14 - exp);
-                h = (sign << 15) | (mant >> 13);
+            } else if (exp >= -24) {
+                // Subnormal float16 value: h_mant = value / 2^-24, and
+                // value = (1.mant) * 2^exp, so h_mant = (0x800000|mant) >> -(exp+1).
+                // The previous form shifted by (14 - exp) and then by another 13,
+                // i.e. 28 bits too far, which flushed every |v| < 2^-13 to zero:
+                // a Q4_K requant of Q8_0 experts then wrote d = dmin = 0 and
+                // every routed expert became an all-zero matrix.
+                h = (sign << 15) |
+                    static_cast<uint16_t>(((mant | 0x800000u) >> -(exp + 1)) & 0x3FFu);
             } else {
                 // Zero (or flush to zero)
                 h = sign << 15;

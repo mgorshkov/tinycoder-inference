@@ -651,7 +651,7 @@ TEST_P(SampleQuestionTest, AnswersQuestion) {
     // while the engine could not answer a factual question on it.  It is the
     // same architecture family as the 27B above, so the same content-based
     // assertions apply; the token floor is trivially met.  Any new GGUF shape
-    // that gets a BENCHMARKS.md row must be added here in the same change.
+    // that gets a benchmark row must be added here in the same change.
     const bool isOrnith9B = (cfg.architecture == ARCH_QWEN35 &&
                              cfg.hiddenSize == 4096 && cfg.numLayers == 32);
     if (!isGptQwen025B && !isQwen25Coder7B && !isQwen25Coder15B &&
