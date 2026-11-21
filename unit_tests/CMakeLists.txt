@@ -134,6 +134,42 @@ if(ENABLE_CUDA)
         CXX_STANDARD_REQUIRED ON
     )
 
+    # ---- int8 GEMM numeric gate (diagnostic; not a gtest) ----
+    # Compares int8Gemm against a float64 dot over the dequantized weights of a
+    # real checkpoint, per (type, rows, cols).  Gates the sm_86 prefill work.
+    add_executable(int8_gemm_parity
+        ../tools/int8_gemm_parity.cpp
+    )
+
+    target_link_libraries(int8_gemm_parity
+        PRIVATE
+        tinycoder_core
+        CUDA::cudart
+    )
+
+    set_target_properties(int8_gemm_parity PROPERTIES
+        CXX_STANDARD 20
+        CXX_STANDARD_REQUIRED ON
+    )
+
+    # ---- GGUF decode GEMV numeric gate (diagnostic; not a gtest) ----
+    # Per (type, rows, cols) against an fp64 reference on real weights.  The
+    # decode path had no tool coverage at all before this.
+    add_executable(gemv_decode_parity
+        ../tools/gemv_decode_parity.cpp
+    )
+
+    target_link_libraries(gemv_decode_parity
+        PRIVATE
+        tinycoder_core
+        CUDA::cudart
+    )
+
+    set_target_properties(gemv_decode_parity PROPERTIES
+        CXX_STANDARD 20
+        CXX_STANDARD_REQUIRED ON
+    )
+
     # ---- EXL3 GPU kernel benchmark (diagnostic; not a gtest) ----
     # Times the reconstruct pipeline + steady-state GEMV over the real layer
     # shapes of a checkpoint and projects a decode step.  Needs the CUDA runtime

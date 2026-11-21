@@ -1,4 +1,10 @@
-# Benchmarking: GPU Performance (TinyCoder vs llama.cpp)
+# Benchmarking on RTX 2080 Ti: GPU Performance (TinyCoder vs llama.cpp)
+
+Per-card benchmark files: this one is the **RTX 2080 Ti** (11 GB, sm_75, ~616 GB/s), the
+reference box every number below was measured on. The Ampere sibling is
+[BENCHMARKS-3090.md](BENCHMARKS-3090.md). A number is only comparable within the file for
+the card it was measured on, and each file's baseline column must be measured on that
+same card.
 
 ## GPU Comparison (TinyCoder vs llama.cpp / exllamav3)
 
@@ -17,8 +23,14 @@ with the old and new path in the same binary.
 | Ternary-Bonsai-2-27B `pq2_0` (Prism) | 6.7 GB | full offload | **880.6 tok/s** | **51.73 tok/s** | PrismML llama.cpp (fork) | 878.5 tok/s | 50.36 tok/s |
 | Ternary-Bonsai-2-27B `ptq1_0` (Prism) | 5.5 GB | full offload | **880.7 tok/s** | 51.73 tok/s | PrismML llama.cpp (fork) | 848.1 tok/s | **65.29 tok/s** |
 | Ornith-1.5-9B `q4_k_m` | 5.9 GB | full offload | 2,538.1 tok/s | 83.3 tok/s | llama.cpp | **2,640.1 tok/s** | **84.1 tok/s** |
-| Ornith-1.5-35B-A3B `q8_0` → `q4_k` experts | 34.4 GB | hybrid (layer arena, grouped int8) | **176.3 tok/s** | **53.6 tok/s** | llama.cpp `-ncmoe 99` | 132.2 tok/s | 17.1 tok/s |
-| Qwen3.8-27B EXL3 `1.60bpw` | 8.6 GB | full offload | **727.5 tok/s** | 23.60 tok/s | exllamav3 1.6.6 | 719.5 tok/s | **23.76 tok/s** |
+| Ornith-1.5-35B-A3B `q8_0` → `q4_k` experts | 34.4 GB | **hybrid only** (experts in RAM, layer arena) | **176.3 tok/s** | **53.6 tok/s** | llama.cpp `-ncmoe 99` | 132.2 tok/s | 17.1 tok/s |
+| Qwen3.8-27B EXL3 `1.60bpw` | 8.6 GB | full offload | **725.8 tok/s** | **29.83 tok/s** | exllamav3 1.6.6 | 716.8 tok/s | 23.67 tok/s |
+
+The Ornith-1.5-35B-A3B row describes **one configuration only**: the hybrid mode in which
+the expert FFNs live in system RAM and both columns run the same expert-offload mode
+(`-ncmoe 99` on the llama.cpp side). It is not a statement about the model on a fully
+GPU-resident path, and it must not be compared against one; at 34.4 GB the model does not
+fit on this card, so no fully resident number exists for it here.
 
 ## How the exllamav3 EXL3 baseline was measured
 
@@ -65,9 +77,12 @@ is a floor rather than a best case. These runs are interleaved with the TinyCode
 (`scripts/exl3_ab_bench.sh`, three alternating pairs), not measured engine-by-engine: separate passes
 let clock drift bias the comparison -- measuring each engine in its own pass moved the baseline by
 0.6% prefill and 0.3% decode here, which is larger than the difference being claimed.
-On the interleaved protocol TinyCoder leads prefill, 727.5 against 719.5 (+1.1%, both spreads 1.0),
-and **exllamav3 leads decode**, 23.76 against 23.60 (+0.7%, spreads 0.03-0.05). The decode lead is
-small but outside the noise, so it is not reported as a tie.
+On the interleaved protocol TinyCoder leads both columns: prefill 725.8 against 716.8 (+1.3%,
+spreads 1.2 and 1.6), and decode **29.83 against 23.67 (+26.0%**, spreads 0.06 and 0.07). The decode
+margin is the `mul1` dp4a fold in `exl3GemvV3` (see the EXL3 section of AGENTS.md): the same
+arithmetic as one `IMAD` + one `dp4a` + one `HADD2` instead of four byte extracts, three shifts and
+two adds, bit-identical. A repeat session on the same binary measured 30.77 / 23.63, so the
+between-session spread on this row is about 3%, larger than the within-session spread of 0.06.
 
 
 ## How the Prism Bonsai baseline was measured
@@ -119,7 +134,8 @@ shipped, so the transcode stays and is also why the `ptq1_0` column exists at al
 The default is still **2048 tokens** (`--ctx` unset): a request is only honoured when one is given, so
 every row in the table above is unchanged and the three long-context rows were re-measured at the
 default window to confirm it (9B 2554.9 / 83.44, Bonsai `pq2_0` 878.7 / 51.28, 27B EXL3 727.4 / 23.52
-against the published 2560.4 / 82.3, 880.6 / 51.73, 727.5 / 23.60 -- all inside the run-to-run spread).
+-- all inside the run-to-run spread of the numbers published for them at the time; the 27B decode
+figure is 23.52 because that run predates the `mul1` dp4a fold in `exl3GemvV3`).
 Passing `--ctx N` asks the planner for N; it grants the largest window that fits the measured free
 VRAM/RAM minus the weights, the session's fixed ~1.4 GiB of scratch, and the K/V cost of the precision
 it picks (f32 K/V + an int8 decode mirror, then f32, then int8), and it refuses the load below 1024

@@ -46,6 +46,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
+#include <string>
+#include <vector>
 
 extern "C" {
 #define DECL_INT8_SK(N)                                                          \
@@ -349,6 +352,82 @@ namespace tinycoder::gpu {
             return setSmemAttrImpl(int8GemmStreamKQ6KTile32, bytes);
         }
 
+    namespace {
+        // ---------------------------------------------------------------------
+        // Fallback accounting for the int8 GEMM.
+        //
+        // `int8Gemm` returning false means the caller silently runs the integer
+        // `kQGemmKxQ8K` kernel instead: correct, several times slower on a
+        // prefill, and invisible in every number the engine reports.  That is
+        // how a missing Q6_K launch branch survived here -- the only symptom
+        // was one stderr line per call, and nothing read it.
+        //
+        // Only the *unexpected* failures are reported: the early "not my shape"
+        // returns (small batch, unaligned cols, unsupported type) are the
+        // dispatch doing its job, and logging them would fire on every decode
+        // step.  Each distinct (reason, type, shape) warns once; a single total
+        // line is printed at exit so a benchmark cannot end without the reader
+        // learning that some fraction of the prefill never reached the tensor
+        // cores.
+        struct Int8Fallback {
+            const char *reason;
+            int type;
+            uint32_t rows, cols, seqLen;
+        };
+        std::mutex &fallbackMutex() {
+            static std::mutex m;
+            return m;
+        }
+        std::vector<Int8Fallback> &fallbackSeen() {
+            static std::vector<Int8Fallback> v;
+            return v;
+        }
+        unsigned long &fallbackCount() {
+            static unsigned long n = 0;
+            return n;
+        }
+
+        void printFallbackTotal() {
+            const unsigned long n = fallbackCount();
+            if (n == 0) return;
+            std::fprintf(stderr,
+                         "[int8] %lu int8-GEMM call(s) fell back to the integer kernel "
+                         "(%zu distinct shape(s) reported above); prefill did not use the "
+                         "tensor cores for those\n",
+                         n, fallbackSeen().size());
+        }
+
+        void noteInt8Fallback(const char *reason, int type, uint32_t rows,
+                              uint32_t cols, uint32_t seqLen) {
+            std::lock_guard<std::mutex> lock(fallbackMutex());
+            ++fallbackCount();
+            for (const auto &f: fallbackSeen()) {
+                if (f.reason == reason && f.type == type && f.rows == rows &&
+                    f.cols == cols && f.seqLen == seqLen) {
+                    return;
+                }
+            }
+            if (fallbackSeen().empty()) std::atexit(printFallbackTotal);
+            fallbackSeen().push_back({reason, type, rows, cols, seqLen});
+            std::fprintf(stderr,
+                         "[int8] fallback: %s (type=%d k=%u n=%u m=%u) -- this shape now "
+                         "runs the integer kernel, not the tensor cores\n",
+                         reason, type, cols, rows, seqLen);
+        }
+    }// namespace
+
+        // Q6_K on the int8 tensor path: on by default (it agrees with the fp64
+        // reference on real weights to 3.4e-4, tools/int8_gemm_parity) and off
+        // only to reproduce the old silent-fallback numbers.  The fallback is
+        // kQGemmKxQ8K, which is correct but not tensor-core.
+        bool q6kInt8Enabled() {
+            static const bool on = [] {
+                const char *e = std::getenv("TINYCODER_INT8_Q6K");
+                return e == nullptr || e[0] != '0';
+            }();
+            return on;
+        }
+
         bool launchSk(int tileX, int type, const void *w, const int *yq,
                       float *out, int k, int n, int m, int strideRowX,
                       float *fixup, int nblocks, int ntiles, cudaStream_t s) {
@@ -375,6 +454,23 @@ namespace tinycoder::gpu {
                             wc, yq, out, fixup, k, n, m, strideRowX, m, n, m);
                 else
                     int8GemmStreamKQ5KTile32<<<grid, block, smem, s>>>(
+                            wc, yq, out, fixup, k, n, m, strideRowX, m, n, m);
+            } else if (type == kTypeQ6K_ && q6kInt8Enabled()) {
+                // Q6_K was wired everywhere around this switch -- the extern
+                // declarations, the dynamic-smem attribute, the fixup kernels, the
+                // supported-type guard at int8Gemm() and even the q8-wide tile loader
+                // selection -- but this branch was missing, so every Q6_K projection
+                // fell through to `return false`, logged "launch failed" and silently
+                // ran the integer kQGemmKxQ8K fallback instead.  Q6_K is attn_qkv,
+                // ffn_down and output on every Q4_K_M checkpoint.
+                if (tileX == 128)
+                    int8GemmStreamKQ6KTile128<<<grid, block, smem, s>>>(
+                            wc, yq, out, fixup, k, n, m, strideRowX, m, n, m);
+                else if (tileX == 64)
+                    int8GemmStreamKQ6KTile64<<<grid, block, smem, s>>>(
+                            wc, yq, out, fixup, k, n, m, strideRowX, m, n, m);
+                else
+                    int8GemmStreamKQ6KTile32<<<grid, block, smem, s>>>(
                             wc, yq, out, fixup, k, n, m, strideRowX, m, n, m);
             } else if (type == kTypeQ8_0_) {
                 if (tileX == 128)
@@ -437,9 +533,19 @@ namespace tinycoder::gpu {
                     int8GemmStreamKIQ3STile32<<<grid, block, smem, s>>>(
                             wc, yq, out, fixup, k, n, m, strideRowX, m, n, m);
             } else {
+                // A type that passed int8Gemm's supported-type guard but has no
+                // branch here is exactly the defect the Q6_K omission was: the
+                // caller falls back and nothing says why.
+                noteInt8Fallback("no launch branch for this type", type,
+                                 static_cast<uint32_t>(n), static_cast<uint32_t>(k),
+                                 static_cast<uint32_t>(m));
                 return false;
             }
-            if (cudaGetLastError() != cudaSuccess) return false;
+            if (cudaGetLastError() != cudaSuccess) {
+                noteInt8Fallback("kernel launch error", type, static_cast<uint32_t>(n),
+                                 static_cast<uint32_t>(k), static_cast<uint32_t>(m));
+                return false;
+            }
             if (ntiles % nblocks == 0) return true;
             // Fold the partial tiles stream-k split across blocks.
             const dim3 fblock(32, 8, 1);
@@ -592,6 +698,7 @@ namespace tinycoder::gpu {
 
     void int8GemmSetQ8Enabled(bool enabled) { g_q8GemmEnabled = enabled; }
 
+
     bool int8Gemm(int type, const void *w, const float *x, float *out,
                   uint32_t seqLen, uint32_t rows, uint32_t cols,
                   uint32_t blocksPerRow, void *stream) {
@@ -604,6 +711,11 @@ namespace tinycoder::gpu {
         // Q8-dominant checkpoints hit the broken sm_75 Q80 tile loader; the
         // adapter disables it for those models only.
         if (type == kTypeQ8_0_ && !g_q8GemmEnabled) return false;
+        if (type == kTypeQ6K_ && !q6kInt8Enabled()) {
+            noteInt8Fallback("Q6_K int8 path disabled by TINYCODER_INT8_Q6K", type,
+                             rows, cols, seqLen);
+            return false;
+        }
         if (seqLen < 8 || rows == 0 || cols == 0) return false;
         // The activation quantizer pads each row to 512 values and the kernel
         // derives its y row stride from that padding; every dense qwen35
@@ -640,7 +752,10 @@ namespace tinycoder::gpu {
         }
         if (seqLen < 32 || gemmSmemBytes(64, type) > static_cast<size_t>(c.smpbo))
             tileX = 32;
-        if (!setSmemAttr(tileX, type)) return false;
+        if (!setSmemAttr(tileX, type)) {
+            noteInt8Fallback("cannot raise the dynamic-smem limit", type, rows, cols, seqLen);
+            return false;
+        }
 
         const int ntx = (static_cast<int>(seqLen) + tileX - 1) / tileX;
         const int nty = (static_cast<int>(rows) + kInt8Y - 1) / kInt8Y;
@@ -688,10 +803,6 @@ namespace tinycoder::gpu {
                       static_cast<int>(cols), static_cast<int>(rows),
                       static_cast<int>(seqLen), static_cast<int>(blocksPerRow),
                       static_cast<float *>(g_fixup), nblocks, ntiles, s)) {
-            std::fprintf(stderr,
-                         "[int8] launch failed (type=%d k=%u n=%u m=%u x=%d "
-                         "tiles=%d blocks=%d)\n",
-                         type, cols, rows, seqLen, tileX, ntiles, nblocks);
             return false;
         }
         return true;
@@ -809,70 +920,70 @@ namespace tinycoder::gpu {
             case kTypeQ4K_:
                 gemvLaunchQ4KF32Plain(
                         w, g_mvq, out, static_cast<int>(cols),
-                        static_cast<int>(rows), static_cast<int>(colsPadded),
+                        static_cast<int>(rows), static_cast<int>(colsPadded / 32u),
                         static_cast<int>(rows), static_cast<int>(seqLen),
                         static_cast<void *>(s));
                 break;
             case kTypeQ5K_:
                 gemvLaunchQ5KF32Plain(
                         w, g_mvq, out, static_cast<int>(cols),
-                        static_cast<int>(rows), static_cast<int>(colsPadded),
+                        static_cast<int>(rows), static_cast<int>(colsPadded / 32u),
                         static_cast<int>(rows), static_cast<int>(seqLen),
                         static_cast<void *>(s));
                 break;
             case kTypeQ6K_:
                 gemvLaunchQ6KF32Plain(
                         w, g_mvq, out, static_cast<int>(cols),
-                        static_cast<int>(rows), static_cast<int>(colsPadded),
+                        static_cast<int>(rows), static_cast<int>(colsPadded / 32u),
                         static_cast<int>(rows), static_cast<int>(seqLen),
                         static_cast<void *>(s));
                 break;
             case kTypeIQ2XS_:
                 gemvLaunchIQ2XSF32Plain(
                         w, g_mvq, out, static_cast<int>(cols),
-                        static_cast<int>(rows), static_cast<int>(colsPadded),
+                        static_cast<int>(rows), static_cast<int>(colsPadded / 32u),
                         static_cast<int>(rows), static_cast<int>(seqLen),
                         static_cast<void *>(s));
                 break;
             case kTypeIQ3S_:
                 gemvLaunchIQ3SF32Plain(
                         w, g_mvq, out, static_cast<int>(cols),
-                        static_cast<int>(rows), static_cast<int>(colsPadded),
+                        static_cast<int>(rows), static_cast<int>(colsPadded / 32u),
                         static_cast<int>(rows), static_cast<int>(seqLen),
                         static_cast<void *>(s));
                 break;
             case kTypeIQ2S_:
                 gemvLaunchIQ2SF32Plain(
                         w, g_mvq, out, static_cast<int>(cols),
-                        static_cast<int>(rows), static_cast<int>(colsPadded),
+                        static_cast<int>(rows), static_cast<int>(colsPadded / 32u),
                         static_cast<int>(rows), static_cast<int>(seqLen),
                         static_cast<void *>(s));
                 break;
             case kTypeIQ3XXS_:
                 gemvLaunchIQ3XXSF32Plain(
                         w, g_mvq, out, static_cast<int>(cols),
-                        static_cast<int>(rows), static_cast<int>(colsPadded),
+                        static_cast<int>(rows), static_cast<int>(colsPadded / 32u),
                         static_cast<int>(rows), static_cast<int>(seqLen),
                         static_cast<void *>(s));
                 break;
             case kTypeQ2K_:
                 gemvLaunchQ2KF32Plain(
                         w, g_mvq, out, static_cast<int>(cols),
-                        static_cast<int>(rows), static_cast<int>(colsPadded),
+                        static_cast<int>(rows), static_cast<int>(colsPadded / 32u),
                         static_cast<int>(rows), static_cast<int>(seqLen),
                         static_cast<void *>(s));
                 break;
             case kTypeQ3K_:
                 gemvLaunchQ3KF32Plain(
                         w, g_mvq, out, static_cast<int>(cols),
-                        static_cast<int>(rows), static_cast<int>(colsPadded),
+                        static_cast<int>(rows), static_cast<int>(colsPadded / 32u),
                         static_cast<int>(rows), static_cast<int>(seqLen),
                         static_cast<void *>(s));
                 break;
             default:
                 gemvLaunchQ80F32Plain(
                         w, g_mvq, out, static_cast<int>(cols),
-                        static_cast<int>(rows), static_cast<int>(colsPadded),
+                        static_cast<int>(rows), static_cast<int>(colsPadded / 32u),
                         static_cast<int>(rows), static_cast<int>(seqLen),
                         static_cast<void *>(s));
                 break;

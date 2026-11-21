@@ -17,7 +17,7 @@ The engine runs the **Qwen2.5** (`qwen2`), **Qwen3.6** and **Qwen3.8** (`qwen35`
 
 ### Strongly recommended (large speed-up)
 
-TinyCoder builds and runs with only the base toolchain, but **both items below are strongly recommended** — without them you get the unoptimised fallback, not the numbers in [BENCHMARKS.md](BENCHMARKS.md):
+TinyCoder builds and runs with only the base toolchain, but **both items below are strongly recommended** — without them you get the unoptimised fallback, not the numbers in [BENCHMARKS-2080TI.md](BENCHMARKS-2080TI.md):
 
 - **CUDA Toolkit** ≥ 11.0 + nvcc — **install this if you have any NVIDIA GPU.** CMake enables the GPU offload automatically when nvcc is on the `PATH` (`-DENABLE_CUDA=OFF` forces a CPU-only build); a CPU-only `tinycoder_bench` rejects `--gpu` with an explicit "needs a CUDA build" message rather than an unknown-option error. It enables the GPU offload engine on Turing / Ampere / Ada and newer (RTX 2080 Ti, RTX 3090, RTX 4090, RTX 5090). Without it the engine runs on the CPU only, which is several times to orders of magnitude slower depending on model size; on a model that does not fit in RAM it will not run at all.
 - **OpenMP** — **usually already present with the compiler**, so this normally costs nothing. It parallelises the CPU path across all cores; without it CPU inference is single-threaded.
@@ -69,7 +69,8 @@ This installs the static library and headers (`install(TARGETS tinycoder_core �
 
 GPU performance against llama.cpp and exllamav3 — the comparison table, the measurement
 protocol, and the procedure used for the exllamav3 baseline — lives in
-[BENCHMARKS.md](BENCHMARKS.md).
+[BENCHMARKS-2080TI.md](BENCHMARKS-2080TI.md), with the Ampere table in
+[BENCHMARKS-3090.md](BENCHMARKS-3090.md).
 
 ## Key Features
 

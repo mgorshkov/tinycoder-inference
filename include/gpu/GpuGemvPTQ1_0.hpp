@@ -916,7 +916,10 @@ __global__ void __launch_bounds__(128) kQGemvPTQ1_0CtaRow(
 // 32 lanes covering 512 contiguous bytes per load.  Same dot product
 // as kQGemvPTQ1_0WarpRow, only the activation fetch differs.
 template<uint32_t NW>
-__global__ void __launch_bounds__(NW * 32u) kQGemvPTQ1_0WarpRowPt(
+// (128, 8): the decoded 36-int activation window plus the weight words put this
+// kernel at 90 registers, i.e. 5 blocks and 20 of 48 warps per SM -- 41% occupancy on
+// a kernel that is pure weight streaming.  Eight blocks needs <= 64 registers.
+__global__ void __launch_bounds__(NW * 32u, 8u) kQGemvPTQ1_0WarpRowPt(
         const uint8_t *__restrict__ weights,
         const int32_t *__restrict__ actWords, float *__restrict__ out,
         uint32_t ncols, uint32_t nrows, uint32_t rowBytes,
