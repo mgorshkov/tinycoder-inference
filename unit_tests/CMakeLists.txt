@@ -152,6 +152,25 @@ if(ENABLE_CUDA)
         CXX_STANDARD_REQUIRED ON
     )
 
+    # ---- Synthetic int8 GEMM shape probe (diagnostic; not a gtest) ----
+    # Builds Q6_K shapes no checkpoint in this tree has (k=2048/6144, the ones
+    # the rented 3090 run logged as `int8 launch failed`), from a real block run
+    # lifted out of a checkpoint, and compares the int8 path against fp64.
+    add_executable(int8_gemm_shape_probe
+        ../tools/int8_gemm_shape_probe.cpp
+    )
+
+    target_link_libraries(int8_gemm_shape_probe
+        PRIVATE
+        tinycoder_core
+        CUDA::cudart
+    )
+
+    set_target_properties(int8_gemm_shape_probe PROPERTIES
+        CXX_STANDARD 20
+        CXX_STANDARD_REQUIRED ON
+    )
+
     # ---- GGUF decode GEMV numeric gate (diagnostic; not a gtest) ----
     # Per (type, rows, cols) against an fp64 reference on real weights.  The
     # decode path had no tool coverage at all before this.
