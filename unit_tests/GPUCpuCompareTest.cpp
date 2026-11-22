@@ -58,6 +58,7 @@ SOFTWARE.
 #include "Tokenizer.hpp"
 
 #ifdef USE_CUDA
+#include "GGMLDequantize.hpp"
 #include "GPUCompute.hpp"
 #endif
 
@@ -1558,7 +1559,61 @@ TEST_F(GPUCpuCompareTest, Q4K_Q6KKernelParityWithCPU) {
     }
 }
 
+// The rented 3090 report (defect 2) caught a Q6_K `token_embd` sending the whole
+// model to the CPU path: `supportedEmbeddingType` listed every other type, and
+// bartowski's Q2_K stores embeddings as Q6_K.  The kernel that matters is
+// kEmbedDequantQ6K; this pins it against GGMLDequantize on real Q6_K rows.
+TEST_F(GPUCpuCompareTest, Q6KEmbeddingGatherMatchesDequant) {
+    if (!tinycoder::gpu::gpuEnabled()) {
+        GTEST_SKIP() << "GPU disabled ($TINYCODER_GPU=0) or no CUDA device";
+    }
+    tinycoder::Model *model = SharedTestEnv::model;
+    const auto &layers = model->debugGetLayers();
+    ASSERT_FALSE(layers.empty());
+
+    // Any real Q6_K matrix supplies realistic rows; the kernel only needs the
+    // block bytes, the row stride and the width.
+    const tinycoder::QuantizedMatrix *src = nullptr;
+    for (const auto &L: layers) {
+        const tinycoder::QuantizedMatrix *ms[] = {&L.attnQKV, &L.attnGate,
+                                                  &L.ssmOut, &L.ffnDown};
+        for (const auto *m: ms) {
+            if (!m->empty() && m->type == GGML_TYPE_Q6_K && m->cols % 256u == 0) {
+                src = m;
+                break;
+            }
+        }
+        if (src != nullptr) break;
+    }
+    if (src == nullptr) {
+        GTEST_SKIP() << "model has no Q6_K matrix to borrow rows from";
+    }
+
+    const uint32_t cols = src->cols;
+    const uint32_t rowBytes = (cols / 256u) * 210u;
+    tinycoder::gpu::GPUModel gm;
+    std::vector<float> gpuOut(cols), cpuOut(cols);
+    const uint32_t rows = std::min<uint32_t>(src->rows, 8u);
+    for (uint32_t r = 0; r < rows; ++r) {
+        const uint8_t *row = src->data.data() + static_cast<size_t>(r) * rowBytes;
+        gm.debugEmbedQ6KRow(row, cols, rowBytes, gpuOut.data());
+        const auto cpu = tinycoder::GGMLDequantize::dequantize(
+                GGML_TYPE_Q6_K, row, cols);
+        ASSERT_EQ(cpu.size(), cols);
+        std::copy(cpu.begin(), cpu.end(), cpuOut.begin());
+        double maxAbs = 0.0, maxAbsRef = 0.0;
+        for (uint32_t i = 0; i < cols; ++i) {
+            maxAbs = std::max(maxAbs, std::fabs(static_cast<double>(gpuOut[i]) - cpuOut[i]));
+            maxAbsRef = std::max(maxAbsRef, std::fabs(static_cast<double>(cpuOut[i])));
+        }
+        EXPECT_LE(maxAbs, 1e-6 * std::max(1.0, maxAbsRef))
+                << "kEmbedDequantQ6K diverges from GGMLDequantize on row " << r
+                << " of a " << cols << "-wide Q6_K matrix";
+    }
+}
+
 #else// !USE_CUDA
+
 
 TEST_F(GPUCpuCompareTest, ParityTestSkippedWithoutCuda) {
     GTEST_SKIP() << "Built without USE_CUDA -- no GPU engine to compare";

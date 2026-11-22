@@ -897,6 +897,10 @@ namespace tinycoder::gpu {
                 kEmbedDequantQ4K<<<seqLen, 32, 0, g_stream>>>(
                         eQ, s.tokens, s.hidden, seqLen, H, blocksPerRow,
                         embedRowBytes_, geom_.vocabSize);
+            } else if (embedType_ == kTypeQ6K) {
+                kEmbedDequantQ6K<<<seqLen, 32, 0, g_stream>>>(
+                        eQ, s.tokens, s.hidden, seqLen, H, blocksPerRow,
+                        embedRowBytes_, geom_.vocabSize);
             } else if (embedType_ == kTypeQ8_0) {
                 kEmbedDequantSmall32<kTypeQ8_0><<<seqLen, 32, 0, g_stream>>>(
                         eQ, s.tokens, s.hidden, seqLen, H, blocksPerRow,
@@ -3469,6 +3473,10 @@ namespace tinycoder::gpu {
                         embedRowBytes_, geom_.vocabSize);
             } else if (embedType_ == kTypeQ4K) {
                 kEmbedDequantQ4K<<<seqLen, 32, 0, g_stream>>>(
+                        eQ, s.tokens, s.hidden, seqLen, H, blocksPerRow,
+                        embedRowBytes_, geom_.vocabSize);
+            } else if (embedType_ == kTypeQ6K) {
+                kEmbedDequantQ6K<<<seqLen, 32, 0, g_stream>>>(
                         eQ, s.tokens, s.hidden, seqLen, H, blocksPerRow,
                         embedRowBytes_, geom_.vocabSize);
             } else if (embedType_ == kTypeQ5K) {

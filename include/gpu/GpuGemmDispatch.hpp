@@ -575,6 +575,57 @@ __global__ void kEmbedDequantQ4K(const uint8_t *__restrict__ embed,
     }
 }
 
+// Token embedding dequant for Q6_K rows (one warp per token).
+//
+// Q6_K is the type the rented 3090 report caught going to the CPU path: the
+// support gate listed every other embedding type, so a bartowski Q2_K file
+// (token_embd stored as Q6_K) silently ran at ~20 tok/s on 12 CPU threads.
+// Layout matches GGMLDequantize case 14 / dequantize_row_q6_K: ql[128] holds
+// the low nibbles, qh[64] the two high bits (shift 2*g), scales[16] one int8
+// per 16 values, d at byte 208.  A lane owns 8 consecutive columns, which sit
+// inside one 16-value sub-block, so the scale is constant across them.
+__global__ void kEmbedDequantQ6K(const uint8_t *__restrict__ embed,
+                                 const int32_t *__restrict__ tokens,
+                                 float *__restrict__ hidden,
+                                 uint32_t seqLen, uint32_t hiddenSize,
+                                 uint32_t blocksPerRow, uint32_t rowBytes,
+                                 uint32_t vocabSize) {
+    const uint32_t s = blockIdx.x;
+    if (s >= seqLen) return;
+    const int32_t t = tokens[s];
+    if (t < 0 || static_cast<uint32_t>(t) >= vocabSize) return;
+    const uint8_t *row = embed + static_cast<uint64_t>(t) * rowBytes;
+    float *h = hidden + static_cast<size_t>(s) * hiddenSize;
+    const uint32_t lane = threadIdx.x;
+    const uint32_t e0 = lane * 8u;          // 0..248 inside the 256-value block
+    const uint32_t half = e0 / 128u;        // the block holds two 128-value halves
+    const uint32_t r = e0 % 128u;           // position inside the half
+    const uint32_t g = r / 32u;             // which qh shift / ql pair
+    const uint32_t sub = (r % 32u) / 16u;   // 16-value sub-block inside the group
+    for (uint32_t b = 0; b < blocksPerRow; ++b) {
+        // Per-block pointers: every 210-byte block carries its own ql/qh/scales/d.
+        // Hoisting them out of the loop made blocks 1..n-1 decode block 0's bytes
+        // (caught by Q6KEmbeddingGatherMatchesDequant at ~0.11 absolute error on
+        // 15/16 of a 4096-wide row).
+        const int8_t *sc = reinterpret_cast<const int8_t *>(row + 192);
+        const uint8_t *ql = row;            // 128 bytes
+        const uint8_t *qh = row + 128u;     // 64 bytes
+        const float d = __half2float(*reinterpret_cast<const __half *>(row + 208));
+        const float scale = d * static_cast<float>(sc[half * 8u + 2u * g + sub]);
+        const uint8_t *qlp = ql + half * 64u + (g & 1u) * 32u + (r % 32u);
+        const uint8_t *qhp = qh + half * 32u + (r % 32u);
+#pragma unroll
+        for (uint32_t k = 0; k < 8; ++k) {
+            const uint32_t nib = (g < 2u) ? (qlp[k] & 0xFu) : (qlp[k] >> 4);
+            const uint32_t hi = (qhp[k] >> (2u * g)) & 3u;
+            const int q = static_cast<int>(nib | (hi << 4)) - 32;
+            const uint32_t col = b * 256u + e0 + k;
+            if (col < hiddenSize) h[col] = scale * static_cast<float>(q);
+        }
+        row += kQ6K_BYTES;
+    }
+}
+
 // Token embedding dequant for the 32-wide-block legacy quants
 // (Q5_0 / Q8_0): one warp per token, each lane writes its own column
 // (b*32 + lane) of every block.  blocksPerRow = ceil(hiddenSize/32),

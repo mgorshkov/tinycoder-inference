@@ -143,8 +143,11 @@ namespace tinycoder {
                    type == GGML_TYPE_Q2_K || type == GGML_TYPE_Q5_0 ||
                    type == GGML_TYPE_Q8_0 || type == GGML_TYPE_IQ3_S ||
                    type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K ||
-                   type == GGML_TYPE_IQ4_NL || type == GGML_TYPE_PQ2_0 ||
-                   type == GGML_TYPE_PTQ1_0;
+                   // Q6_K embeddings are common in llama.cpp K/IQ quants
+                   // (bartowski's Q2_K stores token_embd as Q6_K); without it
+                   // the engine silently ran the whole model on the CPU.
+                   type == GGML_TYPE_Q6_K || type == GGML_TYPE_IQ4_NL ||
+                   type == GGML_TYPE_PQ2_0 || type == GGML_TYPE_PTQ1_0;
         }
 
         DeviceMatrix toDeviceMatrix(const QuantizedMatrix &m) {
@@ -229,7 +232,11 @@ namespace tinycoder {
                 err = "GPU offload unsupported: token embedding quant type " +
                       std::to_string(emb.type) +
                       " not implemented by GPU kernels (need Q2_K/Q4_K/Q5_K/"
-                      "Q5_0/Q8_0/IQ3_S)";
+                      "Q6_K/Q5_0/Q8_0/IQ3_S)";
+                // One machine-readable line: the rented 3090 report's defect 2
+                // was that a Q6_K `token_embd` dropped the whole model to the
+                // CPU and nothing outside the engine could see it.
+                std::fprintf(stderr, "[gpu] offload=cpu reason=%s\n", err.c_str());
                 return false;
             }
             // A QuantizedMatrix is GPU-representable either by its GGML type
@@ -675,10 +682,15 @@ namespace tinycoder {
                              prism.n5120, prism.n6144, prism.n17408);
             }
 
-            if (!gpu_.uploadWithPrism(deviceLayers, geom, emb.data.data(),
-                                      emb.type, embRowBytes, lmHeadQ, lmHeadType,
-                                      lmHeadRowBytes, prism, err,
-                                      m.lmHead_.exl3)) {
+            const bool uploaded = gpu_.uploadWithPrism(
+                    deviceLayers, geom, emb.data.data(), emb.type, embRowBytes,
+                    lmHeadQ, lmHeadType, lmHeadRowBytes, prism, err,
+                    m.lmHead_.exl3);
+            if (uploaded) {
+                std::fprintf(stderr, "[gpu] offload=full layers=%u\n",
+                             static_cast<unsigned>(deviceLayers.size()));
+            }
+            if (!uploaded) {
                 // Failed to fit. IQ1_M fits the full-GPU upload on the first
                 // try and never reaches this path.
                 if (cfg.architecture == ARCH_QWEN35MOE && !moeCpuEnabled_) {
