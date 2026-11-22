@@ -876,6 +876,15 @@ namespace tinycoder {
                         finalNormData, hiddenSize);
         });
 
+        // The GPU full-offload path releases the pre-dequantised embedding
+        // tables (ModelGPU.cpp) because the device LM head never reads them.  A
+        // CPU forward after that fallback needs them back; rebuild once.
+        if (dequantizedEmbeddings_.empty() && !quantizedEmbeddings_.empty()) {
+            if (!buildDequantizedEmbeddings()) {
+                std::fprintf(stderr, "[cpu] embeddings rebuild failed\n");
+            }
+        }
+
         // LM head (logits)
         np::Array<float> logits = np::Array<float>(np::Shape{seqLen, vocabSize});
         float *logitsData = logits.data();

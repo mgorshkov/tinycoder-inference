@@ -624,7 +624,31 @@ namespace tinycoder {
         // This eliminates the expensive dequantization from every forward pass
         std::cout << "[TinyCoder] Building pre-dequantized embedding matrix..."
                   << std::endl;
-        if (!buildDequantizedEmbeddings()) {
+        // When the CUDA path is available the full-offload upload frees these
+        // tables anyway (they are CPU-LM-head-only), so building them first and
+        // freeing them after leaves the *peak* RSS unchanged — the rented 3090
+        // report measured 22.5 GiB of host RSS on a 34 GB model for exactly
+        // this.  Defer the build to first CPU use instead (Model::forward
+        // rebuilds when the table is empty); a CPU-only build still builds it
+        // here, where it is the only path.
+        // A CUDA build with the GPU path left enabled will upload the LM head to
+        // the device, so the host tables are dead weight until something falls
+        // back; if it does, Model::forward rebuilds them.  `TINYCODER_GPU=0`
+        // (and a non-CUDA build) keeps the eager build.
+        const bool deferEmbTables = [] {
+#ifdef USE_CUDA
+            const char *e = std::getenv("TINYCODER_GPU");
+            return !(e != nullptr && e[0] == '0');
+#else
+            return false;
+#endif
+        }();
+        if (deferEmbTables) {
+            std::cout << "[TinyCoder] embedding tables deferred to first CPU use "
+                         "(GPU path owns the LM head)"
+                      << std::endl;
+        }
+        if (!deferEmbTables && !buildDequantizedEmbeddings()) {
             // The dequantized table is not optional: the generation-time LM
             // head and the sampler read it, and continuing without it produced
             // coherent-looking logits but garbage text (caught by the text gate,

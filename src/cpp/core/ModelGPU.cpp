@@ -689,6 +689,30 @@ namespace tinycoder {
             if (uploaded) {
                 std::fprintf(stderr, "[gpu] offload=full layers=%u\n",
                              static_cast<unsigned>(deviceLayers.size()));
+                // Host copies the full-offload path will never read again: the
+                // pre-dequantised embedding tables (F32/F16, up to 5 GB for a
+                // 248320 x 5120 vocab) are only used by the CPU LM head.  The
+                // quantised source stays, so a later CPU fallback can rebuild
+                // them (Model::forward calls buildDequantizedEmbeddings() when
+                // the table is empty).  The rented 3090 report measured 22.5 GiB
+                // of host RSS on a 34 GB model for exactly these tables.
+                const uint64_t freedB =
+                        static_cast<uint64_t>(m.dequantizedEmbeddings_.data.size()) *
+                        sizeof(float);
+                m.dequantizedEmbeddings_.data.clear();
+                m.dequantizedEmbeddings_.data.shrink_to_fit();
+                // The Q8_K host copy of the LM head is the other table only the
+                // CPU head reads (248320 rows x 8 blocks x 292 B = 553 MB on the
+                // 9B, more on a wider vocab).  The device has its own upload.
+                const uint64_t freedQ8K =
+                        static_cast<uint64_t>(m.lmHeadQ8K_.size()) * sizeof(Q8KBlock);
+                m.lmHeadQ8K_.clear();
+                m.lmHeadQ8K_.shrink_to_fit();
+                if (freedB + freedQ8K != 0) {
+                    std::fprintf(stderr, "[gpu] host weights released: %.0f MB\n",
+                                 static_cast<double>(freedB + freedQ8K) /
+                                         (1024.0 * 1024.0));
+                }
             }
             if (!uploaded) {
                 // Failed to fit. IQ1_M fits the full-GPU upload on the first
