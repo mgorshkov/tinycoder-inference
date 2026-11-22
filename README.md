@@ -124,6 +124,24 @@ Download the `.gguf` file and point the engine at it via `TINYCODER_MODEL_PATH` 
 
 [`Model::load`](src/cpp/core/ModelLoad.cpp) detects the format automatically, and both formats use the same CUDA/CPU kernels, KV cache, and offload path.
 
+### Checkpoints behind the published benchmarks
+
+Every row in [BENCHMARKS-2080TI.md](benchmarks/BENCHMARKS-2080TI.md) and [BENCHMARKS-3090.md](benchmarks/BENCHMARKS-3090.md) was measured on one of these files; the link is the exact artefact, so a row can be reproduced rather than approximated:
+
+| Model | Quantization | Download |
+|---|---|---|
+| Qwen2.5-Coder-1.5B-Instruct | `q2_k` | [Qwen2.5-Coder-1.5B-Instruct-Q2_K.gguf](https://huggingface.co/unsloth/Qwen2.5-Coder-1.5B-Instruct-GGUF/resolve/main/Qwen2.5-Coder-1.5B-Instruct-Q2_K.gguf) |
+| Qwen2.5-Coder-1.5B-Instruct | `iq3_xxs` | [qwen2.5-coder-1.5b-iq3_xxs-imat.gguf](https://huggingface.co/ggml-org/Qwen2.5-Coder-1.5B-IQ3_XXS-GGUF/resolve/main/qwen2.5-coder-1.5b-iq3_xxs-imat.gguf) |
+| Qwen2.5-Coder-7B-Instruct | `iq2_s` | [Qwen2.5-Coder-7B-Instruct-IQ2_S.gguf](https://huggingface.co/ThomasBaruzier/Qwen2.5-Coder-7B-Instruct-GGUF/resolve/main/Qwen2.5-Coder-7B-Instruct-IQ2_S.gguf) |
+| Qwen2.5-Coder-7B-Instruct | `iq3_xxs` | [Qwen2.5-Coder-7B-Instruct-IQ3_XXS.gguf](https://huggingface.co/ThomasBaruzier/Qwen2.5-Coder-7B-Instruct-GGUF/resolve/main/Qwen2.5-Coder-7B-Instruct-IQ3_XXS.gguf) |
+| Ternary-Bonsai-2-27B (Prism) | `PQ2_0` | [Ternary-Bonsai-2-27B-PQ2_0.gguf](https://huggingface.co/prism-ml/Ternary-Bonsai-2-27B-gguf/resolve/main/Ternary-Bonsai-2-27B-PQ2_0.gguf) |
+| Ternary-Bonsai-2-27B (Prism) | `PTQ1_0` | [Ternary-Bonsai-2-27B-PTQ1_0.gguf](https://huggingface.co/prism-ml/Ternary-Bonsai-2-27B-gguf/resolve/main/Ternary-Bonsai-2-27B-PTQ1_0.gguf) |
+| Ornith-1.5-9B | `q4_k_m` | [Ornith-1.5-9B-Q4_K_M.gguf](https://huggingface.co/bartowski/Ornith-1.5-9B-GGUF/resolve/main/Ornith-1.5-9B-Q4_K_M.gguf) |
+| Ornith-1.5-35B-A3B | `q8_0` | [Ornith-1.5-35B-A3B-Q8_0.gguf](https://huggingface.co/AtomicChat/Ornith-1.5-35B-A3B-GGUF/resolve/main/Ornith-1.5-35B-A3B-Q8_0.gguf) |
+| Qwen3.8-27B (EXL3, directory) | `1.60bpw` | [turboderp/Qwen3.8-27B-exl3 — branch `SC_1.60bpw_H3`](https://huggingface.co/turboderp/Qwen3.8-27B-exl3/tree/SC_1.60bpw_H3) |
+
+The EXL3 row is a **branch of a multi-checkpoint repository**, so it has no single `resolve/main` file: download the branch as a directory (`config.json`, `*.safetensors`, tokenizer files) and point `Model::load` at the directory, per the paragraph above.
+
 ## Usage (C++ API)
 
 ```cpp

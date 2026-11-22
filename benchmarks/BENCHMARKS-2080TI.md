@@ -16,15 +16,15 @@ with the old and new path in the same binary.
 
 | Model | File size | GPU mode TinyCoder | **TinyCoder pp512** | **TinyCoder tg128** | Baseline engine | **Baseline pp512** | **Baseline tg128** |
 |---|---|---|---|---|---|---|---|
-| Qwen2.5-Coder-1.5B `q2_k` | 0.7 GB | full offload | **12,239.8 tok/s** | **325.9 tok/s** | llama.cpp | 7,679.2 tok/s | 321.6 tok/s |
-| Qwen2.5-Coder-1.5B `iq3_xxs` | 0.9 GB | full offload | **12,243.4 tok/s** | **273.8 tok/s** | llama.cpp | 10,007.0 tok/s | 262.2 tok/s |
-| Qwen2.5-Coder-7B `iq2_s` | 2.4 GB | full offload | **2,765.7 tok/s** | 87.7 tok/s | llama.cpp | 2,482.0 tok/s | **96.5 tok/s** |
-| Qwen2.5-Coder-7B `iq3_xxs` | 2.9 GB | full offload | **3,060.5 tok/s** | 93.5 tok/s | llama.cpp | 2,938.0 tok/s | **97.4 tok/s** |
-| Ternary-Bonsai-2-27B `pq2_0` (Prism) | 6.7 GB | full offload | **880.6 tok/s** | **51.73 tok/s** | PrismML llama.cpp (fork) | 878.5 tok/s | 50.36 tok/s |
-| Ternary-Bonsai-2-27B `ptq1_0` (Prism) | 5.5 GB | full offload | **880.7 tok/s** | 51.73 tok/s | PrismML llama.cpp (fork) | 848.1 tok/s | **65.29 tok/s** |
-| Ornith-1.5-9B `q4_k_m` | 5.9 GB | full offload | 2,538.1 tok/s | 83.3 tok/s | llama.cpp | **2,640.1 tok/s** | **84.1 tok/s** |
-| Ornith-1.5-35B-A3B `q8_0` → `q4_k` experts | 34.4 GB | **hybrid only** (experts in RAM, layer arena) | **133.4 tok/s** | **24.10 tok/s** | llama.cpp `-ncmoe 99` | 132.2 tok/s | 17.1 tok/s |
-| Qwen3.8-27B EXL3 `1.60bpw` | 8.6 GB | full offload | **725.8 tok/s** | **29.83 tok/s** | exllamav3 1.6.6 | 716.8 tok/s | 23.67 tok/s |
+| [Qwen2.5-Coder-1.5B `q2_k`](https://huggingface.co/unsloth/Qwen2.5-Coder-1.5B-Instruct-GGUF/resolve/main/Qwen2.5-Coder-1.5B-Instruct-Q2_K.gguf) | 0.7 GB | full offload | **12,239.8 tok/s** | **325.9 tok/s** | llama.cpp | 7,679.2 tok/s | 321.6 tok/s |
+| [Qwen2.5-Coder-1.5B `iq3_xxs`](https://huggingface.co/ggml-org/Qwen2.5-Coder-1.5B-IQ3_XXS-GGUF/resolve/main/qwen2.5-coder-1.5b-iq3_xxs-imat.gguf) | 0.9 GB | full offload | **12,243.4 tok/s** | **273.8 tok/s** | llama.cpp | 10,007.0 tok/s | 262.2 tok/s |
+| [Qwen2.5-Coder-7B `iq2_s`](https://huggingface.co/ThomasBaruzier/Qwen2.5-Coder-7B-Instruct-GGUF/resolve/main/Qwen2.5-Coder-7B-Instruct-IQ2_S.gguf) | 2.4 GB | full offload | **2,765.7 tok/s** | 87.7 tok/s | llama.cpp | 2,482.0 tok/s | **96.5 tok/s** |
+| [Qwen2.5-Coder-7B `iq3_xxs`](https://huggingface.co/ThomasBaruzier/Qwen2.5-Coder-7B-Instruct-GGUF/resolve/main/Qwen2.5-Coder-7B-Instruct-IQ3_XXS.gguf) | 2.9 GB | full offload | **3,060.5 tok/s** | 93.5 tok/s | llama.cpp | 2,938.0 tok/s | **97.4 tok/s** |
+| [Ternary-Bonsai-2-27B `pq2_0` (Prism)](https://huggingface.co/prism-ml/Ternary-Bonsai-2-27B-gguf/resolve/main/Ternary-Bonsai-2-27B-PQ2_0.gguf) | 6.7 GB | full offload | **880.6 tok/s** | **51.73 tok/s** | PrismML llama.cpp (fork) | 878.5 tok/s | 50.36 tok/s |
+| [Ternary-Bonsai-2-27B `ptq1_0` (Prism)](https://huggingface.co/prism-ml/Ternary-Bonsai-2-27B-gguf/resolve/main/Ternary-Bonsai-2-27B-PTQ1_0.gguf) | 5.5 GB | full offload | **880.7 tok/s** | 51.73 tok/s | PrismML llama.cpp (fork) | 848.1 tok/s | **65.29 tok/s** |
+| [Ornith-1.5-9B `q4_k_m`](https://huggingface.co/bartowski/Ornith-1.5-9B-GGUF/resolve/main/Ornith-1.5-9B-Q4_K_M.gguf) | 5.9 GB | full offload | 2,538.1 tok/s | 83.3 tok/s | llama.cpp | **2,640.1 tok/s** | **84.1 tok/s** |
+| [Ornith-1.5-35B-A3B `q8_0` → `q4_k` experts](https://huggingface.co/AtomicChat/Ornith-1.5-35B-A3B-GGUF/resolve/main/Ornith-1.5-35B-A3B-Q8_0.gguf) | 34.4 GB | **hybrid only** (experts in RAM, layer arena) | **133.4 tok/s** | **24.10 tok/s** | llama.cpp `-ncmoe 99` | 132.2 tok/s | 17.1 tok/s |
+| [Qwen3.8-27B EXL3 `1.60bpw`](https://huggingface.co/turboderp/Qwen3.8-27B-exl3/tree/SC_1.60bpw_H3) | 8.6 GB | full offload | **725.8 tok/s** | **29.83 tok/s** | exllamav3 1.6.6 | 716.8 tok/s | 23.67 tok/s |
 
 The Ornith-1.5-35B-A3B row describes **one configuration only**: the hybrid mode in which
 the expert FFNs live in system RAM and both columns run the same expert-offload mode
@@ -143,9 +143,9 @@ tokens. What it grants on an 11 GB card:
 
 | Checkpoint | K/V at the grant | Largest window granted (`maxAllowed`) | What leaves the ladder first |
 |---|---|---|---|
-| Ornith-1.5-9B `q4_k_m` | int8 | **196,352** | f32 K/V (52,480), then f32+mirror (41,984) |
+| [Ornith-1.5-9B `q4_k_m`](https://huggingface.co/bartowski/Ornith-1.5-9B-GGUF/resolve/main/Ornith-1.5-9B-Q4_K_M.gguf) | int8 | **196,352** | f32 K/V (52,480), then f32+mirror (41,984) |
 | Ternary-Bonsai-2-27B `pq2_0` | int8 | **64,256** | f32 K/V (16,640), then f32+mirror |
-| Qwen3.8-27B EXL3 `1.60bpw` | int8 | **12,288** (default 2048 stays f32+mirror) | f32 K/V (2,560), then f32+mirror |
+| [Qwen3.8-27B EXL3 `1.60bpw`](https://huggingface.co/turboderp/Qwen3.8-27B-exl3/tree/SC_1.60bpw_H3) | int8 | **12,288** (default 2048 stays f32+mirror) | f32 K/V (2,560), then f32+mirror |
 
 Throughput at a granted window, same protocol as the table above (`--n-prompts 512 --n-gen 128 --reps 1
 --threads 36`, one process at a time; `maxAllowed` alongside each grant):
