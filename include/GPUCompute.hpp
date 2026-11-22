@@ -428,6 +428,17 @@ namespace tinycoder::gpu {
                             uint32_t blocksPerRow, const float *x,
                             uint32_t cols, uint32_t rowBytes);
 
+        /// @brief Debug: run ONE Q6_K row through kEmbedDequantQ6K (the
+        /// token-embedding gather) and return the dequantised floats.
+        /// Used to prove the embedding kernel a Q6_K `token_embd` exercises
+        /// matches GGMLDequantize, so the model no longer needs the CPU path.
+        /// @param row Host pointer to one Q6_K row (210 B per 256 values)
+        /// @param cols Row width, a multiple of 256
+        /// @param rowBytes cols/256 * 210
+        /// @param out Host buffer receiving cols floats
+        void debugEmbedQ6KRow(const uint8_t *row, uint32_t cols,
+                              uint32_t rowBytes, float *out);
+
         /// @brief Debug: quantize x with kQuantizeQ8_0x32 and emit the
         /// per-block float contributions kQGemvQ8_0xQ8K would accumulate.
         /// Fills outBlk[0..blocksPerRow) (host) and outQuant[0..

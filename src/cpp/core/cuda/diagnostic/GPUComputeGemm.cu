@@ -177,6 +177,30 @@ namespace tinycoder::gpu {
         return result;
     }
 
+    void GPUModel::debugEmbedQ6KRow(const uint8_t *row, uint32_t cols,
+                                    uint32_t rowBytes, float *out) {
+        // Same kernel the forward launches (kEmbedDequantQ6K, one warp per
+        // token); one token, one vocab row, so the token table is {0}.
+        const uint32_t blocksPerRow = cols / 256u;
+        uint8_t *dW = nullptr;
+        int32_t *dTok = nullptr;
+        float *dH = nullptr;
+        cudaMalloc(&dW, rowBytes);
+        cudaMalloc(&dTok, sizeof(int32_t));
+        cudaMalloc(&dH, cols * sizeof(float));
+        const int32_t tok = 0;
+        cudaMemcpy(dW, row, rowBytes, cudaMemcpyHostToDevice);
+        cudaMemcpy(dTok, &tok, sizeof(tok), cudaMemcpyHostToDevice);
+        cudaMemset(dH, 0, cols * sizeof(float));
+        kEmbedDequantQ6K<<<1, 32, 0, g_stream>>>(dW, dTok, dH, 1, cols,
+                                                 blocksPerRow, rowBytes, 1);
+        cudaStreamSynchronize(g_stream);
+        cudaMemcpy(out, dH, cols * sizeof(float), cudaMemcpyDeviceToHost);
+        cudaFree(dW);
+        cudaFree(dTok);
+        cudaFree(dH);
+    }
+
     void GPUModel::debugQ8KBlocks(uint32_t type, const uint8_t *wRow,
                                   uint32_t blocksPerRow, const float *x,
                                   uint32_t cols, float *outBlk,
