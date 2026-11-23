@@ -114,6 +114,26 @@ if(ENABLE_CUDA)
         CXX_STANDARD_REQUIRED ON
     )
 
+    # ---- Q2_0 int8 MMQ parity + microbench (Inkling expert down) ----------
+    # Runs the standalone kernel on the real checkpoint's Q2_0 down tensor,
+    # checks it against an fp64 dot over the dequantized rows (2e-3, the Q8_1
+    # activation floor) and reports TFLOPS for the real cols=1152/rows=2304
+    # shape.  This is the gate for src/cpp/core/cuda/gemm/Q2_0Mma.cu.
+    add_executable(q2_0_mmq_parity
+        ../tools/q2_0_mmq_parity.cpp
+    )
+
+    target_link_libraries(q2_0_mmq_parity
+        PRIVATE
+        tinycoder_core
+        CUDA::cudart
+    )
+
+    set_target_properties(q2_0_mmq_parity PROPERTIES
+        CXX_STANDARD 20
+        CXX_STANDARD_REQUIRED ON
+    )
+
     # ---- GGUF prefill int8 GEMM per-shape probe (diagnostic; not a gtest) ----
     # Times int8Gemm for the exact (type, rows, cols) of the 7B/9B projections,
     # so the prefill deficit can be attributed to a shape instead of an average.
@@ -185,6 +205,26 @@ if(ENABLE_CUDA)
     )
 
     set_target_properties(gemv_decode_parity PROPERTIES
+        CXX_STANDARD 20
+        CXX_STANDARD_REQUIRED ON
+    )
+
+    # ---- Expert-down int8 timing probe (diagnostic; not a gtest) ----
+    # Answers "would the down projection profit from an int8 dot?" by timing the
+    # float expert GEMV against int8GemvExpert on the real 8-expert down shape.
+    # The int8 path cannot serve the real call's 2*ff activation stride, so the
+    # probe gives it the contiguous stride it accepts -- its best case.
+    add_executable(gemv_down_probe
+        ../tools/gemv_down_probe.cpp
+    )
+
+    target_link_libraries(gemv_down_probe
+        PRIVATE
+        tinycoder_core
+        CUDA::cudart
+    )
+
+    set_target_properties(gemv_down_probe PROPERTIES
         CXX_STANDARD 20
         CXX_STANDARD_REQUIRED ON
     )
@@ -332,3 +372,100 @@ set_target_properties(tinycoder_test PROPERTIES
 
 # Register the test with CTest
 add_test(NAME tinycoder_test COMMAND tinycoder_test)
+
+if(ENABLE_CUDA)
+
+add_executable(inkling_gpu_parity
+    ../tools/inkling_gpu_parity.cpp
+)
+target_link_libraries(inkling_gpu_parity PRIVATE tinycoder_core CUDA::cudart)
+
+# ---- Inkling-2-Mini full CUDA decode graph parity gate (diagnostic) ----
+# Runs token 9707 through Model::forward (CPU reference) and
+# gpu::InklingGPU::forward, then gates on top-1 exact, top-5 set and each
+# top-5 logit within 0.15 absolute.  Needs the IQ2_XXS checkpoint as argv[1].
+add_executable(inkling_gpu_forward_test
+    ../tools/inkling_gpu_forward_test.cpp
+)
+target_link_libraries(inkling_gpu_forward_test PRIVATE tinycoder_core CUDA::cudart)
+set_target_properties(inkling_gpu_forward_test PROPERTIES
+    CXX_STANDARD 20
+    CXX_STANDARD_REQUIRED ON
+)
+
+# ---- Inkling-2-Mini batched-prefill GEMV gate (diagnostic) ----
+# inklingGemvBatched decodes every weight block once for an m-token batch.
+# This tool compares it, per output element, against m single-token inklingGemv
+# calls on one real tensor per hot type (NVFP4, Q2_0, IQ1_S, IQ2_XXS, IQ2_XS,
+# IQ2_S) at m=16, checks a partial-row/partial-M tail, and prints the m=16
+# speedup on an 8-expert ffn slice.  Needs the IQ2_XXS checkpoint as argv[1].
+add_executable(inkling_gpu_batched_test
+    ../tools/inkling_gpu_batched_test.cpp
+)
+target_link_libraries(inkling_gpu_batched_test PRIVATE tinycoder_core CUDA::cudart)
+set_target_properties(inkling_gpu_batched_test PROPERTIES
+    CXX_STANDARD 20
+    CXX_STANDARD_REQUIRED ON
+)
+
+# ---- Inkling-2-Mini batched-prefill gate (parity + pp16/pp512) ----
+# Runs one prompt twice on one engine: the token-major decode graph
+# (TINYCODER_INKLING_BATCHED=0) and the [H, m] batched prefill graph, then
+# requires per-position top-1/top-5 parity, logit cosine >= 0.9999, the same
+# cosine on the prelude hidden state and on every block's hidden state, and
+# prints both prefill throughputs.  Needs the IQ2_XXS checkpoint.
+#   inkling_gpu_batched_prefill_test <model.gguf> --m 16 --bench 512 --reps 1
+add_executable(inkling_gpu_batched_prefill_test
+    ../tools/inkling_gpu_batched_prefill_test.cpp
+)
+target_link_libraries(inkling_gpu_batched_prefill_test PRIVATE tinycoder_core CUDA::cudart)
+set_target_properties(inkling_gpu_batched_prefill_test PROPERTIES
+    CXX_STANDARD 20
+    CXX_STANDARD_REQUIRED ON
+)
+
+# ---- Grouped gate/up expert MMQ parity + microbench (IQ2_XXS/XS/S) ----
+# Standalone float64 gate on the real blk.*.ffn_gate_up_exps tensor at the 2e-3
+# int8 floor, plus per-path timing of one grouped layer (mma / float / int8
+# 4-row slices) so a pp delta can be attributed to the kernel.
+#   inkling_expert_mma_parity <model.gguf> --type 22 --oneshot 0
+add_executable(inkling_expert_mma_parity
+    ../tools/inkling_expert_mma_parity.cpp
+)
+target_link_libraries(inkling_expert_mma_parity PRIVATE tinycoder_core CUDA::cudart)
+set_target_properties(inkling_expert_mma_parity PROPERTIES
+    CXX_STANDARD 20
+    CXX_STANDARD_REQUIRED ON
+)
+
+# ---- FP32 dequant + cuBLAS SGEMM prototype for the routed experts ---------
+# Measures the hypothesis "dequantize the experts to FP32 once, then SGEMM the
+# token columns" against the current grouped float GEMV on the real blk.0
+# tensors: dequant exactness vs GGMLDequantize, dequant GB/s, SGEMM TFLOPS at
+# m=8..512, one real MoE block replayed from the engine's dumped hidden states
+# (parity per token), the real routed row counts, and a projected pp512.
+# Nothing in the shipped graph is touched.
+#   inkling_fp32_gemm_probe <model.gguf> [--m 128] [--dump <dir>]
+add_executable(inkling_fp32_gemm_probe
+    ../tools/inkling_fp32_gemm_probe.cpp
+)
+target_link_libraries(inkling_fp32_gemm_probe PRIVATE tinycoder_core CUDA::cudart CUDA::cublas)
+set_target_properties(inkling_fp32_gemm_probe PROPERTIES
+    CXX_STANDARD 20
+    CXX_STANDARD_REQUIRED ON
+)
+
+# ---- Batched attention kernel isolation probe ----
+# Times the attention kernel alone on the real geometry and reports cycles per
+# (token, key), so a section number can be attributed to the kernel instead of
+# guessed at.  --tile compares the 8-query-token tiled form.
+add_executable(inkling_attn_probe
+    ../tools/inkling_attn_probe.cpp
+)
+target_link_libraries(inkling_attn_probe PRIVATE tinycoder_core CUDA::cudart)
+set_target_properties(inkling_attn_probe PROPERTIES
+    CXX_STANDARD 20
+    CXX_STANDARD_REQUIRED ON
+)
+
+endif() # ENABLE_CUDA

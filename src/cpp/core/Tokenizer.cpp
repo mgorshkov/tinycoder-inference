@@ -424,6 +424,21 @@ namespace tinycoder {
                     "<|fim_suffix|>",
                     "<|repo_name|>",
                     "<|file_sep|>",
+                    // Inkling-2-Mini message framing.  Without these the
+                    // template's <|message_user|> etc. are BPE-encoded into
+                    // ordinary sub-tokens and the model sees no turn markers
+                    // at all (measured: it echoed the question and never
+                    // answered).
+                    "<|message_user|>",
+                    "<|message_model|>",
+                    "<|message_system|>",
+                    "<|message_tool|>",
+                    "<|content_text|>",
+                    "<|content_thinking|>",
+                    "<|content_image|>",
+                    "<|content_invoke_tool_json|>",
+                    "<|end_message|>",
+                    "<|content_model_end_sampling|>",
             };
             for (const char *sp: qwenSpecials) {
                 int32_t id = findTokenId(sp);

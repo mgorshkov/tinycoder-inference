@@ -46,6 +46,8 @@
 
 namespace tinycoder {
 
+    namespace gpu { class InklingGPU; }
+
     class ThreadPool;
 
     /// @brief Stores a quantized weight matrix and provides quantized matrix-vector
@@ -234,6 +236,46 @@ namespace tinycoder {
         /// @brief Tear down GPU resources (called by ~Model).
         void gpuShutdown();
 
+        /// @brief Inkling-2-Mini (looped MoE) per-layer extras.
+        /// Kept in one nested struct so the other architectures' layout and
+        /// their loaders are untouched.  A physical block is shared by every
+        /// loop pass that runs it; only the KV/conv state is per slot.
+        struct InklingLayerWeights {
+            // Attention extras
+            QuantizedMatrix attnGate;    // hidden x (nHeads*headDim)
+            QuantizedMatrix attnRel;     // hidden x (relativeLength*nHeads)
+            QuantizedMatrix attnRelBias; // relativeLength x relativeExtent
+            QuantizedMatrix attnSinkProj;// hidden x nHeads
+            QuantizedMatrix attnKConv;   // shortconvLCache x kvDim (F32)
+            QuantizedMatrix attnVConv;   // shortconvLCache x kvDim (F32)
+            QuantizedMatrix attnPostConv;// shortconvLCache x hidden (F32)
+            QuantizedMatrix ffnPostConv; // shortconvLCache x hidden (F32)
+            // Full-attention layers only: input-dependent short-conv taps.
+            QuantizedMatrix attnKConvProj;// hidden x (shortconvLCache*nKVHeads)
+            QuantizedMatrix attnVConvProj;// hidden x (shortconvLCache*nKVHeads)
+            // Loop controllers (core blocks only); rank x 2*hidden down,
+            // hidden x rank gain/forget.
+            QuantizedMatrix msgQuery;    // hidden x 4 (q,k,v,ffn)
+            QuantizedMatrix ctrlDown[4];
+            QuantizedMatrix ctrlGain[4];
+            QuantizedMatrix ctrlForget[4];
+            np::Array<float> expertProbsBias;// expertCount (selection bias)
+            // Per-expert output scales stored by the legacy/expanded layout
+            // (llama.cpp applies them to each expert's gate_up and down result).
+            np::Array<float> expertGateUpScale;// expertCount
+            np::Array<float> expertDownScale;  // expertCount
+
+            np::Array<float> attnQClip;   // nHeads*headDim
+            np::Array<float> attnRelClip; // nHeads*relativeLength
+            np::Array<float> attnQInpNorm;// hidden (full-attn layers)
+            np::Array<float> attnKInpNorm;// hidden
+            np::Array<float> attnVInpNorm;// hidden
+            // Depth-attention queries: 1 (SWA) or 3 (full) x hidden; empty on
+            // block 0.  ffnResQuery: hidden.
+            np::Array<float> attnResQuery;
+            np::Array<float> ffnResQuery;
+        };
+
         /// @brief Per-layer weights (stored in native quantized format).
         struct LayerWeights {
             // ---- Common attention weights ----
@@ -341,6 +383,9 @@ namespace tinycoder {
             np::Array<float> nextnEnorm;         // hiddenSize (embedding head norm)
             np::Array<float> nextnHnorm;         // hiddenSize (hidden norm)
             np::Array<float> nextnSharedHeadNorm;// hiddenSize (shared head norm)
+
+            // ---- Inkling-2-Mini extras (empty for other architectures) ----
+            InklingLayerWeights inkling;
         };
 
         /// @brief Progress callback type for model loading.
@@ -689,6 +734,17 @@ namespace tinycoder {
         // Final norm (F32)
         np::Array<float> finalNorm_;// hiddenSize
 
+        // ---- Inkling-2-Mini (looped MoE) model-level extras ----
+        np::Array<float> inklingTokNorm_;        // token_embd_norm (hidden)
+        np::Array<float> inklingOutputResQuery_;// output_res_query (hidden)
+        // Expanded (Unsloth) layout only: 2 queries per core block, grouped
+        // globally as [block][2][hidden].  Empty on the mainline layout, which
+        // stores a 4-row loop_msg_query on each core block.
+        np::Array<float> inklingLoopResQuery_;  // [2*(loopEnd-loopStart), hidden]
+        np::Array<float> inklingLoopKvResQuery_;// [2*(loopEnd-loopStart), hidden]
+        // Short-convolution history per KV slot: active channels x (n_conv-1).
+        std::vector<std::vector<float>> inklingConvState_;
+
         // LM head (quantized, or tied with embeddings)
         QuantizedMatrix lmHead_;
         bool lmHeadTied_ = true;
@@ -870,6 +926,12 @@ namespace tinycoder {
         // GPU is enabled (default ON; TINYCODER_GPU=0 opts out); the adapter is
         // created lazily on first use.
         ModelGPUState *gpuState_ = nullptr;
+#ifdef USE_CUDA
+        // Hybrid Inkling path: device-cached weights for the projections while
+        // the CPU keeps the loop/conv/attention glue.  Null unless
+        // TINYCODER_INKLING_GPU=1 and the device is usable.
+        std::shared_ptr<gpu::InklingGPU> inklingGpu_;
+#endif
         // Force the CPU path in forward() even when the GPU engine is enabled
         // and the session is eligible.  Set ONLY by the GPU adapter while it
         // runs the Option-D profiling pass (inside ensureUploadedLocked, with
@@ -1137,12 +1199,23 @@ namespace tinycoder {
         /// @brief Initialize KV cache.
         bool initKVCache();
 
+        /// @brief Inkling-2-Mini (looped MoE) CPU forward.
+        /// Runs the prelude, every loop pass, the postlude and the LM head with
+        /// token-at-a-time state (one KV slot per logical layer, plus a short
+        /// convolution history per slot).  Returns [seqLen, vocab] logits, or
+        /// [1, vocab] when computeAllLogits is false.
+        np::Array<float> forwardInkling(const std::vector<int32_t> &tokens,
+                                        bool computeAllLogits);
+
         /// @brief Build pre-dequantized embedding matrix for fast LM head.
         /// Called after loadWeights() to avoid per-token dequantization overhead.
         bool buildDequantizedEmbeddings();
 
         // GPU offload adapter pokes the private weights/KV cache.
         friend class ModelGPUAdapter;
+        // Inkling full-device decode graph: uploads the physical-layer
+        // projections and reads the model-level Inkling tensors directly.
+        friend class gpu::InklingGPU;
 
         // Make these methods public for unit tests
         friend class ParisQuestionTest;

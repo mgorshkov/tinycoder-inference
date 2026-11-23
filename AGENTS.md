@@ -18,7 +18,7 @@ the reference bit-for-bit or within a stated tolerance, and what would a wrong a
 |---|---|
 | GPU | RTX 2080 Ti, 11 GB, **sm_75**, ~616 GB/s |
 | CPU | 2x Xeon E5-2686 v4, 36 threads used by the benchmarks |
-| Build dir | `build-1.0` |
+| Build dir | `build` |
 | Reference model | `/data/models/qwen/qwen3.8-27b/qwen3.8-27B-exl3-1.60bpw` |
 
 sm_75 constraints that repeatedly matter:
@@ -40,7 +40,7 @@ sm_75 constraints that repeatedly matter:
 1. **Always name the core target explicitly** when a `.cu` changed:
 
    ```bash
-   cmake --build build-1.0 --target tinycoder_core -j 20
+   cmake --build build --target tinycoder_core -j 20
    ```
 
    Building only a tool target (`--target tiny_logits_probe`, `--target tinycoder_bench`) leaves the
@@ -52,7 +52,7 @@ sm_75 constraints that repeatedly matter:
    the cut. A stale binary then produces believable numbers. If you must filter, keep the exit code:
 
    ```bash
-   cmake --build build-1.0 --target tinycoder_core -j 20 || { echo BUILD FAILED; exit 1; }
+   cmake --build build --target tinycoder_core -j 20 || { echo BUILD FAILED; exit 1; }
    ```
 
    **`-lineinfo` is off by default and costs 2-3x of the fatbin size when enabled.**
@@ -65,7 +65,7 @@ sm_75 constraints that repeatedly matter:
 3. Rebuild the tool you intend to run after the core, in the same command:
 
    ```bash
-   cmake --build build-1.0 --target tinycoder_core tiny_logits_probe tinycoder_bench -j 20
+   cmake --build build --target tinycoder_core tiny_logits_probe tinycoder_bench -j 20
    ```
 
 ## Benchmarking
@@ -73,7 +73,7 @@ sm_75 constraints that repeatedly matter:
 **The only comparable protocol** (default environment, no env vars):
 
 ```bash
-./build-1.0/benchmarks/tinycoder_bench \
+./build/benchmarks/tinycoder_bench \
   --model /data/models/qwen/qwen3.8-27b/qwen3.8-27B-exl3-1.60bpw \
   --n-prompts 512 --n-gen 128 --reps 1 --threads 36
 ```
@@ -87,7 +87,7 @@ sm_75 constraints that repeatedly matter:
   be labelled as such.
 - **A throughput number only exists if the text gates pass on the same tree and the same checkpoint.**
   Speed on a path that cannot answer a question is not a result, it is a measurement of wasted work.
-  Before any row goes into a benchmark file (`benchmarks/BENCHMARKS-2080TI.md`, `benchmarks/BENCHMARKS-3090.md`), run the
+  Before any row goes into a benchmark file (`benchmarks/gpu/BENCHMARKS-2080TI.md`, `benchmarks/gpu/BENCHMARKS-3090.md`), run the
   gate over the checkpoint — the script is the authority, and its exit status is the gate:
 
   ```bash
@@ -129,7 +129,7 @@ artefact at ~2,081 tok/s.
 Run these in order after every change to a compute path. They are cheap and each catches a
 different class of mistake.
 
-1. **Kernel parity** — `./build-1.0/unit_tests/exl3_gpu_parity`
+1. **Kernel parity** — `./build/unit_tests/exl3_gpu_parity`
 
    Baseline is **0 `[FAIL]`** and **10 `[SKIP]`** (`ALL EXL3 GPU PARITY CHECKS PASSED`, 156 PASS):
    the K>3 cases that the fused GEMM genuinely does not implement are reported as SKIP, not FAIL.
@@ -144,7 +144,7 @@ different class of mistake.
    m-strip, so a broken strip index in a multi-strip kernel passes it. If you add a tiling
    dimension, add a probe that reaches the new dimension.
 
-2. **Logits** — `./build-1.0/unit_tests/tiny_logits_probe <model> "def hello():`
+2. **Logits** — `./build/unit_tests/tiny_logits_probe <model> "def hello():`
 
    **The gate is the token id and the top-5 ordering. The logit value is not the gate.**
 
@@ -184,7 +184,7 @@ different class of mistake.
    `!!!!`. A short prompt is not a smoke test for a 27B model. Always also check a **>=45-token
    chat-style prompt** for finite logits, and check that generation answers a factual question.
 
-4. **GGUF int8 GEMM parity** — `./build-1.0/unit_tests/int8_gemm_parity <model.gguf>`
+4. **GGUF int8 GEMM parity** — `./build/unit_tests/int8_gemm_parity <model.gguf>`
 
    Per-shape gate on the prefill int8 tensor-core GEMM, against an fp64 dot over the
    dequantized rows of the *same* checkpoint. Run it after anything that touches
@@ -209,7 +209,7 @@ different class of mistake.
    dispatch arm at the wrong tile kernel (must be caught: it surfaces as a loud
    `[int8] fallback: kernel launch error` plus SKIP, not as a silent pass).
 
-5. **GGUF decode GEMV parity** — `./build-1.0/unit_tests/gemv_decode_parity <model.gguf>`
+5. **GGUF decode GEMV parity** — `./build/unit_tests/gemv_decode_parity <model.gguf>`
 
    The decode counterpart, and until it existed **no tool reached the GGUF decode path** —
    a change there could only be judged by whole-model tok/s, 40 shapes averaged together.
@@ -220,7 +220,7 @@ different class of mistake.
    outside tolerance` and exit non-zero when they verified nothing, because a run that
    skipped every shape used to print the same clean line as a real pass.
 
-6. **Suite** — `./build-1.0/unit_tests/tinycoder_test` must report **0 failed** (119 tests / 102
+6. **Suite** — `./build/unit_tests/tinycoder_test` must report **0 failed** (119 tests / 102
    passed as of this writing; the total grew from the older 113/96 note, so compare the failure count,
    not the total)
    without a model (the rest skip because they need a checkpoint). With `TINYCODER_MODEL_PATH` set, the gated question tests run instead of skipping; they
@@ -228,7 +228,7 @@ different class of mistake.
 
    ```bash
    TINYCODER_MODEL_PATH=/data/models/qwen/qwen3.8-27b/qwen3.8-27B-exl3-1.60bpw \
-     ./build-1.0/unit_tests/tinycoder_test --gtest_filter='FullQuestions*'
+     ./build/unit_tests/tinycoder_test --gtest_filter='FullQuestions*'
    ```
 
    They print the generated text, so read it — a passing keyword check and a plausible-looking

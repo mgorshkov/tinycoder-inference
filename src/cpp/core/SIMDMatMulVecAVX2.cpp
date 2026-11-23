@@ -35,6 +35,11 @@ SOFTWARE.
 #include "SIMDMatMulVecInternal.hpp"
 #include "ThreadPool.hpp"
 
+// Runtime SIMD level (np::internal::max_simd_level / SimdLevel) for the
+// dispatch wrappers at the bottom of this file. Those wrappers sit OUTSIDE the
+// __AVX2__ guard so they exist in a non-AVX2 build and return false.
+#include <np/internal/CpuDispatch.hpp>
+
 #include <atomic>
 #include <cmath>
 #include <cstdint>
@@ -6417,5 +6422,364 @@ namespace tinycoder::simd {
                 gateData, upData, downData, x, gRows, hRows, cols, out, residual);
     }
 
+    // ---- AVX2 batch GEMM for NVFP4 / Q2_0 (Inkling-2-Mini MoE experts) ----
+    //
+    // Both types use 64-element blocks, so unlike the K-quant kernels above
+    // there is no Q8_K integer path: the E2M1/2-bit codes and their scales are
+    // decoded to floats per block (through the SAME GGMLDequantize block
+    // functions the scalar path uses, so the reconstruction is identical) and
+    // dotted with 8-wide FMA. Block order is ascending and each (row, token)
+    // accumulates in one float register chain, so seqLen==1 and seqLen>1 share
+    // one code path and out[s*rows + j] is the only layout.
+    //
+    // AMX is not applicable to these types: AMX is an int8/BF16 tile engine, so
+    // a 4-bit/2-bit code with a per-block UE4M3/fp16 scale must first be
+    // expanded to int8 and the scale applied separately -- which is exactly
+    // this dequant + FMA, plus tile setup cost. See the AVX-512 twin
+    // (SIMDMatMulVecAVX512.cpp) for the full note.
+    namespace {
+
+        inline float dotBlockFMA_AVX2(const float *w, const float *x, uint32_t n) {
+            __m256 a0 = _mm256_setzero_ps();
+            __m256 a1 = _mm256_setzero_ps();
+            __m256 a2 = _mm256_setzero_ps();
+            __m256 a3 = _mm256_setzero_ps();
+            uint32_t i = 0;
+            for (; i + 32u <= n; i += 32u) {
+                a0 = _mm256_fmadd_ps(_mm256_loadu_ps(w + i + 0u),
+                                     _mm256_loadu_ps(x + i + 0u), a0);
+                a1 = _mm256_fmadd_ps(_mm256_loadu_ps(w + i + 8u),
+                                     _mm256_loadu_ps(x + i + 8u), a1);
+                a2 = _mm256_fmadd_ps(_mm256_loadu_ps(w + i + 16u),
+                                     _mm256_loadu_ps(x + i + 16u), a2);
+                a3 = _mm256_fmadd_ps(_mm256_loadu_ps(w + i + 24u),
+                                     _mm256_loadu_ps(x + i + 24u), a3);
+            }
+            for (; i + 8u <= n; i += 8u) {
+                a0 = _mm256_fmadd_ps(_mm256_loadu_ps(w + i),
+                                     _mm256_loadu_ps(x + i), a0);
+            }
+            __m256 s = _mm256_add_ps(_mm256_add_ps(a0, a1),
+                                     _mm256_add_ps(a2, a3));
+            __m128 lo = _mm256_castps256_ps128(s);
+            __m128 hi = _mm256_extractf128_ps(s, 1);
+            __m128 t = _mm_add_ps(lo, hi);
+            t = _mm_hadd_ps(t, t);
+            t = _mm_hadd_ps(t, t);
+            float sum = _mm_cvtss_f32(t);
+            // Partial last block only (cols not a multiple of the block size).
+            for (; i < n; ++i) {
+                sum += w[i] * x[i];
+            }
+            return sum;
+        }
+
+        // QK = elements per block, BLOCK_BYTES = storage per block. blockFn is
+        // one of GGMLDequantize::dequantize{NVFP4,Q2_0}Block.
+        template<uint32_t QK, uint32_t BLOCK_BYTES>
+        void matMulVecBatchBlocks_AVX2(const uint8_t *W, const float *X,
+                                       uint32_t seqLen, uint32_t rows,
+                                       uint32_t cols, float *out,
+                                       void (*blockFn)(const uint8_t *, float *)) {
+            if (seqLen == 0 || rows == 0 || cols == 0) {
+                return;
+            }
+            const uint32_t blocksPerRow = (cols + QK - 1) / QK;
+            const uint64_t rowStride =
+                    static_cast<uint64_t>(blocksPerRow) * BLOCK_BYTES;
+
+            // One row at a time (streaming: the hardware prefetcher sees the
+            // whole packed row), parallel over rows. Each thread keeps seqLen
+            // accumulators and decodes each weight block once, reusing it for
+            // every token.
+            ThreadPool::current().parallelForSlab(0, rows, [&](uint32_t row) {
+                static thread_local std::vector<float> acc;
+                acc.assign(seqLen, 0.0f);
+
+                const uint8_t *rp = W + static_cast<uint64_t>(row) * rowStride;
+                float blockOut[QK];
+                for (uint32_t b = 0; b < blocksPerRow; ++b) {
+                    if (b + 2u < blocksPerRow) {
+                        _mm_prefetch(
+                                reinterpret_cast<const char *>(
+                                        rp + static_cast<uint64_t>(b + 2u) *
+                                                     BLOCK_BYTES),
+                                _MM_HINT_T0);
+                    }
+                    const uint8_t *blockData =
+                            rp + static_cast<uint64_t>(b) * BLOCK_BYTES;
+                    blockFn(blockData, blockOut);
+
+                    const uint32_t start = b * QK;
+                    const uint32_t n = std::min(QK, cols - start);
+                    for (uint32_t s = 0; s < seqLen; ++s) {
+                        acc[s] += dotBlockFMA_AVX2(
+                                blockOut,
+                                X + static_cast<uint64_t>(s) * cols + start,
+                                n);
+                    }
+                }
+                for (uint32_t s = 0; s < seqLen; ++s) {
+                    out[static_cast<uint64_t>(s) * rows + row] = acc[s];
+                }
+            });
+        }
+
+    }// namespace
+
+    void matMulVecBatchNVFP4_AVX2(const uint8_t *W_nvfp4, const float *X,
+                                  uint32_t seqLen, uint32_t rows,
+                                  uint32_t cols, float *out) {
+        matMulVecBatchBlocks_AVX2<tinycoder::GGMLDequantize::QK_NVFP4,
+                                  tinycoder::GGMLDequantize::NVFP4_BLOCK_BYTES>(
+                W_nvfp4, X, seqLen, rows, cols, out,
+                tinycoder::GGMLDequantize::dequantizeNVFP4Block);
+    }
+
+    void matMulVecBatchQ2_0_AVX2(const uint8_t *W_q2_0, const float *X,
+                                 uint32_t seqLen, uint32_t rows,
+                                 uint32_t cols, float *out) {
+        matMulVecBatchBlocks_AVX2<tinycoder::GGMLDequantize::QK_Q2_0,
+                                  tinycoder::GGMLDequantize::Q2_0_BLOCK_BYTES>(
+                W_q2_0, X, seqLen, rows, cols, out,
+                tinycoder::GGMLDequantize::dequantizeQ2_0Block);
+    }
+
+    // ---- AVX2 batch GEMM for the remaining 256-weight i-quants ----
+    // The IQ2/IQ3 family (IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S) previously had
+    // no batch kernel: every expert matvec went through the scalar fused-dot
+    // loop at ~0.08 GFLOP/s (measured 64 ms for one 2304-row expert slice),
+    // which made a whole token 9-11 s. Decode one 256-weight block through the
+    // same GGMLDequantize function the scalar path uses, then four 8-wide FMA
+    // chains: identical reconstruction, ~30x faster.
+    template<uint32_t BLOCK_BYTES>
+    void matMulVecBatchDequant256_AVX2(const uint8_t *W, const float *X,
+                                       uint32_t seqLen, uint32_t rows,
+                                       uint32_t cols, float *out,
+                                       uint32_t type) {
+        if (seqLen == 0 || rows == 0 || cols == 0) return;
+        constexpr uint32_t QK = 256;
+        const uint32_t blocksPerRow = (cols + QK - 1) / QK;
+        const uint64_t rowStride =
+                static_cast<uint64_t>(blocksPerRow) * BLOCK_BYTES;
+        ThreadPool::current().parallelForSlab(0, rows, [&](uint32_t row) {
+            static thread_local std::vector<float> acc;
+            acc.assign(seqLen, 0.0f);
+            const uint8_t *rp = W + static_cast<uint64_t>(row) * rowStride;
+            float blockOut[QK];
+            for (uint32_t b = 0; b < blocksPerRow; ++b) {
+                const uint8_t *blockData =
+                        rp + static_cast<uint64_t>(b) * BLOCK_BYTES;
+                tinycoder::GGMLDequantize::dequantizeBlock(type, blockData,
+                                                           blockOut, QK);
+                const uint32_t startIdx = b * QK;
+                const uint32_t n = std::min(QK, cols - startIdx);
+                for (uint32_t s = 0; s < seqLen; ++s) {
+                    acc[s] += dotBlockFMA_AVX2(
+                            blockOut,
+                            X + static_cast<uint64_t>(s) * cols + startIdx, n);
+                }
+            }
+            for (uint32_t s = 0; s < seqLen; ++s) {
+                out[static_cast<uint64_t>(s) * rows + row] = acc[s];
+            }
+        });
+    }
+
+    bool matMulVecBatchIQGeneric_SIMD(uint32_t type, const uint8_t *data,
+                                      const float *x, uint32_t seqLen,
+                                      uint32_t rows, uint32_t cols, float *out) {
+#if defined(__AVX2__) && defined(__FMA__)
+        if (cols == 0 || (cols & 255) != 0) return false;
+        switch (type) {
+            case tinycoder::GGML_TYPE_IQ2_XXS:
+                matMulVecBatchDequant256_AVX2<66>(data, x, seqLen, rows, cols,
+                                                  out, type);
+                return true;
+            case tinycoder::GGML_TYPE_IQ2_XS:
+                matMulVecBatchDequant256_AVX2<74>(data, x, seqLen, rows, cols,
+                                                  out, type);
+                return true;
+            case tinycoder::GGML_TYPE_IQ2_S:
+                matMulVecBatchDequant256_AVX2<82>(data, x, seqLen, rows, cols,
+                                                  out, type);
+                return true;
+            case tinycoder::GGML_TYPE_IQ3_XXS:
+                matMulVecBatchDequant256_AVX2<98>(data, x, seqLen, rows, cols,
+                                                  out, type);
+                return true;
+            case tinycoder::GGML_TYPE_IQ3_S:
+                matMulVecBatchDequant256_AVX2<110>(data, x, seqLen, rows, cols,
+                                                   out, type);
+                return true;
+            default:
+                return false;
+        }
+#else
+        (void) type; (void) data; (void) x; (void) seqLen; (void) rows;
+        (void) cols; (void) out;
+        return false;
+#endif
+    }
+
+    // ---- AVX2 batch GEMM for IQ1_S (1.5625 bpw, 256-weight blocks) ----
+    // Same structure as the NVFP4/Q2_0 kernels above: each 50-byte block is
+    // decoded by GGMLDequantize::dequantizeIQ1_SBlock (the same function the
+    // scalar path uses) and dotted with 8-wide FMA, one accumulator per token
+    // per row. Every 8-weight grid lookup is a table gather in the dequant, so
+    // the kernel is dequant-bound; there is no integer-tile shortcut.
+    //
+    // AMX does not help for the same reason as the 4-bit types, and more so:
+    // the 1-bit grid values are {-1,0,+1} plus a per-group 0.125 delta, so an
+    // AMX int8 tile would still need the fp32 reconstruct-and-scale pass that
+    // dominates here.
+    void matMulVecBatchIQ1S_AVX2(const uint8_t *W_iq1s, const float *X,
+                                 uint32_t seqLen, uint32_t rows,
+                                 uint32_t cols, float *out) {
+        matMulVecBatchBlocks_AVX2<tinycoder::GGMLDequantize::QK_IQ1,
+                                  tinycoder::GGMLDequantize::IQ1_S_BLOCK_BYTES>(
+                W_iq1s, X, seqLen, rows, cols, out,
+                tinycoder::GGMLDequantize::dequantizeIQ1_SBlock);
+    }
+
 }// namespace tinycoder::simd
 #endif// __AVX2__ && __FMA__
+
+// ---------------------------------------------------------------------------
+// Runtime-dispatch entry points for the Inkling-2-Mini block types.
+//
+// The wrappers live in THIS translation unit, outside the ISA guard, so they
+// exist (and return false) when ENABLE_AVX2 is OFF -- exactly like the
+// matMulVecBatch*_SIMD wrappers in SIMDMatMulVec.cpp, whose runtime level check
+// they mirror. A false return makes QuantizedMatrix fall back to the scalar
+// dequantize+dot path, so a non-AVX2 host still computes correct output.
+//
+// An AVX-512 build (ENABLE_AVX512=ON) compiles EVERY TU with -mavx512f (np's
+// add_compile_options), so __AVX512F__ is defined here too; the wrappers then
+// prefer the 16-wide kernels for direct callers as well (e.g. ModelMoE's batch
+// prefill), not just for QuantizedMatrix's dispatch. In a non-AVX-512 build the
+// guard is false, no AVX-512 symbol is referenced, and the AVX2 kernel runs.
+// ---------------------------------------------------------------------------
+#if defined(__AVX512F__) && defined(__FMA__)
+namespace tinycoder::simd {
+    void matMulVecBatchNVFP4_AVX512(const uint8_t *data, const float *x,
+                                    uint32_t seqLen, uint32_t rows,
+                                    uint32_t cols, float *out);
+    void matMulVecBatchQ2_0_AVX512(const uint8_t *data, const float *x,
+                                   uint32_t seqLen, uint32_t rows,
+                                   uint32_t cols, float *out);
+    void matMulVecBatchIQ1S_AVX512(const uint8_t *data, const float *x,
+                                   uint32_t seqLen, uint32_t rows,
+                                   uint32_t cols, float *out);
+}// namespace tinycoder::simd
+#endif
+
+namespace tinycoder {
+
+    bool matMulVecBatchIQGeneric_SIMD(uint32_t type, const uint8_t *data,
+                                      const float *x, uint32_t seqLen,
+                                      uint32_t rows, uint32_t cols, float *out) {
+        static std::atomic<int> s_level{-1};
+        int level = s_level.load(std::memory_order_acquire);
+        if (level < 0) {
+            level = static_cast<int>(np::internal::max_simd_level());
+            s_level.store(level, std::memory_order_release);
+        }
+        if (level < static_cast<int>(np::internal::SimdLevel::AVX2)) {
+            return false;
+        }
+        return simd::matMulVecBatchIQGeneric_SIMD(type, data, x, seqLen, rows,
+                                                  cols, out);
+    }
+
+    bool matMulVecBatchNVFP4_SIMD(const uint8_t *data, const float *x,
+                                  uint32_t seqLen, uint32_t rows,
+                                  uint32_t cols, float *out) {
+        static std::atomic<int> s_level{-1};
+        int level = s_level.load(std::memory_order_acquire);
+        if (level < 0) {
+            level = static_cast<int>(np::internal::max_simd_level());
+            s_level.store(level, std::memory_order_release);
+        }
+#if defined(__AVX512F__) && defined(__FMA__)
+        if (level >= static_cast<int>(np::internal::SimdLevel::AVX512)) {
+            simd::matMulVecBatchNVFP4_AVX512(data, x, seqLen, rows, cols, out);
+            return true;
+        }
+#endif
+#if defined(__AVX2__) && defined(__FMA__)
+        if (level >= static_cast<int>(np::internal::SimdLevel::AVX2)) {
+            simd::matMulVecBatchNVFP4_AVX2(data, x, seqLen, rows, cols, out);
+            return true;
+        }
+#endif
+        (void) data;
+        (void) x;
+        (void) seqLen;
+        (void) rows;
+        (void) cols;
+        (void) out;
+        return false;
+    }
+
+    bool matMulVecBatchQ2_0_SIMD(const uint8_t *data, const float *x,
+                                 uint32_t seqLen, uint32_t rows,
+                                 uint32_t cols, float *out) {
+        static std::atomic<int> s_level{-1};
+        int level = s_level.load(std::memory_order_acquire);
+        if (level < 0) {
+            level = static_cast<int>(np::internal::max_simd_level());
+            s_level.store(level, std::memory_order_release);
+        }
+#if defined(__AVX512F__) && defined(__FMA__)
+        if (level >= static_cast<int>(np::internal::SimdLevel::AVX512)) {
+            simd::matMulVecBatchQ2_0_AVX512(data, x, seqLen, rows, cols, out);
+            return true;
+        }
+#endif
+#if defined(__AVX2__) && defined(__FMA__)
+        if (level >= static_cast<int>(np::internal::SimdLevel::AVX2)) {
+            simd::matMulVecBatchQ2_0_AVX2(data, x, seqLen, rows, cols, out);
+            return true;
+        }
+#endif
+        (void) data;
+        (void) x;
+        (void) seqLen;
+        (void) rows;
+        (void) cols;
+        (void) out;
+        return false;
+    }
+
+    bool matMulVecBatchIQ1S_SIMD(const uint8_t *data, const float *x,
+                                 uint32_t seqLen, uint32_t rows,
+                                 uint32_t cols, float *out) {
+        static std::atomic<int> s_level{-1};
+        int level = s_level.load(std::memory_order_acquire);
+        if (level < 0) {
+            level = static_cast<int>(np::internal::max_simd_level());
+            s_level.store(level, std::memory_order_release);
+        }
+#if defined(__AVX512F__) && defined(__FMA__)
+        if (level >= static_cast<int>(np::internal::SimdLevel::AVX512)) {
+            simd::matMulVecBatchIQ1S_AVX512(data, x, seqLen, rows, cols, out);
+            return true;
+        }
+#endif
+#if defined(__AVX2__) && defined(__FMA__)
+        if (level >= static_cast<int>(np::internal::SimdLevel::AVX2)) {
+            simd::matMulVecBatchIQ1S_AVX2(data, x, seqLen, rows, cols, out);
+            return true;
+        }
+#endif
+        (void) data;
+        (void) x;
+        (void) seqLen;
+        (void) rows;
+        (void) cols;
+        (void) out;
+        return false;
+    }
+
+}// namespace tinycoder

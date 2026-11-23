@@ -32,6 +32,10 @@ SOFTWARE.
 #include <vector>
 
 #include <np/Array.hpp>
+// np::internal::max_simd_level() / SimdLevel for the runtime ISA choice in
+// matMulVecBatchSIMD (the AVX-512 kernels are only compiled in an AVX-512
+// build, and even there a non-AVX-512 host must not execute them).
+#include <np/internal/CpuDispatch.hpp>
 
 #ifdef USE_CUDA
 #include <np/internal/cuda/Dot1d2d.hpp>
@@ -47,6 +51,56 @@ namespace tinycoder {
     }
 
     uint32_t ggmlTypeSize(uint32_t type);
+
+    // AVX2 batch kernels for the Inkling-2-Mini block types. Defined in
+    // SIMDMatMulVecAVX2.cpp (the only TU compiled with -mavx2 -mfma); each
+    // wrapper does its own runtime AVX2 check and returns false on a host
+    // without it, so the caller falls back to the scalar dequantize+dot path.
+    bool matMulVecBatchNVFP4_SIMD(const uint8_t *data, const float *x,
+                                  uint32_t seqLen, uint32_t rows,
+                                  uint32_t cols, float *out);
+    bool matMulVecBatchQ2_0_SIMD(const uint8_t *data, const float *x,
+                                 uint32_t seqLen, uint32_t rows,
+                                 uint32_t cols, float *out);
+    // IQ1_S (256-weight blocks): AVX2/AVX-512 batch kernel for the 1-bit MoE
+    // expert path. Same contract; returns false on a host without AVX2 so the
+    // caller falls back to the scalar fused dot (which is fully supported).
+    bool matMulVecBatchIQ1S_SIMD(const uint8_t *data, const float *x,
+                                 uint32_t seqLen, uint32_t rows,
+                                 uint32_t cols, float *out);
+    // Generic 256-weight i-quant batch kernel (IQ2_XXS/XS/S, IQ3_XXS/S).
+    bool matMulVecBatchIQGeneric_SIMD(uint32_t type, const uint8_t *data,
+                                      const float *x, uint32_t seqLen,
+                                      uint32_t rows, uint32_t cols, float *out);
+
+    // AVX-512 variants for the same two types (SIMDMatMulVecAVX512.cpp). They
+    // are compiled only when the AVX-512 TU is (-mavx512f), i.e. an
+    // ENABLE_AVX512 build; this mirrors the existing Q4_K/Q6_K AVX-512 arms in
+    // SIMDMatMulVec.cpp, which are guarded the same way because np's
+    // add_compile_options() then gives every TU __AVX512F__. In a non-AVX-512
+    // build the guard is false and the dispatch below falls back to the AVX2
+    // wrapper.
+#if defined(__AVX512F__) && defined(__FMA__)
+    namespace simd {
+        void matMulVecBatchNVFP4_AVX512(const uint8_t *data, const float *x,
+                                        uint32_t seqLen, uint32_t rows,
+                                        uint32_t cols, float *out);
+        void matMulVecBatchQ2_0_AVX512(const uint8_t *data, const float *x,
+                                       uint32_t seqLen, uint32_t rows,
+                                       uint32_t cols, float *out);
+    }// namespace simd
+
+    // Runtime probe, cached after the first call. Compile-time AVX-512 support
+    // is not enough: the binary may run on a host without it, in which case
+    // executing a zmm kernel is a SIGILL. Any level below AVX512 uses the AVX2
+    // kernel (AVX-512 CPUs are a superset of AVX2, and the AVX2 wrapper itself
+    // checks for AVX2 at runtime).
+    static bool hostHasAVX512() {
+        static const bool ok =
+                np::internal::max_simd_level() >= np::internal::SimdLevel::AVX512;
+        return ok;
+    }
+#endif
 
     // Dispatch statistics (A/B diagnostics): count how many matMulVec calls
     // went through the SIMD batch kernels vs the scalar fallback, per quant
@@ -114,6 +168,33 @@ namespace tinycoder {
                     reinterpret_cast<const float *>(data), x, 1, rows, cols,
                     out);
         }
+        // Inkling-2-Mini block types: NVFP4 and Q2_0 both use 64-element
+        // blocks, so they need cols % 64 == 0 rather than the K-quant
+        // cols % 256 == 0 gate below. The kernels decode each block with the
+        // same GGMLDequantize block function the scalar path uses and dot in
+        // 8-wide FMA; every (row, token) accumulates over blocks in ascending
+        // order, so seqLen==1 and seqLen>1 are the same code path.
+        if (type == GGML_TYPE_NVFP4 || type == GGML_TYPE_Q2_0) {
+            if (cols == 0 || (cols & 63) != 0) {
+                return false;
+            }
+#if defined(__AVX512F__) && defined(__FMA__)
+            // Prefer the 16-wide kernel when this build compiled it AND the
+            // host can execute it; otherwise the AVX2 wrapper decides on its
+            // own runtime check and may still return false for a scalar host.
+            if (hostHasAVX512()) {
+                if (type == GGML_TYPE_NVFP4) {
+                    simd::matMulVecBatchNVFP4_AVX512(data, x, 1, rows, cols, out);
+                } else {
+                    simd::matMulVecBatchQ2_0_AVX512(data, x, 1, rows, cols, out);
+                }
+                return true;
+            }
+#endif
+            return type == GGML_TYPE_NVFP4
+                           ? matMulVecBatchNVFP4_SIMD(data, x, 1, rows, cols, out)
+                           : matMulVecBatchQ2_0_SIMD(data, x, 1, rows, cols, out);
+        }
         if (cols == 0 || (cols & 255) != 0) {
             return false;
         }
@@ -141,6 +222,15 @@ namespace tinycoder {
                 return matMulVecBatchIQ4NL_SIMD(data, x, 1, rows, cols, out);
             case GGML_TYPE_Q3_K:
                 return matMulVecBatchQ3K_SIMD(data, x, 1, rows, cols, out);
+            case GGML_TYPE_IQ1_S:
+                return matMulVecBatchIQ1S_SIMD(data, x, 1, rows, cols, out);
+            case GGML_TYPE_IQ2_XXS:
+            case GGML_TYPE_IQ2_XS:
+            case GGML_TYPE_IQ2_S:
+            case GGML_TYPE_IQ3_XXS:
+            case GGML_TYPE_IQ3_S:
+                return matMulVecBatchIQGeneric_SIMD(type, data, x, 1, rows,
+                                                    cols, out);
             case GGML_TYPE_Q8_K:
                 return matMulVecBatchQ8K_SIMD(
                         reinterpret_cast<const Q8KBlock *>(data), x, 1, rows,
@@ -397,6 +487,78 @@ namespace tinycoder {
                     data.data() + static_cast<size_t>(rowStart) * bytesPerRow;
             for (uint32_t j = 0; j < numRows; ++j) {
                 const uint8_t *rowPtr = rowDataScalar + j * bytesPerRow;
+                double dot = 0.0;
+                uint32_t remaining = cols;
+                for (uint32_t b = 0; b < blocksPerRow; ++b) {
+                    uint32_t blockN = std::min(blockSize, remaining);
+                    dot += static_cast<double>(
+                            GGMLDequantize::dotProductFused(type,
+                                                            rowPtr + b * typeSize,
+                                                            x + b * blockSize,
+                                                            blockN));
+                    remaining -= blockN;
+                }
+                out[j] = static_cast<float>(dot);
+            }
+        } else if ((type == GGML_TYPE_NVFP4 || type == GGML_TYPE_Q2_0 ||
+                    type == GGML_TYPE_IQ2_XXS || type == GGML_TYPE_IQ2_XS ||
+                    type == GGML_TYPE_IQ2_S || type == GGML_TYPE_IQ3_XXS ||
+                    type == GGML_TYPE_IQ3_S) &&
+                   !forceScalarPath() && cols != 0 &&
+                   ((type == GGML_TYPE_NVFP4 || type == GGML_TYPE_Q2_0)
+                            ? ((cols & 63) == 0)
+                            : ((cols & 255) == 0))) {
+            // Inkling-2-Mini expert slices: the 64-element-block AVX2 kernels
+            // take a contiguous row range exactly like the Q8_0 arm above, so
+            // the routed-expert matmuls get the batch kernel instead of the
+            // scalar per-row loop. The wrapper returns false on a non-AVX2
+            // host, in which case the scalar loop below still runs.
+            uint32_t blockSize = ggmlBlockSize(type);
+            uint32_t typeSize = ggmlTypeSize(type);
+            uint64_t blocksPerRow = (static_cast<uint64_t>(cols) + blockSize - 1) / blockSize;
+            uint64_t bytesPerRow = blocksPerRow * typeSize;
+            const uint8_t *rowData =
+                    data.data() + static_cast<size_t>(rowStart) * bytesPerRow;
+            if (matMulVecBatchSIMD(type, rowData, x, numRows, cols, out)) {
+                g_batchKernelCalls.fetch_add(1, std::memory_order_relaxed);
+                if (type < 64)
+                    g_batchKernelTypes[type].fetch_add(1, std::memory_order_relaxed);
+                return;
+            }
+            for (uint32_t j = 0; j < numRows; ++j) {
+                const uint8_t *rowPtr = rowData + j * bytesPerRow;
+                double dot = 0.0;
+                uint32_t remaining = cols;
+                for (uint32_t b = 0; b < blocksPerRow; ++b) {
+                    uint32_t blockN = std::min(blockSize, remaining);
+                    dot += static_cast<double>(
+                            GGMLDequantize::dotProductFused(type,
+                                                            rowPtr + b * typeSize,
+                                                            x + b * blockSize,
+                                                            blockN));
+                    remaining -= blockN;
+                }
+                out[j] = static_cast<float>(dot);
+            }
+        } else if (type == GGML_TYPE_IQ1_S && !forceScalarPath() &&
+                   cols != 0 && (cols & 255) == 0) {
+            // 1-bit expert slices: same contiguous row range as the Q8_0 arm,
+            // 256-element blocks. The wrapper prefers AVX-512 when the build
+            // has it, else AVX2, else returns false for the scalar loop below.
+            uint32_t blockSize = ggmlBlockSize(type);
+            uint32_t typeSize = ggmlTypeSize(type);
+            uint64_t blocksPerRow = (static_cast<uint64_t>(cols) + blockSize - 1) / blockSize;
+            uint64_t bytesPerRow = blocksPerRow * typeSize;
+            const uint8_t *rowData =
+                    data.data() + static_cast<size_t>(rowStart) * bytesPerRow;
+            if (matMulVecBatchSIMD(type, rowData, x, numRows, cols, out)) {
+                g_batchKernelCalls.fetch_add(1, std::memory_order_relaxed);
+                if (type < 64)
+                    g_batchKernelTypes[type].fetch_add(1, std::memory_order_relaxed);
+                return;
+            }
+            for (uint32_t j = 0; j < numRows; ++j) {
+                const uint8_t *rowPtr = rowData + j * bytesPerRow;
                 double dot = 0.0;
                 uint32_t remaining = cols;
                 for (uint32_t b = 0; b < blocksPerRow; ++b) {

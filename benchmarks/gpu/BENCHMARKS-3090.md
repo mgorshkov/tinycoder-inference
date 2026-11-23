@@ -31,6 +31,7 @@ Columns follow the same benchmark defaults as the 2080 Ti file:
 | [Ternary-Bonsai-2-27B `ptq1_0` (Prism)](https://huggingface.co/prism-ml/Ternary-Bonsai-2-27B-gguf/resolve/main/Ternary-Bonsai-2-27B-PTQ1_0.gguf) | 5.5 GB | full offload | — | — | PrismML llama.cpp (fork) | — | — | — | — |
 | [Ornith-1.5-9B `q4_k_m`](https://huggingface.co/bartowski/Ornith-1.5-9B-GGUF/resolve/main/Ornith-1.5-9B-Q4_K_M.gguf) | 5.9 GB | full offload | — | — | llama.cpp | — | — | — | — |
 | [Ornith-1.5-35B-A3B `q8_0` → `q4_k` experts](https://huggingface.co/AtomicChat/Ornith-1.5-35B-A3B-GGUF/resolve/main/Ornith-1.5-35B-A3B-Q8_0.gguf) | 34.4 GB | **hybrid only** | — | — | llama.cpp `-ncmoe 99` | — | — | — | — |
+| [Inkling-2-Mini `iq2_xxs`](https://huggingface.co/unsloth/Inkling-2-Mini-GGUF/resolve/main/Inkling-2-Mini-UD-IQ2_XXS.gguf) | 8.5 GB | full offload | — | — | llama.cpp CUDA (`-ngl 99`, ctx 2048) | — | — | — | — |
 | [Qwen3.8-27B EXL3 `1.60bpw`](https://huggingface.co/turboderp/Qwen3.8-27B-exl3/tree/SC_1.60bpw_H3) | 8.6 GB | full offload | — | — | exllamav3 1.6.6 | — | — | — | — |
 
 The last two columns are the reason this file exists. Absolute tok/s says nothing about
@@ -159,3 +160,16 @@ text gate, interleaved benchmark per row, `ncu` on the four kernels that matter,
 census, resolved dispatch decisions, then this table and the two roof percentages.
 The session costs about an hour of rental; the script exists so that the hour is a
 measurement and not a debugging session, and so that anyone can re-run it.
+
+---
+
+## Inkling-2-Mini
+
+No Ampere numbers are published for Inkling-2-Mini; the row is listed with
+dashes so the checkpoint and the intended baseline are tracked. The engine's full-device CUDA
+graph exists and is verified on sm_75, but it has not been measured on a 3090;
+the 2080 Ti numbers are the only measurement, and on that card the graph is
+slower than llama.cpp CUDA on both canonical columns. The parity and speed
+results are in [BENCHMARKS-2080TI.md](BENCHMARKS-2080TI.md).
+
+Back to the [README](../README.md).

@@ -46,6 +46,22 @@ SOFTWARE.
 
 using namespace tinycoder;
 
+namespace tinycoder {
+    // Runtime-dispatch batch kernels defined in SIMDMatMulVecAVX2.cpp. They are
+    // declared here (not in SIMDMatMulVec.hpp) because this test is the only
+    // consumer besides QuantizedMatrix.cpp. Same contract as
+    // matMulVecBatchQ4K_SIMD: out[s*rows + j], uint32_t seqLen.
+    bool matMulVecBatchNVFP4_SIMD(const uint8_t *data, const float *x,
+                                  uint32_t seqLen, uint32_t rows,
+                                  uint32_t cols, float *out);
+    bool matMulVecBatchQ2_0_SIMD(const uint8_t *data, const float *x,
+                                 uint32_t seqLen, uint32_t rows,
+                                 uint32_t cols, float *out);
+    bool matMulVecBatchIQ1S_SIMD(const uint8_t *data, const float *x,
+                                 uint32_t seqLen, uint32_t rows,
+                                 uint32_t cols, float *out);
+}// namespace tinycoder
+
 // ---------------------------------------------------------------------------
 // Test: Q5_1 block dequantization with known constants
 // ---------------------------------------------------------------------------
@@ -592,6 +608,27 @@ TEST(DequantizeTest, TypeSizeAndBlockSize) {
     EXPECT_EQ(ggmlBlockSize(GGML_TYPE_IQ2_S), 256u);
     EXPECT_EQ(ggmlBlockSize(GGML_TYPE_Q8_1), 32u);
     EXPECT_EQ(ggmlBlockSize(GGML_TYPE_Q8_K), 256u);
+
+    // Inkling-2-Mini types. These sizes drive tensor byte offsets in the
+    // loader, so a wrong value reads the wrong weights (or overreads the file).
+    // Layouts verified against upstream ggml-common.h:
+    //   mxfp4  17 B / 32, nvfp4 36 B / 64, q1_0 18 B / 128, q2_0 18 B / 64.
+    EXPECT_EQ(ggmlTypeSize(GGML_TYPE_MXFP4), 17u);
+    EXPECT_EQ(ggmlTypeSize(GGML_TYPE_NVFP4), 36u);
+    EXPECT_EQ(ggmlTypeSize(GGML_TYPE_Q1_0), 18u);
+    EXPECT_EQ(ggmlTypeSize(GGML_TYPE_Q2_0), 18u);
+    EXPECT_EQ(ggmlTypeSize(GGML_TYPE_F8_E4M3), 1u);
+    // IQ1_S was 34 (wrong: that is block_iq1_s' qs+qh without d), IQ1_M was
+    // absent. Both are 256-weight super-blocks.
+    EXPECT_EQ(ggmlTypeSize(GGML_TYPE_IQ1_S), 50u);
+    EXPECT_EQ(ggmlTypeSize(GGML_TYPE_IQ1_M), 56u);
+    EXPECT_EQ(ggmlBlockSize(GGML_TYPE_IQ1_S), 256u);
+    EXPECT_EQ(ggmlBlockSize(GGML_TYPE_IQ1_M), 256u);
+    EXPECT_EQ(ggmlBlockSize(GGML_TYPE_MXFP4), 32u);
+    EXPECT_EQ(ggmlBlockSize(GGML_TYPE_NVFP4), 64u);
+    EXPECT_EQ(ggmlBlockSize(GGML_TYPE_Q1_0), 128u);
+    EXPECT_EQ(ggmlBlockSize(GGML_TYPE_Q2_0), 64u);
+    EXPECT_EQ(ggmlBlockSize(GGML_TYPE_F8_E4M3), 1u);
 }
 
 // ---------------------------------------------------------------------------
@@ -1341,4 +1378,518 @@ TEST(DequantizeTest, Q4KQuantizeRoundTripAccuracy) {
               << "% worst=" << worstRelRms * 100.0 << "% (ggml reference: 7.17%)"
               << std::endl;
     EXPECT_LT(meanRelRms, 0.09) << "Q4_K quantiser regressed past the format floor";
+}
+
+// ===========================================================================
+// Inkling-2-Mini types: MXFP4 (39), NVFP4 (40), Q1_0 (41), Q2_0 (42),
+// F8_E4M3 (43).
+//
+// Every expected value below is derived BY HAND from the upstream layout in
+// ggml-common.h and the arithmetic in ggml-quants.c, never by calling the
+// function under test, so a wrong table/offset/scale convention cannot make
+// the test agree with itself. Scale bytes are chosen so the decoded scales are
+// exact binary values (0.5, 0.75, 1.0, 0.25, 0.0), which makes
+// EXPECT_FLOAT_EQ legitimate rather than sloppy.
+// ===========================================================================
+namespace {
+
+    // The E2M1 values DOUBLED (upstream kvalues_fp4), spelled out again so the
+    // test does not share the implementation's table.
+    constexpr int kE2M1Doubled[16] = {
+            0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12};
+
+}// namespace
+
+TEST(DequantizeTest, NVFP4BlockMatchesReferenceLayout) {
+    // block_nvfp4: d[4] UE4M3 scales (one per 16-element sub-block) + qs[32]
+    // packed E2M1 nibbles. Per sub-block s, byte qs[s*8 + j] holds element j in
+    // its low nibble and element j+8 in its high nibble.
+    uint8_t blk[36] = {};
+    const uint8_t scaleBytes[4] = {0x38, 0x3C, 0x40, 0x00};
+    std::memcpy(blk, scaleBytes, sizeof(scaleBytes));
+    for (int s = 0; s < 4; ++s) {
+        for (int j = 0; j < 8; ++j) {
+            blk[4 + s * 8 + j] =
+                    static_cast<uint8_t>(((15 - j) << 4) | j);
+        }
+    }
+    // UE4M3 hand-decode: 0x38 = (1 + 0/8) * 2^0 * 0.5 = 0.5
+    //                    0x3C = (1 + 4/8) * 2^0 * 0.5 = 0.75
+    //                    0x40 = (1 + 0/8) * 2^1 * 0.5 = 1.0
+    //                    0x00 = 0
+    const float expectedScale[4] = {0.5f, 0.75f, 1.0f, 0.0f};
+
+    float out[64];
+    GGMLDequantize::dequantizeNVFP4Block(blk, out);
+    for (int s = 0; s < 4; ++s) {
+        for (int j = 0; j < 8; ++j) {
+            const float lo = static_cast<float>(kE2M1Doubled[j]) * expectedScale[s];
+            const float hi = static_cast<float>(kE2M1Doubled[15 - j]) * expectedScale[s];
+            EXPECT_FLOAT_EQ(out[s * 16 + j], lo)
+                    << "low nibble: sub-block " << s << " element " << j;
+            EXPECT_FLOAT_EQ(out[s * 16 + j + 8], hi)
+                    << "high nibble: sub-block " << s << " element " << j + 8;
+        }
+    }
+
+    // Every switch that must know this type: dequantizeBlock, dequantize().
+    float viaSwitch[64];
+    GGMLDequantize::dequantizeBlock(GGML_TYPE_NVFP4, blk, viaSwitch, 64);
+    for (int i = 0; i < 64; ++i) {
+        EXPECT_FLOAT_EQ(viaSwitch[i], out[i]) << "dequantizeBlock mismatch at " << i;
+    }
+    auto vec = GGMLDequantize::dequantize(GGML_TYPE_NVFP4, blk, 64);
+    ASSERT_EQ(vec.size(), 64u);
+    for (int i = 0; i < 64; ++i) {
+        EXPECT_FLOAT_EQ(vec[i], out[i]) << "dequantize() mismatch at " << i;
+    }
+
+    // Fused dot vs a double reference over the exact block values.
+    float x[64];
+    for (int i = 0; i < 64; ++i) {
+        x[i] = 0.01f * static_cast<float>((i * 7) % 13) - 0.05f;
+    }
+    double ref = 0.0;
+    for (int i = 0; i < 64; ++i) {
+        ref += static_cast<double>(x[i]) * out[i];
+    }
+    const float got = GGMLDequantize::dotProductNVFP4(blk, x);
+    std::cout << "  NVFP4 dot=" << got << " ref=" << ref << std::endl;
+    EXPECT_NEAR(got, ref, 1e-5) << "dotProductNVFP4 deviates from double reference";
+}
+
+TEST(DequantizeTest, Q2_0BlockMatchesReferenceLayout) {
+    // block_q2_0: fp16 d + qs[16], four 2-bit codes per byte in element order,
+    // 00=-1 01=0 10=+1 11=+2 (value = (q - 1) * d).
+    uint8_t blk[18] = {};
+    writeFp16(blk, 0.25f);
+    std::memset(blk + 2, 0xE4, 16);// codes per byte, LSB pair first: 0,1,2,3
+
+    float out[64];
+    GGMLDequantize::dequantizeQ2_0Block(blk, out);
+    const float codes[4] = {-0.25f, 0.0f, 0.25f, 0.5f};
+    for (int j = 0; j < 64; ++j) {
+        EXPECT_FLOAT_EQ(out[j], codes[j & 3])
+                << "element " << j << " (byte " << j / 4 << ", code "
+                << (j & 3) << ")";
+    }
+
+    float viaSwitch[64];
+    GGMLDequantize::dequantizeBlock(GGML_TYPE_Q2_0, blk, viaSwitch, 64);
+    for (int i = 0; i < 64; ++i) EXPECT_FLOAT_EQ(viaSwitch[i], out[i]);
+    auto vec = GGMLDequantize::dequantize(GGML_TYPE_Q2_0, blk, 64);
+    ASSERT_EQ(vec.size(), 64u);
+    for (int i = 0; i < 64; ++i) EXPECT_FLOAT_EQ(vec[i], out[i]);
+
+    float x[64];
+    for (int i = 0; i < 64; ++i) x[i] = 0.5f * static_cast<float>((i * 5) % 11) - 2.0f;
+    double ref = 0.0;
+    for (int i = 0; i < 64; ++i) ref += static_cast<double>(x[i]) * out[i];
+    const float got = GGMLDequantize::dotProductQ2_0(blk, x);
+    std::cout << "  Q2_0 dot=" << got << " ref=" << ref << std::endl;
+    EXPECT_NEAR(got, ref, 1e-5) << "dotProductQ2_0 deviates from double reference";
+}
+
+TEST(DequantizeTest, Q1_0BlockMatchesReferenceLayout) {
+    // block_q1_0: fp16 d + qs[16] sign bits, LSB-first per byte; 1 -> +d.
+    uint8_t blk[18] = {};
+    writeFp16(blk, 1.0f);
+    std::memset(blk + 2, 0xAA, 16);// bit k of 0xAA is (k & 1)
+
+    float out[128];
+    GGMLDequantize::dequantizeQ1_0Block(blk, out);
+    for (int j = 0; j < 128; ++j) {
+        const float want = (j & 1) ? 1.0f : -1.0f;
+        EXPECT_FLOAT_EQ(out[j], want) << "element " << j;
+    }
+
+    float viaSwitch[128];
+    GGMLDequantize::dequantizeBlock(GGML_TYPE_Q1_0, blk, viaSwitch, 128);
+    for (int i = 0; i < 128; ++i) EXPECT_FLOAT_EQ(viaSwitch[i], out[i]);
+    auto vec = GGMLDequantize::dequantize(GGML_TYPE_Q1_0, blk, 128);
+    ASSERT_EQ(vec.size(), 128u);
+    for (int i = 0; i < 128; ++i) EXPECT_FLOAT_EQ(vec[i], out[i]);
+
+    float x[128];
+    for (int i = 0; i < 128; ++i) x[i] = 0.1f * static_cast<float>(i % 9);
+    double ref = 0.0;
+    for (int i = 0; i < 128; ++i) ref += static_cast<double>(x[i]) * out[i];
+    const float got = GGMLDequantize::dotProductQ1_0(blk, x);
+    std::cout << "  Q1_0 dot=" << got << " ref=" << ref << std::endl;
+    EXPECT_NEAR(got, ref, 1e-5) << "dotProductQ1_0 deviates from double reference";
+}
+
+TEST(DequantizeTest, MXFP4BlockMatchesReferenceLayout) {
+    // block_mxfp4: E8M0 byte e then qs[16]; element j = kvalues[low nibble of
+    // qs[j]] * 2^(e-128), element j+16 = kvalues[high nibble].
+    uint8_t blk[17] = {};
+    blk[0] = 127;// 2^(127-128) = 0.5 (halved E8M0 form)
+    std::memset(blk + 1, 0xE4, 16);// low nibble 4, high nibble 14
+
+    float out[32];
+    GGMLDequantize::dequantizeMXFP4Block(blk, out);
+    for (int j = 0; j < 16; ++j) {
+        EXPECT_FLOAT_EQ(out[j], static_cast<float>(kE2M1Doubled[4]) * 0.5f)
+                << "low nibble element " << j;
+        EXPECT_FLOAT_EQ(out[j + 16], static_cast<float>(kE2M1Doubled[14]) * 0.5f)
+                << "high nibble element " << j + 16;
+    }
+    EXPECT_FLOAT_EQ(out[0], 2.0f);// 4 * 0.5
+    EXPECT_FLOAT_EQ(out[16], -4.0f);// -8 * 0.5
+
+    float viaSwitch[32];
+    GGMLDequantize::dequantizeBlock(GGML_TYPE_MXFP4, blk, viaSwitch, 32);
+    for (int i = 0; i < 32; ++i) EXPECT_FLOAT_EQ(viaSwitch[i], out[i]);
+    auto vec = GGMLDequantize::dequantize(GGML_TYPE_MXFP4, blk, 32);
+    ASSERT_EQ(vec.size(), 32u);
+    for (int i = 0; i < 32; ++i) EXPECT_FLOAT_EQ(vec[i], out[i]);
+
+    float x[32];
+    for (int i = 0; i < 32; ++i) x[i] = 0.25f * static_cast<float>((i * 3) % 7) - 0.5f;
+    double ref = 0.0;
+    for (int i = 0; i < 32; ++i) ref += static_cast<double>(x[i]) * out[i];
+    const float got = GGMLDequantize::dotProductMXFP4(blk, x);
+    std::cout << "  MXFP4 dot=" << got << " ref=" << ref << std::endl;
+    EXPECT_NEAR(got, ref, 1e-5) << "dotProductMXFP4 deviates from double reference";
+}
+
+TEST(DequantizeTest, F8E4M3DecodeMatchesOCPValues) {
+    // OCP FP8 E4M3: 1 sign + 4 exp (bias 7) + 3 mantissa; subnormal = man/512;
+    // 0x7F/0xFF are NaN; 0x7E is the largest finite value (448).
+    const uint8_t bytes[7] = {0x00, 0x38, 0xB8, 0x01, 0x7E, 0x7F, 0xFF};
+    const float expect[5] = {0.0f, 1.0f, -1.0f, 1.0f / 512.0f, 448.0f};
+
+    for (int i = 0; i < 5; ++i) {
+        float out[1] = {123.0f};
+        GGMLDequantize::dequantizeF8E4M3Block(&bytes[i], out);
+        EXPECT_FLOAT_EQ(out[0], expect[i]) << "byte 0x" << std::hex
+                                           << static_cast<int>(bytes[i]);
+        GGMLDequantize::dequantizeBlock(GGML_TYPE_F8_E4M3, &bytes[i], out, 1);
+        EXPECT_FLOAT_EQ(out[0], expect[i]);
+    }
+    float nanOut[1] = {0.0f};
+    GGMLDequantize::dequantizeF8E4M3Block(&bytes[5], nanOut);
+    EXPECT_TRUE(std::isnan(nanOut[0]));
+    GGMLDequantize::dequantizeF8E4M3Block(&bytes[6], nanOut);
+    EXPECT_TRUE(std::isnan(nanOut[0]));
+
+    auto all = GGMLDequantize::dequantize(GGML_TYPE_F8_E4M3, bytes, 7);
+    ASSERT_EQ(all.size(), 7u);
+    for (int i = 0; i < 5; ++i) EXPECT_FLOAT_EQ(all[i], expect[i]);
+    EXPECT_TRUE(std::isnan(all[5]));
+    EXPECT_TRUE(std::isnan(all[6]));
+}
+
+// ---------------------------------------------------------------------------
+// The AVX2 batch kernels: identical output to the scalar dequantize+dot path
+// for a single token (seqLen=1) and a prefill batch (seqLen=4), over 16 rows
+// and four 64-element blocks per row. This is the contract QuantizedMatrix's
+// dispatch relies on, and 128-expert MoE decode goes through seqLen=1 while
+// prefill goes through seqLen>1.
+// ---------------------------------------------------------------------------
+TEST(DequantizeTest, NVFP4BatchSIMDVsScalarDot) {
+    constexpr uint32_t BLOCK = 64;
+    constexpr uint32_t BLOCKS_PER_ROW = 4;
+    constexpr uint32_t COLS = BLOCK * BLOCKS_PER_ROW;// 256
+    constexpr uint32_t ROWS = 16;
+    std::mt19937 rng(404);
+    std::uniform_int_distribution<int> scaleDist(0x30, 0x40);// finite UE4M3
+    std::uniform_int_distribution<int> byteDist(0, 255);
+
+    std::vector<uint8_t> wQ(ROWS * BLOCKS_PER_ROW * 36);
+    for (uint32_t r = 0; r < ROWS; ++r) {
+        for (uint32_t b = 0; b < BLOCKS_PER_ROW; ++b) {
+            uint8_t *blk = wQ.data() + (r * BLOCKS_PER_ROW + b) * 36;
+            for (int s = 0; s < 4; ++s) blk[s] = static_cast<uint8_t>(scaleDist(rng));
+            for (int i = 0; i < 32; ++i) blk[4 + i] = static_cast<uint8_t>(byteDist(rng));
+        }
+    }
+
+    std::uniform_real_distribution<float> dist(-0.05f, 0.05f);
+    for (uint32_t seq: {1u, 4u}) {
+        std::vector<float> x(static_cast<size_t>(seq) * COLS);
+        for (auto &v: x) v = dist(rng);
+        std::vector<float> out(static_cast<size_t>(seq) * ROWS, -1e30f);
+
+        const bool used = matMulVecBatchNVFP4_SIMD(wQ.data(), x.data(), seq,
+                                                   ROWS, COLS, out.data());
+        ASSERT_TRUE(used) << "NVFP4 AVX2 batch kernel not dispatched";
+
+        double maxAbs = 0.0, maxRef = 0.0;
+        for (uint32_t s = 0; s < seq; ++s) {
+            for (uint32_t r = 0; r < ROWS; ++r) {
+                double ref = 0.0;
+                for (uint32_t b = 0; b < BLOCKS_PER_ROW; ++b) {
+                    float blkOut[BLOCK];
+                    GGMLDequantize::dequantizeNVFP4Block(
+                            wQ.data() + (r * BLOCKS_PER_ROW + b) * 36, blkOut);
+                    for (uint32_t i = 0; i < BLOCK; ++i) {
+                        ref += static_cast<double>(x[static_cast<size_t>(s) * COLS +
+                                                     b * BLOCK + i]) *
+                               blkOut[i];
+                    }
+                }
+                const float got = out[static_cast<size_t>(s) * ROWS + r];
+                maxAbs = std::max(maxAbs,
+                                  std::fabs(static_cast<double>(got) - ref));
+                maxRef = std::max(maxRef, std::fabs(ref));
+            }
+        }
+        std::cout << "  NVFP4 seqLen=" << seq << " maxAbsDiff=" << maxAbs
+                  << " maxRef=" << maxRef << std::endl;
+        const double tol = 1e-3 * std::max(1.0, maxRef) + 1e-4;
+        EXPECT_LT(maxAbs, tol)
+                << "NVFP4 batch kernel deviates from scalar dot at seqLen=" << seq;
+    }
+}
+
+TEST(DequantizeTest, Q2_0BatchSIMDVsScalarDot) {
+    constexpr uint32_t BLOCK = 64;
+    constexpr uint32_t BLOCKS_PER_ROW = 4;
+    constexpr uint32_t COLS = BLOCK * BLOCKS_PER_ROW;// 256
+    constexpr uint32_t ROWS = 16;
+    std::mt19937 rng(505);
+    std::uniform_int_distribution<int> byteDist(0, 255);
+
+    std::vector<uint8_t> wQ(ROWS * BLOCKS_PER_ROW * 18);
+    for (uint32_t r = 0; r < ROWS; ++r) {
+        for (uint32_t b = 0; b < BLOCKS_PER_ROW; ++b) {
+            uint8_t *blk = wQ.data() + (r * BLOCKS_PER_ROW + b) * 18;
+            writeFp16(blk, 0.01f * static_cast<float>(1 + (r + b) % 5));
+            for (int i = 0; i < 16; ++i) blk[2 + i] = static_cast<uint8_t>(byteDist(rng));
+        }
+    }
+
+    std::uniform_real_distribution<float> dist(-0.05f, 0.05f);
+    for (uint32_t seq: {1u, 4u}) {
+        std::vector<float> x(static_cast<size_t>(seq) * COLS);
+        for (auto &v: x) v = dist(rng);
+        std::vector<float> out(static_cast<size_t>(seq) * ROWS, -1e30f);
+
+        const bool used = matMulVecBatchQ2_0_SIMD(wQ.data(), x.data(), seq,
+                                                  ROWS, COLS, out.data());
+        ASSERT_TRUE(used) << "Q2_0 AVX2 batch kernel not dispatched";
+
+        double maxAbs = 0.0, maxRef = 0.0;
+        for (uint32_t s = 0; s < seq; ++s) {
+            for (uint32_t r = 0; r < ROWS; ++r) {
+                double ref = 0.0;
+                for (uint32_t b = 0; b < BLOCKS_PER_ROW; ++b) {
+                    float blkOut[BLOCK];
+                    GGMLDequantize::dequantizeQ2_0Block(
+                            wQ.data() + (r * BLOCKS_PER_ROW + b) * 18, blkOut);
+                    for (uint32_t i = 0; i < BLOCK; ++i) {
+                        ref += static_cast<double>(x[static_cast<size_t>(s) * COLS +
+                                                     b * BLOCK + i]) *
+                               blkOut[i];
+                    }
+                }
+                const float got = out[static_cast<size_t>(s) * ROWS + r];
+                maxAbs = std::max(maxAbs,
+                                  std::fabs(static_cast<double>(got) - ref));
+                maxRef = std::max(maxRef, std::fabs(ref));
+            }
+        }
+        std::cout << "  Q2_0 seqLen=" << seq << " maxAbsDiff=" << maxAbs
+                  << " maxRef=" << maxRef << std::endl;
+        const double tol = 1e-3 * std::max(1.0, maxRef) + 1e-4;
+        EXPECT_LT(maxAbs, tol)
+                << "Q2_0 batch kernel deviates from scalar dot at seqLen=" << seq;
+    }
+}
+
+// ===========================================================================
+// IQ1_S (type 19) and IQ1_M (type 29): 1-bit super-blocks.
+//
+// Expected values are derived BY HAND from the upstream dequantizers and from
+// the first four iq1s_grid entries, which are written out below as int8 rows
+// (little-endian byte order of the uint64 entries):
+//   grid[0] = 0xffffffffffffffff -> {-1,-1,-1,-1,-1,-1,-1,-1}
+//   grid[1] = 0xffffffffffffff01 -> {+1,-1,-1,-1,-1,-1,-1,-1}
+//   grid[2] = 0xffffffffffff0000 -> { 0, 0,-1,-1,-1,-1,-1,-1}
+//   grid[3] = 0xffffffffffff01ff -> {-1,+1,-1,-1,-1,-1,-1,-1}
+// ===========================================================================
+namespace {
+    constexpr int8_t kIQ1SFirstGrids[4][8] = {
+            {-1, -1, -1, -1, -1, -1, -1, -1},
+            {1, -1, -1, -1, -1, -1, -1, -1},
+            {0, 0, -1, -1, -1, -1, -1, -1},
+            {-1, 1, -1, -1, -1, -1, -1, -1}};
+}
+
+TEST(DequantizeTest, IQ1_SBlockMatchesReferenceLayout) {
+    // 50-byte block: fp16 d, qs[32], qh[8] uint16 (little-endian).
+    // Block A: d=0.5, qh all 0 -> per group dl = d, delta = +0.125, and group 0
+    // uses grid indices 0..3 (qs[0..3]); every other group uses index 0.
+    uint8_t blk[50] = {};
+    writeFp16(blk, 0.5f);
+    blk[2 + 0] = 0;
+    blk[2 + 1] = 1;
+    blk[2 + 2] = 2;
+    blk[2 + 3] = 3;
+
+    float out[256];
+    GGMLDequantize::dequantizeIQ1_SBlock(blk, out);
+    float outA[256];
+    std::memcpy(outA, out, sizeof(outA));
+    for (int ib = 0; ib < 8; ++ib) {
+        for (int l = 0; l < 4; ++l) {
+            for (int j = 0; j < 8; ++j) {
+                const int gridVal = (ib == 0) ? kIQ1SFirstGrids[l][j] : -1;
+                const float want = 0.5f * (static_cast<float>(gridVal) + 0.125f);
+                EXPECT_FLOAT_EQ(out[ib * 32 + l * 8 + j], want)
+                        << "ib=" << ib << " l=" << l << " j=" << j;
+            }
+        }
+    }
+
+    // Block B: d=1.0, qh[0] = 0xD000 -> dl = 1*(2*5+1) = 11 and a NEGATIVE
+    // delta (bit 15); index bits are 0, so grid[0] all -1. Every other group
+    // has qh=0 -> dl = 1, delta = +0.125.
+    uint8_t blkB[50] = {};
+    writeFp16(blkB, 1.0f);
+    blkB[34] = 0x00;// qh[0] low byte
+    blkB[35] = 0xD0;// qh[0] high byte: bit15 sign, bits12-14 = 5
+    GGMLDequantize::dequantizeIQ1_SBlock(blkB, out);
+    for (int j = 0; j < 32; ++j) {
+        EXPECT_FLOAT_EQ(out[j], 11.0f * (-1.0f - 0.125f)) << "j=" << j;
+    }
+    for (int j = 32; j < 256; ++j) {
+        EXPECT_FLOAT_EQ(out[j], 1.0f * (-1.0f + 0.125f)) << "j=" << j;
+    }
+
+    // Switch and vector entry points agree with the block function.
+    float viaSwitch[256];
+    GGMLDequantize::dequantizeBlock(GGML_TYPE_IQ1_S, blk, viaSwitch, 256);
+    for (int i = 0; i < 256; ++i) EXPECT_FLOAT_EQ(viaSwitch[i], outA[i]);
+    auto vec = GGMLDequantize::dequantize(GGML_TYPE_IQ1_S, blk, 256);
+    ASSERT_EQ(vec.size(), 256u);
+    for (int i = 0; i < 256; ++i) EXPECT_FLOAT_EQ(vec[i], outA[i]);
+
+    // Fused dot vs a double reference over the dequantized block.
+    float x[256];
+    for (int i = 0; i < 256; ++i) {
+        x[i] = 0.01f * static_cast<float>((i * 7) % 23) - 0.1f;
+    }
+    GGMLDequantize::dequantizeIQ1_SBlock(blkB, out);
+    double ref = 0.0;
+    for (int i = 0; i < 256; ++i) ref += static_cast<double>(x[i]) * out[i];
+    const float got = GGMLDequantize::dotProductIQ1_S(blkB, x);
+    std::cout << "  IQ1_S dot=" << got << " ref=" << ref << std::endl;
+    EXPECT_NEAR(got, ref, 1e-5) << "dotProductIQ1_S deviates from double reference";
+}
+
+TEST(DequantizeTest, IQ1_MBlockMatchesReferenceLayout) {
+    // 56-byte block: qs[32] + qh[16] + scales[8] (four uint16 words).
+    // Scale words chosen so the assembled fp16 super-scale is 0x3C00 (= 1.0):
+    //   (sc0>>12) | ((sc1>>8)&0x00f0) | ((sc2>>4)&0x0f00) | (sc3&0xf000)
+    //   = 0 | 0 | 0x0C00 | 0x3000 = 0x3C00.
+    // sc0 also carries the group scales: bits 0-2 = 2 -> dl1 = 5,
+    // bits 3-5 = 4 -> dl2 = 9, bits 6-8 = 1 -> dl1 = 3, bits 9-11 = 6 ->
+    // dl2 = 13 for groups 0 and 1; groups 2..7 get scale 0 -> dl = 1.
+    // qh[0] = 0x08 (negative delta for l=0), qh[1] = 0x80 (negative delta for
+    // l=3), all indices 0 -> grid[0] = all -1.
+    uint8_t blk[56] = {};
+    const uint16_t sc[4] = {0x0C62, 0x0000, 0xC000, 0x3000};
+    for (int i = 0; i < 4; ++i) {
+        std::memcpy(blk + 48 + 2 * i, &sc[i], sizeof(uint16_t));
+    }
+    blk[32] = 0x08;// qh[0]
+    blk[33] = 0x80;// qh[1]
+
+    float out[256];
+    GGMLDequantize::dequantizeIQ1_MBlock(blk, out);
+    const float expect[32] = {
+            // ib=0: l0 dl1=5 delta=-, l1 dl1=5 delta=+, l2 dl2=9 delta=+, l3 dl2=9 delta=-
+            -5.625f, -4.375f, -7.875f, -10.125f,
+            // ib=1: l0,l1 dl1=3; l2,l3 dl2=13; all delta=+
+            -2.625f, -2.625f, -11.375f, -11.375f};
+    for (int l = 0; l < 4; ++l) {
+        for (int j = 0; j < 8; ++j) {
+            EXPECT_FLOAT_EQ(out[l * 8 + j], expect[l]) << "ib=0 l=" << l << " j=" << j;
+            EXPECT_FLOAT_EQ(out[32 + l * 8 + j], expect[4 + l])
+                    << "ib=1 l=" << l << " j=" << j;
+        }
+    }
+    for (int j = 64; j < 256; ++j) {
+        EXPECT_FLOAT_EQ(out[j], -0.875f) << "j=" << j;
+    }
+
+    float viaSwitch[256];
+    GGMLDequantize::dequantizeBlock(GGML_TYPE_IQ1_M, blk, viaSwitch, 256);
+    for (int i = 0; i < 256; ++i) EXPECT_FLOAT_EQ(viaSwitch[i], out[i]);
+    auto vec = GGMLDequantize::dequantize(GGML_TYPE_IQ1_M, blk, 256);
+    ASSERT_EQ(vec.size(), 256u);
+    for (int i = 0; i < 256; ++i) EXPECT_FLOAT_EQ(vec[i], out[i]);
+
+    float x[256];
+    for (int i = 0; i < 256; ++i) {
+        x[i] = 0.02f * static_cast<float>((i * 5) % 17) - 0.15f;
+    }
+    double ref = 0.0;
+    for (int i = 0; i < 256; ++i) ref += static_cast<double>(x[i]) * out[i];
+    const float got = GGMLDequantize::dotProductIQ1_M(blk, x);
+    std::cout << "  IQ1_M dot=" << got << " ref=" << ref << std::endl;
+    EXPECT_NEAR(got, ref, 1e-5) << "dotProductIQ1_M deviates from double reference";
+}
+
+// ---------------------------------------------------------------------------
+// IQ1_S AVX2 batch kernel: 16 rows x 2 blocks x 256 weights, seqLen 1 and 4.
+// Random qs/qh exercise every grid index in 0..2047; the reference dequantizes
+// through the same block function the scalar path uses, so this isolates the
+// kernel's indexing and per-token accumulator layout.
+// ---------------------------------------------------------------------------
+TEST(DequantizeTest, IQ1SBatchSIMDVsScalarDot) {
+    constexpr uint32_t BLOCK = 256;
+    constexpr uint32_t BLOCKS_PER_ROW = 2;
+    constexpr uint32_t COLS = BLOCK * BLOCKS_PER_ROW;// 512
+    constexpr uint32_t ROWS = 16;
+    std::mt19937 rng(606);
+    std::uniform_int_distribution<int> byteDist(0, 255);
+
+    std::vector<uint8_t> wQ(ROWS * BLOCKS_PER_ROW * 50);
+    for (uint32_t r = 0; r < ROWS; ++r) {
+        for (uint32_t b = 0; b < BLOCKS_PER_ROW; ++b) {
+            uint8_t *blk = wQ.data() + (r * BLOCKS_PER_ROW + b) * 50;
+            writeFp16(blk, 0.01f * static_cast<float>(1 + (r + b) % 5));
+            for (int i = 0; i < 48; ++i) blk[2 + i] = static_cast<uint8_t>(byteDist(rng));
+        }
+    }
+
+    std::uniform_real_distribution<float> dist(-0.05f, 0.05f);
+    for (uint32_t seq: {1u, 4u}) {
+        std::vector<float> x(static_cast<size_t>(seq) * COLS);
+        for (auto &v: x) v = dist(rng);
+        std::vector<float> out(static_cast<size_t>(seq) * ROWS, -1e30f);
+
+        const bool used = matMulVecBatchIQ1S_SIMD(wQ.data(), x.data(), seq,
+                                                  ROWS, COLS, out.data());
+        ASSERT_TRUE(used) << "IQ1_S AVX2 batch kernel not dispatched";
+
+        double maxAbs = 0.0, maxRef = 0.0;
+        for (uint32_t s = 0; s < seq; ++s) {
+            for (uint32_t r = 0; r < ROWS; ++r) {
+                double ref = 0.0;
+                for (uint32_t b = 0; b < BLOCKS_PER_ROW; ++b) {
+                    float blkOut[BLOCK];
+                    GGMLDequantize::dequantizeIQ1_SBlock(
+                            wQ.data() + (r * BLOCKS_PER_ROW + b) * 50, blkOut);
+                    for (uint32_t i = 0; i < BLOCK; ++i) {
+                        ref += static_cast<double>(x[static_cast<size_t>(s) * COLS +
+                                                     b * BLOCK + i]) *
+                               blkOut[i];
+                    }
+                }
+                const float got = out[static_cast<size_t>(s) * ROWS + r];
+                maxAbs = std::max(maxAbs,
+                                  std::fabs(static_cast<double>(got) - ref));
+                maxRef = std::max(maxRef, std::fabs(ref));
+            }
+        }
+        std::cout << "  IQ1_S seqLen=" << seq << " maxAbsDiff=" << maxAbs
+                  << " maxRef=" << maxRef << std::endl;
+        const double tol = 1e-3 * std::max(1.0, maxRef) + 1e-4;
+        EXPECT_LT(maxAbs, tol)
+                << "IQ1_S batch kernel deviates from scalar dot at seqLen=" << seq;
+    }
 }

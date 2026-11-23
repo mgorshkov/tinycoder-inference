@@ -111,12 +111,16 @@ TEST(GGUFMetadataTest, LoadMetadata) {
     EXPECT_GT(cfg.numKVHeads, 0);
     EXPECT_GT(cfg.vocabSize, 0);
     if (cfg.architecture == ARCH_QWEN35 ||
-        cfg.architecture == ARCH_QWEN35MOE) {
-        // Both the Qwen35 (Qwen3.8) dense and the Qwen35MoE (Qwen3.6-35B-A3B)
-        // hybrids declare explicit per-head dims via attention.key_length /
-        // attention.value_length (256 for 27B / 35B-A3B).  headDim is the
-        // explicit key length, NOT hiddenSize/numAttentionHeads (5120/24 =
-        // 213.33 and 2048/16 = 128 would both be wrong).
+        cfg.architecture == ARCH_QWEN35MOE ||
+        cfg.architecture == ARCH_INKLING2 ||
+        cfg.architecture == ARCH_INKLING2_LOOP) {
+        // Qwen35 (Qwen3.8) dense, Qwen35MoE (Qwen3.6-35B-A3B) and Inkling-2-Mini
+        // all declare explicit per-head dims via attention.key_length /
+        // attention.value_length.  headDim is the explicit key length, NOT
+        // hiddenSize/numAttentionHeads: 5120/24 = 213.33 and 2048/16 = 128 would
+        // both be wrong for qwen35, and Inkling-2-Mini is 2304 hidden with 24
+        // heads of 128 (3072 > 2304, i.e. attention widens the head, so the
+        // division is 96 and wrong by 25%).
         EXPECT_EQ(cfg.headDim, cfg.attentionKeyLength);
         EXPECT_EQ(cfg.attentionKeyLength, cfg.attentionValueLength);
     }
@@ -150,7 +154,13 @@ TEST(GGUFMetadataTest, LoadMetadata) {
             EXPECT_EQ(cfg.ssmInnerSize, 4096u);
             EXPECT_EQ(cfg.ssmTimeStepRank, 32u);
         }
-    } else if (cfg.architecture != ARCH_QWEN35MOE) {
+    } else if (cfg.architecture != ARCH_QWEN35MOE &&
+               cfg.architecture != ARCH_INKLING2 &&
+               cfg.architecture != ARCH_INKLING2_LOOP) {
+        // Architectures with no explicit per-head declaration: the head width is
+        // hiddenSize/numAttentionHeads by definition.  Qwen35MoE and the two
+        // Inkling layouts are excluded because they declare key_length, which is
+        // asserted above instead.
         EXPECT_EQ(cfg.headDim, cfg.hiddenSize / cfg.numAttentionHeads);
     }
 }
@@ -654,8 +664,16 @@ TEST_P(SampleQuestionTest, AnswersQuestion) {
     // that gets a benchmark row must be added here in the same change.
     const bool isOrnith9B = (cfg.architecture == ARCH_QWEN35 &&
                              cfg.hiddenSize == 4096 && cfg.numLayers == 32);
+    // Inkling-2-Mini (looped MoE, 24 physical blocks, hidden 2304).  It answers
+    // the same content-based question ("What is the capital of France?" ->
+    // "The capital of France is Paris."), so it joins the gate instead of
+    // silently skipping the only checkpoint in its benchmark row.
+    const bool isInkling = ((cfg.architecture == ARCH_INKLING2 ||
+                             cfg.architecture == ARCH_INKLING2_LOOP) &&
+                            cfg.hiddenSize == 2304 && cfg.numLayers == 24);
     if (!isGptQwen025B && !isQwen25Coder7B && !isQwen25Coder15B &&
-        !isQwen3527B && !isBonsai && !isQwen35MoE && !isOrnith9B) {
+        !isQwen3527B && !isBonsai && !isQwen35MoE && !isOrnith9B &&
+        !isInkling) {
         GTEST_SKIP() << "generation keyword assertions validated against the "
                         "IQ3_XXS Qwen2-0.5B and Qwen2.5-Coder-7B reference "
                         "models plus the Qwen3.6-27B (qwen35) model; loaded "
@@ -673,7 +691,8 @@ TEST_P(SampleQuestionTest, AnswersQuestion) {
     const uint32_t maxGenTokens =
             isQwen25Coder7B ? 96u
                             : (isOrnith9B ? 384u
-                                          : ((isQwen3527B || isBonsai || isQwen35MoE)
+                                          : ((isQwen3527B || isBonsai || isQwen35MoE ||
+                                              isInkling)
                                                      ? 160u
                                                      : 64u));
 

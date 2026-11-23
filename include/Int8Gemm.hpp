@@ -78,6 +78,28 @@ namespace tinycoder::gpu {
     bool int8Gemv(int type, const void *w, const float *x, float *out,
                   uint32_t seqLen, uint32_t rows, uint32_t cols, void *stream);
 
+    /// @brief Expert-indexed quantized mat-vec: rowsPer*nUsed output rows in one
+    ///        launch, each expert's weight block reached through `idx` (a device
+    ///        array of expert ids).  This is the routed-MoE decode path; the
+    ///        routing decision never leaves the device.
+    /// @param rowsPer  weight rows per expert (2*ff for gate/up, ff for down).
+    /// @param xStride  per-expert activation stride in floats: 0 when every
+    ///                 expert reads the same row (gate/up), `cols` when the
+    ///                 rows are contiguous (down).  Other values are refused.
+    /// @return false for unsupported types/strides; the caller falls back to
+    ///         the float expert decoders.
+    bool int8GemvExpert(int type, const void *w, const float *x, float *out,
+                        uint32_t rowsPer, uint32_t cols, const int32_t *idx,
+                        uint32_t nUsed, uint32_t xStride, void *stream);
+
+    /// @brief Gate/up variant of int8GemvExpert: four output rows per warp over
+    ///        one shared Q8_1 activation row.  Serves IQ2_XXS / IQ2_XS /
+    ///        IQ2_S / IQ1_S only; the prefill path keeps the one-row kernel,
+    ///        so this changes decode arithmetic only.
+    bool int8GemvExpert4(int type, const void *w, const float *x, float *out,
+                         uint32_t rowsPer, uint32_t cols, const int32_t *idx,
+                         uint32_t nUsed, void *stream);
+
     /// @brief Pre-allocate the GEMV activation scratch (no launch).  Required
     ///        before a CUDA graph capture: cudaMalloc is not capturable.
     void int8GemvReserve(uint32_t cols, uint32_t seqLen);

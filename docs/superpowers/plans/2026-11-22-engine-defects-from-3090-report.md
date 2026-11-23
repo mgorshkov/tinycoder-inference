@@ -11,14 +11,14 @@
 **Spec:** the 2026-11-20 RTX 3090 recheck report from the eva-brain stand
 (received 2026-11-22; **not published in this repository**). Sections 4 and 6
 are the defect list; §5.5 is the affected measurements. The numbers it
-reported are transcribed in `benchmarks/BENCHMARKS-3090.md` §1.1, which is
+reported are transcribed in `benchmarks/gpu/BENCHMARKS-3090.md` §1.1, which is
 the in-repo record.
 
 ## Global Constraints
 
 - Reference box: RTX 2080 Ti, sm_75, build dir `build-1.0`. Build the core explicitly: `cmake --build build-1.0 --target tinycoder_core <tools> -j 20`; check the exit code, never a grep window.
 - Every change to a compute path ends with the gates in `AGENTS.md`: `tinycoder_test` (0 failed), `exl3_gpu_parity` (0 `[FAIL]`, 10 `[SKIP]`), `int8_gemm_parity` and `gemv_decode_parity` on `Ornith-1.5-9B-Q4_K_M`, the 27B logits probe (`id=198`, 19.3090 ±2e-3), and `./scripts/text_gate.sh` (all rows pass).
-- A published benchmark row must have a passing text gate on the same tree and checkpoint (`benchmarks/BENCHMARKS-3090.md` §2). No row may be published from a run with a non-zero fallback counter.
+- A published benchmark row must have a passing text gate on the same tree and checkpoint (`benchmarks/gpu/BENCHMARKS-3090.md` §2). No row may be published from a run with a non-zero fallback counter.
 - `-lineinfo` stays off (default). New `.cu` files compile for 75;80;86 unless a task says otherwise.
 - Commit messages: short, change-oriented, no measured numbers (see `AGENTS.md` → Versioning).
 

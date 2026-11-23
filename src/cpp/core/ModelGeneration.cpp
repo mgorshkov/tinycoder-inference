@@ -74,6 +74,29 @@ namespace tinycoder {
         // clarification request instead of the code. This is the same failure
         // mode documented for ARCH_QWEN2 below. Correct generation wins over
         // token-count parity with the reference CLI.
+        // Inkling-2-Mini: <|message_*|><|content_text|>...<|end_message|>.
+        // The template always emits a thinking-effort system turn before the
+        // first non-system message; 0.9 is the checkpoint's default.
+        if (config_.architecture == ARCH_INKLING2 ||
+            config_.architecture == ARCH_INKLING2_LOOP) {
+            std::string result =
+                    "<|message_system|><|content_text|>Thinking effort level: "
+                    "0.9<|end_message|>";
+            for (const auto &msg: messages) {
+                const std::string tok =
+                        msg.first == "system"   ? "<|message_system|>"
+                        : msg.first == "assistant" ? "<|message_model|>"
+                        : msg.first == "tool"      ? "<|message_tool|>"
+                                                   : "<|message_user|>";
+                result += tok + "<|content_text|>" + msg.second +
+                          "<|end_message|>";
+            }
+            if (addGenerationPrompt) {
+                result += "<|message_model|>";
+            }
+            return result;
+        }
+
         if (config_.architecture == ARCH_QWEN35 || config_.architecture == ARCH_QWEN35MOE) {
             std::string result;
             for (const auto &msg: messages) {

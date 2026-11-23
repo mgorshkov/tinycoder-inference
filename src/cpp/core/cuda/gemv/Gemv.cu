@@ -3083,6 +3083,36 @@ vec_dot_q8_0_q8_1(const void *__restrict__ vbq,
                                                       __low2half(bq8_1->ds));
 }
 
+// ---------------------------------------------------------------------------
+// Q2_0 with Q8_1 activations: 18 B per 64 weights (fp16 d, 16 B of 2-bit
+// codes), value = d*(code-1).  The zero point folds into the weight value, so
+// the integer dot needs no separate sum term.  The generic GEMV loop is
+// indexed in 32-weight units, so this treats the 64-weight block as two
+// virtual halves and maps kbx -> (block, half) here.
+#define QK2_0 32
+#define QI2_0 8
+#define VDR_Q2_0_Q8_1_GEMV 1
+typedef struct {
+    half d;
+    uint8_t qs[16];
+} block_q2_0;
+
+static __device__ __forceinline__ float
+vec_dot_q2_0_q8_1(const void *__restrict__ vbq,
+                  const block_q8_1 *__restrict__ bq8_1, const int &kbx,
+                  const int &iqs) {
+    const uint8_t *blk = static_cast<const uint8_t *>(vbq) + (kbx >> 1) * 18;
+    const int half = kbx & 1;
+    const float d = __half2float(*reinterpret_cast<const __half *>(blk));
+    const uint8_t b = blk[2 + half * 8 + iqs];// 4 weights, iqs in [0, 8)
+    const int v = static_cast<int>((uint32_t(int(b & 3) - 1) & 0xFFu) |
+                                   ((uint32_t(int((b >> 2) & 3) - 1) & 0xFFu) << 8) |
+                                   ((uint32_t(int((b >> 4) & 3) - 1) & 0xFFu) << 16) |
+                                   ((uint32_t(int((b >> 6) & 3) - 1) & 0xFFu) << 24));
+    const int u = get_int_from_int8_aligned(bq8_1->qs, iqs);
+    return d * __low2float(bq8_1->ds) * float(tc_dp4a(v, u, 0));
+}
+
 static __device__ __forceinline__ float
 vec_dot_q2_K_q8_1(const void *__restrict__ vbq,
                   const block_q8_1 *__restrict__ bq8_1, const int &kbx,
@@ -3306,6 +3336,56 @@ static __device__ void gemvCoreImpl(
                     (dst_t) tmp[j][threadIdx.x];
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Expert-indexed mat-vec: the same one-row-per-block / four-warps-per-row shape
+// as gemvCoreImpl<ncols_dst = 1>, but the weight row is reached through a
+// device-side expert index so a routed-MoE GEMV needs no host sync.
+//
+//   output row r  ->  expert u = r / rowsPer, local row rr = r % rowsPer
+//   weight row    ->  rowIdx[u] * rowsPer + rr
+//   activation    ->  y + u * stride_col_y   (0 when all experts share one row)
+//
+// rowsPer*nUsed output rows are produced in one launch, which is what the
+// Inkling routed experts need: gate/up writes 2*ff rows per expert, down writes
+// ff, and the routing decision never leaves the device.
+template<typename dst_t, int qk, int qi, typename block_q_t, int vdr,
+         vec_dot_q_cuda_t vec_dot_q_cuda>
+static __device__ void gemvExpertCoreImpl(
+        const void *__restrict__ vx, const block_q8_1 *__restrict__ y,
+        dst_t *__restrict__ dst, const int ncols_x, const int nrows_x,
+        const int stride_col_y, const int *__restrict__ rowIdx,
+        const int rowsPer) {
+    constexpr int nwarps = 4;
+    const int outRow = blockIdx.x;
+    if (outRow >= nrows_x) return;
+    const int u = outRow / rowsPer;
+    const int rr = outRow - u * rowsPer;
+    const int row = rowIdx[u] * rowsPer + rr;
+    const int tid = WARP_SIZE * threadIdx.y + threadIdx.x;
+    const int blocks_per_row_x = ncols_x / qk;
+    constexpr int blocks_per_iter = vdr * nwarps * WARP_SIZE / qi;
+    const block_q8_1 *yv = y + (size_t) u * stride_col_y;
+
+    float tmp = 0.0f;
+    for (int kbx = tid / (qi / vdr); kbx < blocks_per_row_x;
+         kbx += blocks_per_iter) {
+        const int kby = kbx * (qk / QK8_1);
+        const int kqs = vdr * (tid % (qi / vdr));
+        tmp += vec_dot_q_cuda(vx, &yv[kby], row * blocks_per_row_x + kbx, kqs);
+    }
+
+    __shared__ float red[nwarps][WARP_SIZE];
+    red[threadIdx.y][threadIdx.x] = tmp;
+    __syncthreads();
+    if (threadIdx.y != 0) return;
+    float acc = red[0][threadIdx.x];
+#pragma unroll
+    for (int l = 1; l < nwarps; ++l)
+        acc += red[l][threadIdx.x];
+    acc = warp_reduce_sum_f32(acc);
+    if (threadIdx.x == 0) dst[outRow] = (dst_t) acc;
 }
 
 // ---------------------------------------------------------------------------
@@ -3809,6 +3889,41 @@ GEMV_LAUNCHER_PLAIN(IQ2S, F32, float)
 GEMV_LAUNCHER_PLAIN(IQ2XS, F32, float)
 GEMV_LAUNCHER_PLAIN(IQ3S, F32, float)
 GEMV_LAUNCHER_PLAIN(IQ3XXS, F32, float)
+
+// Expert-indexed entries and their host launchers.  One kernel per type, one
+// launch for all selected experts; the expert ids stay on the device.
+
+#define GEMV_EXPERT_ENTRY(tag, block_q_t, qk_val, qi_val, vdr_val, vec_dot)     \
+    extern "C" __global__ void gemvExpert##tag##F32(                            \
+            const void *__restrict__ vx, const void *__restrict__ vy,           \
+            float *__restrict__ dst, const int ncols_x, const int nrows_x,      \
+            const int stride_col_y, const int *__restrict__ rowIdx,             \
+            const int rowsPer) {                                                \
+        gemvExpertCoreImpl<float, qk_val, qi_val, block_q_t, vdr_val, vec_dot>( \
+                vx, (const block_q8_1 *) vy, dst, ncols_x, nrows_x,             \
+                stride_col_y, rowIdx, rowsPer);                                 \
+    }                                                                           \
+    extern "C" void gemvLaunchExpert##tag(                                      \
+            const void *vx, const void *vy, void *dst, int ncols_x,             \
+            int nrows_x, int stride_col_y, const int *rowIdx, int rowsPer,      \
+            void *stream) {                                                     \
+        dim3 grid((unsigned int) nrows_x, 1, 1);                                \
+        dim3 block(WARP_SIZE, 4, 1);                                            \
+        gemvExpert##tag##F32<<<grid, block, 0,                                  \
+                              static_cast<cudaStream_t>(stream)>>>(             \
+                vx, vy, (float *) dst, ncols_x, nrows_x, stride_col_y, rowIdx,  \
+                rowsPer);                                                       \
+    }
+
+GEMV_EXPERT_ENTRY(Q4K, block_q4_K, QK_K, QI4_K, VDR_Q4_K_Q8_1_GEMV, vec_dot_q4_K_q8_1)
+GEMV_EXPERT_ENTRY(Q5K, block_q5_K, QK_K, QI5_K, VDR_Q5_K_Q8_1_GEMV, vec_dot_q5_K_q8_1)
+GEMV_EXPERT_ENTRY(Q6K, block_q6_K, QK_K, QI6_K, VDR_Q6_K_Q8_1_GEMV, vec_dot_q6_K_q8_1)
+GEMV_EXPERT_ENTRY(Q80, block_q8_0, QK8_0, QI8_0, VDR_Q8_0_Q8_1_GEMV, vec_dot_q8_0_q8_1)
+GEMV_EXPERT_ENTRY(IQ2S, block_iq2_s, QK_K, QI2_S, VDR_IQ2_S_Q8_1_GEMV, vec_dot_iq2_s_q8_1)
+GEMV_EXPERT_ENTRY(IQ2XS, block_iq2_xs, QK_K, QI2_XS, VDR_IQ2_XS_Q8_1_GEMV, vec_dot_iq2_xs_q8_1)
+GEMV_EXPERT_ENTRY(IQ3S, block_iq3_s, QK_K, QI3_S, VDR_IQ3_S_Q8_1_GEMV, vec_dot_iq3_s_q8_1)
+GEMV_EXPERT_ENTRY(IQ3XXS, block_iq3_xxs, QK_K, QI3_XXS, VDR_IQ3_XXS_Q8_1_GEMV, vec_dot_iq3_xxs_q8_1)
+GEMV_EXPERT_ENTRY(Q20, block_q2_0, QK2_0, QI2_0, VDR_Q2_0_Q8_1_GEMV, vec_dot_q2_0_q8_1)
 
 // Quantize launchers.
 

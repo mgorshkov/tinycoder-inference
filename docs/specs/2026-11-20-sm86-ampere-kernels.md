@@ -2,7 +2,7 @@
 
 Status: draft for approval, 2026-11-20.
 Scope owner: this design covers the GPU compute paths of every row published in
-`benchmarks/BENCHMARKS-2080TI.md`, and produces the first column of `benchmarks/BENCHMARKS-3090.md`. It is
+`benchmarks/gpu/BENCHMARKS-2080TI.md`, and produces the first column of `benchmarks/gpu/BENCHMARKS-3090.md`. It is
 written to be planned from without further questions to the author; the decisions that
 were open are recorded in §12.
 
@@ -12,7 +12,7 @@ An external user reproduced our `GPU comparison: tinycoder vs llama.cpp / exllam
 table on an RTX 3090 and reported three things that do not fit "the numbers scale
 with bandwidth":
 
-| row | our 2080 Ti (`benchmarks/BENCHMARKS-2080TI.md`) | their 3090 | ratio |
+| row | our 2080 Ti (`benchmarks/gpu/BENCHMARKS-2080TI.md`) | their 3090 | ratio |
 |---|---|---|---|
 | Qwen3.8-27B EXL3 decode | 23.60 tok/s | 26.6 tok/s | **1.13x** (bandwidth ratio 1.52x) |
 | Qwen3.8-27B EXL3 decode, exllamav3 | 23.76 tok/s | 54.0 tok/s | 2.27x |
@@ -44,13 +44,13 @@ k32 int8 MMA, 16 KB more smem per block, 48 warps/SM) and moves the bottleneck f
 "bytes/sec per SM" to "warps in flight per SM". The work below is to take those
 options per kernel family, not to rescale tile sizes.
 
-## 1. The list — scope is exactly the `benchmarks/BENCHMARKS-2080TI.md` table
+## 1. The list — scope is exactly the `benchmarks/gpu/BENCHMARKS-2080TI.md` table
 
 The supported set is the nine rows of the GPU comparison table, and nothing else. No
 other checkpoint in `/data/models` is in scope; models that the engine supports but the
 table does not publish stay on their current path and only have to not regress.
 
-| # | row (`benchmarks/BENCHMARKS-2080TI.md`) | quant type(s) | GPU mode | prefill kernel | decode kernel |
+| # | row (`benchmarks/gpu/BENCHMARKS-2080TI.md`) | quant type(s) | GPU mode | prefill kernel | decode kernel |
 |---|---|---|---|---|---|
 | 1 | Qwen2.5-Coder-1.5B | `q2_k` | full offload | `xW4` int8 GEMM | `kQGemvQ2KxW4_Nm` / `GpuGemvQ2KFused` |
 | 2 | Qwen2.5-Coder-1.5B | `iq3_xxs` | full offload | IQ int8 GEMM | `GpuGemvIQInt8` / `GpuGemvIQ` |
@@ -529,7 +529,7 @@ rather than silently omitting the pass.
 7. run the staged trace (`TINYCODER_STAGE_TRACE=1`) on one model **first**, before any
    tuning conclusion is drawn: if the external report's 4x decode gap is real, this names
    the stage it lives in, and it is the cheapest thing on the card to run;
-8. emit a markdown fragment in `benchmarks/BENCHMARKS-3090.md`'s column format, with the clock and
+8. emit a markdown fragment in `benchmarks/gpu/BENCHMARKS-3090.md`'s column format, with the clock and
    memory temperature recorded.
 
 Two things the dry run already established, worth stating before the card arrives:
@@ -551,7 +551,7 @@ Two things the dry run already established, worth stating before the card arrive
 | 0 | every listed kernel passes `arch_check.py` on 75/80/86; build exit 0 |
 | 1 | parity 29 failures; logits `198` + same top-5; text gate green on every checkpoint; suite 113/96/0 |
 | 2 | predicted 3090 numbers written into the design's table before the hour, per row |
-| 3 | on the 3090: decode ≥ 70% of the measured memory roof per row, prefill ≥ 55% of the measured int8 roof, gates green, no silent fallback counter; the numbers land in `benchmarks/BENCHMARKS-3090.md` |
+| 3 | on the 3090: decode ≥ 70% of the measured memory roof per row, prefill ≥ 55% of the measured int8 roof, gates green, no silent fallback counter; the numbers land in `benchmarks/gpu/BENCHMARKS-3090.md` |
 
 ## 10. Order of work
 
@@ -583,7 +583,7 @@ Each stage is independently shippable and independently gated.
 1. **Approach B** — per-family Ampere kernels — with the staging primitive from A shared
    between prefill GEMM and the EXL3 fused kernel. (§6)
 2. **Benchmarks are per card.** The existing table was renamed
-   `benchmarks/BENCHMARKS-2080TI.md` and a sibling `benchmarks/BENCHMARKS-3090.md` was created, empty by
+   `benchmarks/gpu/BENCHMARKS-2080TI.md` and a sibling `benchmarks/gpu/BENCHMARKS-3090.md` was created, empty by
    construction: no row is published until §8.4 has run and its gate has passed. A row's
    baseline column is measured on the same card as its TinyCoder column.
 3. **The Ornith-1.5-35B-A3B row is hybrid-only** in both files, and says so in the table

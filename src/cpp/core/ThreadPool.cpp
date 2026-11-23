@@ -274,7 +274,13 @@ namespace tinycoder {
                        std::atoi(envNuma) > 0) {
                 numaNode_ = std::atoi(envNuma);
             } else {
+#if defined(USE_CUDA)
                 numaNode_ = detectGpuNumaNode();
+#else
+                // CPU-only build: there is no GPU node to follow.  "auto"
+                // still means NUMA ON, bound to the first CPU node.
+                numaNode_ = 0;
+#endif
             }
             if (numaNode_ >= 0) {
                 affinityEnabled_ = true;
@@ -290,6 +296,10 @@ namespace tinycoder {
             // The node's CPU list includes SMT siblings.  Spreading 36 workers
             // over 18 physical cores + 18 siblings is slower than using the
             // physical cores only (measured 35B hybrid: 33.3 -> 36.4 pp128).
+            if (std::getenv("TINYCODER_NUMA_DEBUG") != nullptr)
+                std::fprintf(stderr, "[numa] env=%s node=%d cpus=%zu threads=%zu\n",
+                             envNuma ? envNuma : "(unset)", numaNode_,
+                             numaCpus_.size(), numThreads_);
             if (numaNode_ >= 0 && numThreads_ > 1 && !numaCpus_.empty()) {
                 bool smt = false;
                 if (FILE *f = std::fopen("/sys/devices/system/cpu/smt/active", "r")) {
