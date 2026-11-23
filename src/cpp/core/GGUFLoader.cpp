@@ -108,7 +108,9 @@ namespace tinycoder {
             case GGML_TYPE_IQ3_XXS:
                 return 98;// 256 weights in 98 bytes (3.0625 bpw)
             case GGML_TYPE_IQ1_S:
-                return 34;// 256 weights in 34 bytes
+                return 50;// 256 weights: d(fp16,2) + qs(32) + qh(8xuint16,16) = 50 bytes (block_iq1_s)
+            case GGML_TYPE_IQ1_M:
+                return 56;// 256 weights: qs(32) + qh(16) + scales(8) = 56 bytes (block_iq1_m)
             case GGML_TYPE_IQ4_NL:
                 return 18;// 32 weights: d(fp16,2) + qs(16) = 18 bytes (block_iq4_nl)
             case GGML_TYPE_IQ3_S:
@@ -121,6 +123,17 @@ namespace tinycoder {
                 return 34;// 128 weights: d(fp16,2) + qs(32) = 34 bytes (block_pq2_0)
             case GGML_TYPE_PTQ1_0:
                 return 28;// 128 weights: qs(24) + qh(2) + d(fp16,2)
+            // Inkling-2-Mini types (ggml-common.h layouts, verified there):
+            case GGML_TYPE_MXFP4:
+                return 17;// 32 weights: e(E8M0,1) + qs(16) = 17 bytes (block_mxfp4)
+            case GGML_TYPE_NVFP4:
+                return 36;// 64 weights: d[4] (UE4M3 per 16) + qs(32) = 36 bytes (block_nvfp4)
+            case GGML_TYPE_Q1_0:
+                return 18;// 128 weights: d(fp16,2) + qs(16) = 18 bytes (block_q1_0)
+            case GGML_TYPE_Q2_0:
+                return 18;// 64 weights: d(fp16,2) + qs(16) = 18 bytes (block_q2_0)
+            case GGML_TYPE_F8_E4M3:
+                return 1;// 1 element: OCP FP8 E4M3 (no block, not quantized)
             default:
                 return 0;
         }
@@ -144,6 +157,7 @@ namespace tinycoder {
             case GGML_TYPE_IQ2_XXS:
             case GGML_TYPE_IQ2_XS:
             case GGML_TYPE_IQ1_S:
+            case GGML_TYPE_IQ1_M:
             case GGML_TYPE_IQ3_S:
             case GGML_TYPE_IQ2_S:
             case GGML_TYPE_IQ4_XS:
@@ -156,6 +170,16 @@ namespace tinycoder {
                 return 128;// 128 weights per block (block_pq2_0, Prism-private)
             case GGML_TYPE_PTQ1_0:
                 return 128;// 128 weights per block (block_ptq1_0, Prism-private)
+            case GGML_TYPE_NVFP4:
+                return 64;// 64 weights per block (block_nvfp4)
+            case GGML_TYPE_Q2_0:
+                return 64;// 64 weights per block (block_q2_0)
+            case GGML_TYPE_Q1_0:
+                return 128;// 128 weights per block (block_q1_0)
+            case GGML_TYPE_MXFP4:
+                return 32;// 32 weights per block (block_mxfp4)
+            case GGML_TYPE_F8_E4M3:
+                return 1;// 1 element per "block" (unquantized)
             default:
                 return 1;
         }
@@ -532,12 +556,25 @@ namespace tinycoder {
                                 break;
                             }
                             case GGUF_TYPE_BOOL: {
-                                uint8_t val;
-                                file_.read(reinterpret_cast<char *>(&val), sizeof(uint8_t));
-                                metadata_[key] = val ? "true" : "false";
-                                for (uint64_t j = 1; j < arrayLen; ++j) {
-                                    file_.seekg(1, std::ios::cur);
+                                // The sliding-window pattern is a per-layer
+                                // bool array; keeping only the first element
+                                // makes every layer look like layer 0.  Store
+                                // the whole pattern as "1,0,1,...".
+                                static const std::string kSwPattern =
+                                        ".attention.sliding_window_pattern";
+                                const bool perLayerPattern =
+                                        key.size() >= kSwPattern.size() &&
+                                        key.compare(key.size() - kSwPattern.size(),
+                                                    kSwPattern.size(), kSwPattern) == 0;
+                                std::string joined;
+                                for (uint64_t j = 0; j < arrayLen; ++j) {
+                                    uint8_t val;
+                                    file_.read(reinterpret_cast<char *>(&val), sizeof(uint8_t));
+                                    if (j > 0) joined += ",";
+                                    joined += val ? "1" : "0";
                                 }
+                                metadata_[key] = perLayerPattern ? joined
+                                                                 : (joined == "1" ? "true" : "false");
                                 break;
                             }
                             case GGUF_TYPE_UINT64: {
@@ -683,6 +720,57 @@ namespace tinycoder {
                     config_.ssmTimeStepRank = std::stoul(metadata_[key]);
                 } else if (key == prefix + ".nextn_predict_layers") {
                     config_.nextnPredictLayers = std::stoul(metadata_[key]);
+                } else if (key == prefix + ".loop.start" ||
+                           key == prefix + ".loop.core_start") {
+                    config_.loopStart = std::stoul(metadata_[key]);
+                } else if (key == prefix + ".loop.end" ||
+                           key == prefix + ".loop.core_end") {
+                    config_.loopEnd = std::stoul(metadata_[key]);
+                } else if (key == prefix + ".loop.count" ||
+                           key == prefix + ".num_loops") {
+                    config_.loopCount = std::stoul(metadata_[key]);
+                } else if (key == prefix + ".loop.gate_rank") {
+                    config_.loopGateRank = std::stoul(metadata_[key]);
+                } else if (key == prefix + ".attn_res.block_size") {
+                    config_.attnResBlockSize = std::stoul(metadata_[key]);
+                } else if (key == prefix + ".attention.relative_length") {
+                    config_.relativeLength = std::stoul(metadata_[key]);
+                } else if (key == prefix + ".attention.relative_extent") {
+                    config_.relativeExtent = std::stoul(metadata_[key]);
+                } else if (key == prefix + ".attention.qk_clip") {
+                    config_.qkClip = std::stof(metadata_[key]);
+                } else if (key == prefix + ".attention.relative_clip") {
+                    config_.relativeClip = std::stof(metadata_[key]);
+                } else if (key == prefix + ".attention.log_scale_floor") {
+                    config_.logScaleFloor = std::stof(metadata_[key]);
+                } else if (key == prefix + ".attention.log_scale_alpha") {
+                    config_.logScaleAlpha = std::stof(metadata_[key]);
+                } else if (key == prefix + ".shortconv.l_cache") {
+                    config_.shortconvLCache = std::stoul(metadata_[key]);
+                } else if (key == prefix + ".activation.situ_beta") {
+                    config_.situBeta = std::stof(metadata_[key]);
+                } else if (key == prefix + ".activation.situ_linear_beta") {
+                    config_.situLinearBeta = std::stof(metadata_[key]);
+                } else if (key == prefix + ".expert_weights_scale") {
+                    config_.expertWeightsScale = std::stof(metadata_[key]);
+                } else if (key == prefix + ".vocab_size_unpadded") {
+                    config_.vocabSizeUnpadded = std::stoul(metadata_[key]);
+                } else if (key == prefix + ".attention.sliding_window") {
+                    config_.slidingWindow = std::stoul(metadata_[key]);
+                } else if (key == prefix + ".attention.sliding_window_pattern") {
+                    config_.slidingWindowPattern.clear();
+                    const std::string &pat = metadata_[key];
+                    size_t start = 0;
+                    while (start < pat.size()) {
+                        size_t comma = pat.find(',', start);
+                        std::string tok = comma == std::string::npos
+                                                  ? pat.substr(start)
+                                                  : pat.substr(start, comma - start);
+                        config_.slidingWindowPattern.push_back(
+                                tok == "1" || tok == "true" ? 1 : 0);
+                        if (comma == std::string::npos) break;
+                        start = comma + 1;
+                    }
                 }
             };
 
@@ -691,6 +779,59 @@ namespace tinycoder {
             parseArchKey("gemma4");
             parseArchKey("qwen35moe");
             parseArchKey("qwen35");
+            parseArchKey("inkling2");
+            parseArchKey("inkling2_loop");
+        }
+
+        // ---- Inkling-2-Mini looped layout -------------------------------
+        // Both layouts describe the same 24 physical blocks.  The mainline
+        // `inkling2_loop` file stores block_count = 24 and expands the cache
+        // slots at load; the Unsloth `inkling2` file stores block_count = 48
+        // (the expanded slots) but only the 24 physical block tensors.  The
+        // forward pass wants physical blocks + one KV slot per logical run.
+        if (config_.architecture == ARCH_INKLING2 ||
+            config_.architecture == ARCH_INKLING2_LOOP) {
+            const uint32_t logical = config_.numLayers;
+            if (config_.loopCount < 2 || config_.loopEnd <= config_.loopStart ||
+                config_.loopEnd > logical) {
+                std::cerr << "[TinyCoder] inkling2: invalid loop "
+                          << "[" << config_.loopStart << ", " << config_.loopEnd
+                          << ") x " << config_.loopCount << " of " << logical
+                          << " layers" << std::endl;
+                return false;
+            }
+            const uint32_t core = config_.loopEnd - config_.loopStart;
+            const uint32_t extra = (config_.loopCount - 1) * core;
+            if (logical >= extra + config_.loopEnd) {
+                // Expanded on-disk layout (block_count already includes slots).
+                config_.numPhysicalLayers = logical - extra;
+                config_.inklingExpandedLayout = true;
+            } else {
+                config_.numPhysicalLayers = logical;
+                config_.inklingExpandedLayout = false;
+            }
+            config_.numKvSlots = config_.numPhysicalLayers + extra;
+            config_.numLayers = config_.numPhysicalLayers;
+            if (config_.numAttentionHeads == 0 || config_.numKVHeads == 0) {
+                std::cerr << "[TinyCoder] inkling2: missing head counts" << std::endl;
+                return false;
+            }
+            if (config_.vocabSizeUnpadded == 0) {
+                config_.vocabSizeUnpadded = config_.vocabSize;
+            }
+            if (config_.relativeExtent == 0 || config_.relativeLength == 0 ||
+                config_.attnResBlockSize == 0 || config_.shortconvLCache < 2) {
+                std::cerr << "[TinyCoder] inkling2: missing relative/conv/block "
+                             "geometry"
+                          << std::endl;
+                return false;
+            }
+            std::cout << "[TinyCoder] inkling2: " << config_.numPhysicalLayers
+                      << " physical blocks, loop [" << config_.loopStart << ", "
+                      << config_.loopEnd << ") x " << config_.loopCount << ", "
+                      << config_.numKvSlots << " cache slots ("
+                      << (config_.inklingExpandedLayout ? "expanded" : "mainline")
+                      << " layout)" << std::endl;
         }
 
         // Qwen35 (dense/gated-delta-net) and Qwen35MoE models declare the
@@ -699,7 +840,9 @@ namespace tinycoder {
         // Using hiddenSize/numAttentionHeads (5120/24 = 213, 2048/16 = 128)
         // would be wrong, so honor the explicit lengths when present.
         if ((config_.architecture == ARCH_QWEN35 ||
-             config_.architecture == ARCH_QWEN35MOE) &&
+             config_.architecture == ARCH_QWEN35MOE ||
+             config_.architecture == ARCH_INKLING2 ||
+             config_.architecture == ARCH_INKLING2_LOOP) &&
             config_.attentionKeyLength > 0) {
             config_.headDim = config_.attentionKeyLength;
         } else {

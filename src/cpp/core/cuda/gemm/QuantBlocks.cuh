@@ -400,10 +400,10 @@ static int tc_cuda_highest_compiled_arch(const int arch) {
     return TC_CUDA_CC_IS_NVIDIA(cc) && cc >= TC_CUDA_CC_VOLTA;
 }
 
-static bool amd_mfma_available(const int /*cc*/) { return false; }// NVIDIA only
-static bool amd_wmma_available(const int /*cc*/) { return false; }// NVIDIA only
+[[maybe_unused]] static bool amd_mfma_available(const int /*cc*/) { return false; }// NVIDIA only
+[[maybe_unused]] static bool amd_wmma_available(const int /*cc*/) { return false; }// NVIDIA only
 
-static bool turing_mma_available(const int cc) {
+[[maybe_unused]] static bool turing_mma_available(const int cc) {
     return TC_CUDA_CC_IS_NVIDIA(cc) && tc_cuda_highest_compiled_arch(cc) >= TC_CUDA_CC_TURING;
 }
 

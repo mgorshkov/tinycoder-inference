@@ -38,6 +38,7 @@ SOFTWARE.
 
 #ifdef USE_CUDA
 #include "GPUCompute.hpp"
+#include "gpu/InklingGPU.hpp"
 #include "LMHeadCUDA.hpp"
 #endif
 
@@ -76,6 +77,33 @@ namespace tinycoder {
         uint32_t gpuContinueLayer = 0;
         bool hiddenFromGpu = false;
 #ifdef USE_CUDA
+        // Inkling full-device graph.  It owns its own K/V and conv state; the
+        // CPU path below remains the reference and the fallback.
+        const char *inklingGpuEnv = std::getenv("TINYCODER_INKLING_GPU");
+        if (!forceCpuForward_ &&
+            (config_.architecture == ARCH_INKLING2 ||
+             config_.architecture == ARCH_INKLING2_LOOP) &&
+            inklingGpuEnv != nullptr && inklingGpuEnv[0] != '\0' &&
+            inklingGpuEnv[0] != '0') {
+            if (!inklingGpu_) inklingGpu_ = std::make_shared<gpu::InklingGPU>();
+            if (inklingGpu_->available()) {
+                np::Array<float> logits(np::Shape{computeAllLogits
+                                                          ? tokens.size()
+                                                          : size_t(1),
+                                                  size_t(config_.vocabSizeUnpadded
+                                                                 ? config_.vocabSizeUnpadded
+                                                                 : config_.vocabSize)});
+                std::string gerr;
+                if (inklingGpu_->forward(*this, tokens, computeAllLogits,
+                                         logits.data(), gerr)) {
+                    kvCache_.pos += tokens.size();
+                    return logits;
+                }
+                std::fprintf(stderr, "[inkling] GPU forward fallback: %s\n",
+                             gerr.c_str());
+            }
+        }
+
         // GPU offload fast path: the GPU engine owns its own KV cache (kvPos_)
         // and is authoritative for the whole session once the first pass
         // succeeds. A session is eligible when: * it starts fresh from a clean
@@ -330,6 +358,15 @@ namespace tinycoder {
                       << config_.maxSeqLen << " tokens" << std::endl;
             return np::Array<float>();
         }
+
+        // Inkling-2-Mini has its own token-at-a-time loop (physical blocks are
+        // re-run by the loop passes, each with its own K/V slot, so the
+        // layer-major loop below does not describe it).
+        if (config_.architecture == ARCH_INKLING2 ||
+            config_.architecture == ARCH_INKLING2_LOOP) {
+            return forwardInkling(tokens, computeAllLogits);
+        }
+
         for (uint32_t layer = gpuContinueLayer; layer < nLayers; ++layer) {
             // Cooperative cancellation: bail out between layers. The token
             // callback alone cannot interrupt a single long prefill/decode

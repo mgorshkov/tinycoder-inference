@@ -67,9 +67,30 @@ namespace tinycoder {
         GGML_TYPE_I8 = 24,
         GGML_TYPE_I16 = 25,
         GGML_TYPE_I32 = 26,
+        // IQ1_M (1.75 bpw, 256-weight super-block). Upstream id 29. Distinct
+        // from IQ1_S (19, 1.5625 bpw): no separate fp16 d field, the super
+        // scale is assembled from the top nibbles of the four group-scale
+        // words. See GGMLDequantize::dequantizeIQ1_MBlock.
+        GGML_TYPE_IQ1_M = 29,
         // bfloat16 (2 bytes/element). Used by the Ternary-Bonsai-2-27B export for
         // the ssm_alpha / ssm_beta projection matrices (converted to F32 at load).
         GGML_TYPE_BF16 = 30,
+        // Inkling-2-Mini GGUF types. Values match upstream llama.cpp
+        // (ggml/include/ggml.h); block layouts are copied verbatim from
+        // ggml-common.h and the dequantizers from ggml-quants.c.
+        //   MXFP4  : 32 weights, E8M0 power-of-two scale, E2M1 4-bit values
+        //            (17 B/block = 4.25 bpw).
+        //   NVFP4  : 64 weights, four UE4M3 per-16 scales, E2M1 4-bit values
+        //            (36 B/block = 4.5 bpw).
+        //   Q1_0   : 128 weights, one fp16 scale, 1-bit values (18 B = 1.125 bpw).
+        //   Q2_0   : 64 weights, one fp16 scale, 2-bit values (three-bit
+        //            signed map -1..+2) (18 B = 2.25 bpw).
+        //   F8_E4M3: unquantized OCP FP8 E4M3 (1 B/element).
+        GGML_TYPE_MXFP4 = 39,
+        GGML_TYPE_NVFP4 = 40,
+        GGML_TYPE_Q1_0 = 41,
+        GGML_TYPE_Q2_0 = 42,
+        GGML_TYPE_F8_E4M3 = 43,
         // Prism-private 2-bit type (Ternary-Bonsai PQ2_0 export): identical 2-bit
         // codec to Q2_0 but with one fp16 scale per 128 weights (34-byte block).
         GGML_TYPE_PQ2_0 = 142,

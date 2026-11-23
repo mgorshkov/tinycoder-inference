@@ -8,7 +8,7 @@ same card.
 
 ## GPU Comparison (TinyCoder vs llama.cpp / exllamav3)
 
-Columns follow the benchmark defaults: `tinycoder_bench --n-prompts 512 --n-gen 128 --threads 36` (**pp512 / tg128**). Every row below is a **CUDA build** (`cmake -B build -DCMAKE_BUILD_TYPE=Release`, which enables the offload engine whenever `nvcc` is installed; `-DENABLE_CUDA=OFF` produces a CPU-only binary that these numbers do not describe). The rows were measured with the AVX2 matvec and sampler kernels compiled in (`ENABLE_AVX2=ON`, `ENABLE_AVX512=OFF` on the reference box); a tree whose cache holds `ENABLE_AVX2=OFF` compiles `SIMDMatMulVecAVX2.cpp` to an empty translation unit and runs scalar CPU kernels, so its CPU-path numbers are not comparable — `scripts/build.sh` prints the resolved set after configure for exactly this reason. `--gpu` forces the offload path and `--cpu` takes the CPU baseline of the same run; a CPU-only binary answers `--gpu` with "needs a CUDA build" and exit 2 rather than an unknown-option error. GGUF baselines are `llama-bench -p 512 -n 128 -t 36 -r 1`, run **interleaved** with the TinyCoder run (three alternating pairs, so clock drift affects both columns equally, means reported; the Ornith-35B row adds `-ncmoe 99`, the same expert-offload mode the TinyCoder column uses); the EXL3 baseline is a local exllamav3 1.6.6 run measured with the same pp512/tg128 protocol — see [How the exllamav3 EXL3 baseline was measured](#how-the-exllamav3-exl3-baseline-was-measured); the two Ternary-Bonsai rows instead use PrismML's llama.cpp fork, because stock llama.cpp cannot load either Bonsai packing — see [How the Prism Bonsai baseline was measured](#how-the-prism-bonsai-baseline-was-measured). Warm mean-of-reps, RTX 2080 Ti. Bold marks the faster engine in a column. Figures are the mean of three alternating interleaved pairs (spread = (max - min)/2); the
+Columns follow the benchmark defaults: `tinycoder_bench --n-prompts 512 --n-gen 128 --threads 36` (**pp512 / tg128**). Every row below is a **CUDA build** (`cmake -B build -DCMAKE_BUILD_TYPE=Release`, which enables the offload engine whenever `nvcc` is installed; `-DENABLE_CUDA=OFF` produces a CPU-only binary that these numbers do not describe). The rows were measured with the AVX2 matvec and sampler kernels compiled in (`ENABLE_AVX2=ON`, `ENABLE_AVX512=OFF` on the reference box); a tree whose cache holds `ENABLE_AVX2=OFF` compiles `SIMDMatMulVecAVX2.cpp` to an empty translation unit and runs scalar CPU kernels, so its CPU-path numbers are not comparable — `scripts/build.sh` prints the resolved set after configure for exactly this reason. `--gpu` forces the offload path and `--cpu` takes the CPU baseline of the same run; a CPU-only binary answers `--gpu` with "needs a CUDA build" and exit 2 rather than an unknown-option error. GGUF baselines are `llama-bench -p 512 -n 128 -t 36 -r 1`, run **interleaved** with the TinyCoder run (three alternating pairs, so clock drift affects both columns equally, means reported; the Ornith-35B row adds `-ncmoe 99`, the same expert-offload mode the TinyCoder column uses; the Inkling-2-Mini row's baseline is llama.cpp CUDA (`-ngl 99`, 2048-token context) from the Unsloth `inkling2-loop-legacy-layout` tree (`dd330cc` plus the looped-layer fix), because stock llama.cpp mainline cannot load that expanded-layout checkpoint, and `scripts/inkling_ab.sh` runs those pairs); the EXL3 baseline is a local exllamav3 1.6.6 run measured with the same pp512/tg128 protocol — see [How the exllamav3 EXL3 baseline was measured](#how-the-exllamav3-exl3-baseline-was-measured); the two Ternary-Bonsai rows instead use PrismML's llama.cpp fork, because stock llama.cpp cannot load either Bonsai packing — see [How the Prism Bonsai baseline was measured](#how-the-prism-bonsai-baseline-was-measured). Warm mean-of-reps, RTX 2080 Ti. Bold marks the faster engine in a column. Figures are the mean of three alternating interleaved pairs (spread = (max - min)/2); the
 dense-prefill attention path computes QK^T, causal softmax and PV in fp16 via cuBLAS, which moves the
 attention output by maxAbsDiff 0.0146 against the previous fp32 warp kernel -- a numerics change
 licensed by the gates, not a refactor, and measured as byte-identical greedy text on a 512-token prompt
@@ -24,6 +24,7 @@ with the old and new path in the same binary.
 | [Ternary-Bonsai-2-27B `ptq1_0` (Prism)](https://huggingface.co/prism-ml/Ternary-Bonsai-2-27B-gguf/resolve/main/Ternary-Bonsai-2-27B-PTQ1_0.gguf) | 5.5 GB | full offload | **880.7 tok/s** | 51.73 tok/s | PrismML llama.cpp (fork) | 848.1 tok/s | **65.29 tok/s** |
 | [Ornith-1.5-9B `q4_k_m`](https://huggingface.co/bartowski/Ornith-1.5-9B-GGUF/resolve/main/Ornith-1.5-9B-Q4_K_M.gguf) | 5.9 GB | full offload | 2,538.1 tok/s | 83.3 tok/s | llama.cpp | **2,640.1 tok/s** | **84.1 tok/s** |
 | [Ornith-1.5-35B-A3B `q8_0` → `q4_k` experts](https://huggingface.co/AtomicChat/Ornith-1.5-35B-A3B-GGUF/resolve/main/Ornith-1.5-35B-A3B-Q8_0.gguf) | 34.4 GB | **hybrid only** (experts in RAM, layer arena) | **133.4 tok/s** | **24.10 tok/s** | llama.cpp `-ncmoe 99` | 132.2 tok/s | 17.1 tok/s |
+| [Inkling-2-Mini `iq2_xxs`](https://huggingface.co/unsloth/Inkling-2-Mini-GGUF/resolve/main/Inkling-2-Mini-UD-IQ2_XXS.gguf) | 8.5 GB | full offload | **1200.0 tok/s** | **47.0 tok/s** | llama.cpp CUDA (`-ngl 99`, ctx 2048) | 883.6 tok/s | 44.3 tok/s |
 | [Qwen3.8-27B EXL3 `1.60bpw`](https://huggingface.co/turboderp/Qwen3.8-27B-exl3/tree/SC_1.60bpw_H3) | 8.6 GB | full offload | **725.8 tok/s** | **29.83 tok/s** | exllamav3 1.6.6 | 716.8 tok/s | 23.67 tok/s |
 
 The Ornith-1.5-35B-A3B row describes **one configuration only**: the hybrid mode in which
@@ -184,6 +185,168 @@ token 0 at 64k, Bonsai is grant-checked because it does not answer a needle at a
 grant row confirms its default 2048 is untouched), and `./scripts/text_gate.sh`, where every checkpoint
 these rows use answers (1.5B, 7B, 9B, the 35B-A3B, Bonsai `pq2_0`/`ptq1_0`, 27B EXL3): the whole
 script passes.
+
+---
+
+## Inkling-2-Mini (IQ2_XXS, canonical and diagnostic protocols)
+
+IQ2_XXS (8.49 GB) is the only published Inkling quant that fits the 11 GB card
+with the K/V cache. `TINYCODER_INKLING_GPU=1` selects the full-device CUDA
+graph; the rest is the default environment, 36 threads. The canonical protocol
+(`--n-prompts 512 --n-gen 128`) and the short-run diagnostic both run here:
+
+| engine | pp512 | tg128 | pp16 | tg16 |
+|---|---|---|---|---|
+| TinyCoder GPU graph | **1200.0** | **47.0** | **233.3** | **51.65** |
+| TinyCoder CPU (36 threads, `TINYCODER_NUMA=off`) | - | - | 1.90 | 1.92 |
+| llama.cpp CPU (`-ngl 0`) | 333.8 | 4.41 | 23.7 | 4.91 |
+| llama.cpp CUDA (`-ngl 99`, ctx 2048) | 883.6 | 44.3 | 177.2 | 35.52 |
+
+All tok/s, one session: the mean of three alternating interleaved pairs, with
+the range of the three (`scripts/inkling_ab.sh`, text gate first). TinyCoder GPU 1199.10–1201.80 / 46.97–47.01 / 232.90–233.60 / 51.62–51.71;
+llama.cpp CUDA 883.52–883.76 / 44.27–44.35 / 176.52–178.53 / 34.77–35.91;
+llama.cpp CPU 330.94–336.36 / 3.97–4.92 / 23.34–24.16 / 4.56–5.10; TinyCoder CPU
+1.90–1.90 / 1.91–1.93. TinyCoder CPU was not run at pp512/tg128; its 16-token
+diagnostic is already 2.6x behind llama.cpp CPU decode and 12x behind on
+prefill, and the prefill path is token-at-a-time.
+
+The GPU graph is now **faster than llama.cpp CUDA on both canonical columns**:
+prefill 1200.0 against 883.6 (1.36x) and decode **47.0 against 44.3 (1.06x)**. At tg16 it is
+ahead of llama.cpp CUDA (51.65 vs 35.52); at pp16 it beats llama.cpp CPU 9.9x
+(233.3 vs 23.7) and beats llama.cpp CUDA (233.3 vs 177.2). Prefill at the
+canonical 512 is 1.36x **ahead** (1200.0 vs 883.6): the m=512 outer batch removed three of the four
+weight re-reads, and the remaining cost is the skewed expert MMA
+(the expert path is ~57% of the 426.7 ms pass). The pp16/tg16 columns are
+diagnostics: a 16-token prompt is not a prefill benchmark, and tg16 is measured
+after a 16-token prefill while tg128 follows 512 tokens. They must not be
+compared across prompt lengths.
+
+Physics check on the decode number: the graph uploads 7.66 GiB (8.22e9 bytes) of
+weights, so 47.0 tok/s moves 386 GB/s, 63% of this card's ~616 GB/s. The figure
+is inside the bandwidth budget, not beyond it, which is what a decode graph with
+no skipped work should look like. Batched prefill reads a weight block once for
+512 tokens in one pass, so 1200.0 tok/s is ~19 GB/s of weight traffic; prefill is
+ahead of the CUDA reference, and the remaining headroom is expert-MMA/attention
+occupancy, not bandwidth.
+
+The decode path gained three changes. The long-context attention kernel was the
+previous bottleneck (35.6 ms of a 65 ms token at tg128): it now runs one block
+per query head with 2–8 warps splitting the key range (was one block for all 24
+heads), computes the QK dot once per key with an online softmax (was three
+passes), and stages the relative-bias row in shared memory; the depth-mix kernel
+runs one warp per state and accumulates in float instead of fp64. That moved
+tg128 16.34 → 31.86 (+95%) and pp512 23.2 → 33.0 (+42%). Second, the dense
+projections whose type the engine's int8 Q8_1 GEMV covers (Q4_K/Q5_K/Q6_K/Q8_0
+and IQ2_XS/IQ2_S/IQ3_S/IQ3_XXS) now use that kernel instead of the Inkling float
+decoder. On this checkpoint that is attention Q/K/V plus relative bias
+(Q4_K/Q5_K) and attention output (Q8_0): attn_proj 4.6 → 1.93 ms, attn_out
+3.4 → 1.94 ms. It moved tg128 31.86 → 36.7 (+15%), pp512 33.0 → 39.1 (+18%),
+tg16 33.93 → 39.0 (+15%) and pp16 34.7 → 41.1 (+18%).
+
+Third, the routed experts now use an expert-indexed int8 GEMV. The float
+decoder read expert rows through a device-side index, so the existing int8
+kernel did not apply; the new `gemvExpertCoreImpl` keeps that indexing (one
+block per output row, four warps, weight row
+`rowIdx[outRow/rowsPer]*rowsPer + outRow%rowsPer`, activation row
+`outRow/rowsPer`) and swaps the arithmetic underneath for the Q8_1 dot. It
+covers Q4_K/Q5_K/Q6_K/Q8_0/IQ2_XS/IQ2_S/IQ3_S/IQ3_XXS, plus a Q2_0 dot written
+for this path (`block_q2_0` is 18 B per 64 weights — fp16 scale and 2-bit codes,
+value `d*(code-1)` — so the block is read as two virtual 32-weight halves and
+quantised to Q8_1). On this checkpoint that is 11 of the 24 blocks' gate/up
+(IQ2_XS, IQ2_S): `expert_gate_up` 6.23 → 4.00 ms (-36%). It moved tg128
+36.7 → 40.3 (+10%), pp512 39.1 → 41.8 (+7%), tg16 39.0 → 43.6 (+12%) and
+pp16 41.1 → 44.0 (+7%). The later 16-token batched prefill path raised pp512 to
+68.7 and pp16 to 67.6 without changing decode. The 128-token layer-major pass
+then raised pp512 to 108.3 and pp16 to 81.8, still bit-exact. The expert-MMA
+decode, batched-GEMV spill fix and one-warp sink projection raised pp512 to
+168.2 and pp16 to 106.8, still bit-exact at 512 tokens. The Q8 tensor-core
+default then raised pp512 to 247.5 and pp16 to 131.7; the race fixes keep it
+deterministic across fresh processes. The m=512 outer batch (one layer-major
+pass, compact counting-sort expert gather, fixed controller/router kernels)
+raised pp512 to 406.2 and pp16 to 155.2; the expert weight-stationary retile then raised pp512 to 423.4; IQ1_S/NVFP4 in the MMA raised the MoE to 500 ms and pp512 to 557.9. The deterministic 32-token k-tile MMA and aux fixes then raised pp512 to 604.5 and pp16 to 218.8; the expert MMA is now at llama.cpp's level (~333 ms) and the remaining 1.45x was the non-expert half. The flash attention, batched relbias, register-stationary controller and tiled short-conv then raised pp512 to 834.0. The final MoE-auxiliary shape fixes (gather one block per compact slot, parallel group build, warp-per-chunk Q8_1; md5 unchanged) cut the pass 613.9→428.6 ms and raised pp512 to 1194.7, ahead of the CUDA reference on prefill for the first time, with decode 40.4; the decode-fused controller/attention then raised it to 44.7, and the NVFP4/IQ grid and short-matrix GEMV fixes raised it to **47.0**, so both canonical columns are ahead of llama.cpp CUDA (prefill 1.36x, decode 1.06x). The
+token-major exact path remains bit-identical; moving 23 layer executions to the
+IQ1_S/NVFP4 Q8_1 MMA changes the fast path's 512-token top-1 on 41/512 positions
+and top-5 set on 119/512 (was 27/111), min cosine 0.9916. That is the accepted
+Q8 floor; the official final-logit band stays 0.41927 and 10/10 fresh processes
+answer Paris.
+
+The default path is **llama.cpp-class quantised numerics**: Q8_1 activations in
+the dense/expert MMQ. The final-logit gate passes (top-1, top-5 set, band
+0.41927), and the text gate is deterministic: the test now samples greedily by
+default (`--sample` restores stochastic, `--seed` pins it), and **10/10 fresh
+processes generate 40 tokens and answer Paris**. The earlier Paris 1/3 run was
+the test's unseeded sampler (`seed = 0` → random_device), not the engine. The
+racecheck audit did find and fix a real batched `rmsInvShared` barrier race and
+the four mix softmax warp-wide shared RMWs; after that, 20 fresh fast-path
+prefill processes are bit-identical. The exact path remains available via
+`TINYCODER_INKLING_GEMM=0`, `_EXPERT_MMA=0`, `_Q2_0_MMA=0` (224.9 pp512).
+
+`expert_down` went 4.23 → 4.30 ms, which is neutral: it is Q2_0 on 18 blocks
+and NVFP4 on 6, and Q2_0's int8 form only works if the *bytes* were the cost.
+At 0.28 B/weight they are not — the loop is decode-ALU bound like the rest of
+this path, so moving from the float decoder to int8 changes little. The
+remaining gate/up blocks are IQ2_XXS (7) and IQ1_S (6), both still refused by
+the int8 kernel; adding those decoders is the next lever on this column.
+Q2_0 (down), IQ2_XXS, IQ4_XS (LM head), NVFP4, IQ1_S, F32 and BF16 stay on the
+float decoders.
+
+Profile at tg128 (`TINYCODER_INKLING_GPU_PROF=1`), per token over 48
+layer-slots: `expert_down` 4.30 ms, `attn_mix` (depth mix, control, three RMS
+norms) 4.04, `expert_gate_up` 4.00, `attn_core` 2.99, `attn_out` 2.00, `ffn_mix`
+2.00, `attn_proj` (Q/K/V/relative-bias GEMVs) 1.99, `attn_glue` (short
+convolutions) 1.57, `router` 1.38, `lm_head` 0.81, `ffn_post` 0.67 — 25.7 ms
+total across 1302 launches per token (no CUDA graph capture yet). The two
+expert GEMVs are still 8.3 ms of the 25.7 ms. `attn_mix` at 4.04 ms across 48
+calls is now the second-largest single item and is launch-latency bound (the
+three RMS norms and the control channels are ~430 tiny launches per token), so
+it responds to fusion or CUDA-graph capture rather than to a faster kernel. A
+Debug CUDA build is ~10x slower; these numbers are Release.
+
+Method: `./scripts/inkling_ab.sh` (text gate first, then interleaved runs of
+both protocols against both llama.cpp backends). Baseline provenance: llama.cpp
+Unsloth `inkling2-loop-legacy-layout` (dd330cc) with the looped-layer
+`layer_phys` fix needed to run the expanded layout; stock mainline cannot load
+the file. That tree also carries step-time `[dbg]` prints, which cost well under
+1% and can only make llama.cpp slower.
+
+Parity: on a 1-token prompt top-1 and top-5 set match both the exact scalar CPU
+path and the shipped default CPU path. Against the exact path the worst top-5
+delta is 5.43 (all-vocab RMS 4.75); against the default path it is 0.29 (RMS
+0.30). The 5.43 is the Q8_1 activation quantisation of the int8 GEMV, the same
+class as the default CPU path, whose own exact-vs-default RMS is 4.57 — not a
+defect, which is why the default path is the gate reference for the GPU graph.
+
+The gate tool (`build-inkling/unit_tests/inkling_gpu_forward_test`) now also
+runs multi-token prompts, because a 1-token forward does not exercise the
+per-slot K/V and short-conv state at all. That gap was hiding a real defect: at
+HEAD the graph was coherent for one token and emitted word salad from the
+second, a `dBlockBank`/`dBankSnap` scratch buffer sized `8*H` while the depth
+mix indexes it by slot (`slots+2` rows). `FullQuestions` failed on the GPU path
+and passed on CPU before the fix, on the same binary. With the sizing corrected
+the 2-token gate passes on the documented default-path criterion (top-1 and
+top-5 set match, per-logit band 0.164, all-vocab RMS 0.333) and the exact path
+agrees on top-1 with band 2.70. The gate itself is now stated as that criterion:
+the default path's top-1, top-5 ordering and ≤0.5 band are the gate, and the
+exact path's top-1 is required while its band is reported as a diagnostic,
+because the reference's own default-vs-exact RMS is 2.64 on that 2-token prompt
+(4.57 on one token) — the Q8_1 rounding flips a near-tied router expert
+(selection gap ~3e-4 at block 0) and that is a discrete trajectory change, not
+an arithmetic error.
+
+Kernel parity is unchanged (attention maxdiff 1.192e-07, depth-mix 1.192e-07),
+and `inkling_gpu_parity` gained a short-convolution case with non-zero history
+(step0/step1 maxdiff 1.490e-08) plus expert-GEMV cases for IQ2_XS (shared
+activation, 2.190e-03) and Q2_0 per-row (2.284e-03). The GPU path answers
+"The capital of France is Paris." on the chat prompt and passes all four gated
+questions. VRAM: 8828 MiB of 11264 MiB (weights 7.66 GiB, K/V 768 MiB,
+scratch 19.4 MiB).
+
+Checkpoints (`unsloth/Inkling-2-Mini-GGUF`):
+
+- [Inkling-2-Mini-UD-IQ2_XXS.gguf](https://huggingface.co/unsloth/Inkling-2-Mini-GGUF/resolve/main/Inkling-2-Mini-UD-IQ2_XXS.gguf)
+- [Inkling-2-Mini-UD-Q3_K_XL.gguf](https://huggingface.co/unsloth/Inkling-2-Mini-GGUF/resolve/main/Inkling-2-Mini-UD-Q3_K_XL.gguf)
+
+The Q3_K_XL file (13.6 GB) is CPU-only on this card; it does not fit 11 GB.
 
 ---
 

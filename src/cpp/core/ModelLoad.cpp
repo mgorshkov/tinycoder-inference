@@ -24,6 +24,7 @@ SOFTWARE.
 
 #include "MemHints.hpp"
 #include "Model.hpp"
+#include "gpu/InklingGPU.hpp"
 #include "ThreadPool.hpp"
 
 #include "EXL3Loader.hpp"
@@ -416,11 +417,15 @@ namespace tinycoder {
         // and its `reason` is what gets printed, so the message and the
         // decision cannot disagree.
         {
+            const bool inklingArch = config_.architecture == ARCH_INKLING2 ||
+                                     config_.architecture == ARCH_INKLING2_LOOP;
+            const uint32_t kvLayers = config_.numKvSlots > 0 ? config_.numKvSlots
+                                                             : config_.numLayers;
             const uint32_t interval = config_.fullAttentionInterval;
             const uint32_t numAttnLayers =
                     interval > 1u
-                            ? (config_.numLayers + interval - 1u) / interval
-                            : config_.numLayers;
+                            ? (kvLayers + interval - 1u) / interval
+                            : kvLayers;
             // qwen35/qwen35moe carry an MRoPE table next to the text one; both
             // are [maxSeqLen][dims/2] of cos+sin in f32.
             const uint32_t mropeDims =
@@ -433,7 +438,7 @@ namespace tinycoder {
             detail::ContextRequest req;
             req.requested = requestedSeqLen;
             req.modelMax = config_.maxSeqLen;
-            req.numLayers = config_.numLayers;
+            req.numLayers = kvLayers;
             req.numAttentionLayers = numAttnLayers;
             req.numKVHeads = config_.numKVHeads;
             req.headDim = config_.headDim;
@@ -454,7 +459,10 @@ namespace tinycoder {
                 req.forceKvSet = true;
             }
             req.weightBytes = fileSize;
-            req.freeVram = detail::probeFreeVramBytes();
+            // Inkling's CPU path owns the whole model and both K/V and conv
+            // state live in host RAM (there is no GPU Inkling kernel yet), so
+            // plan the window against RAM even when the weights would fit VRAM.
+            req.freeVram = inklingArch ? 0 : detail::probeFreeVramBytes();
             // The RAM probe runs after the weights are resident, so it already
             // accounts for them; planContext must not subtract them again.
             req.availableRam = req.freeVram == 0 ? detail::probeAvailableRamBytes() : 0;
@@ -635,7 +643,13 @@ namespace tinycoder {
         // the device, so the host tables are dead weight until something falls
         // back; if it does, Model::forward rebuilds them.  `TINYCODER_GPU=0`
         // (and a non-CUDA build) keeps the eager build.
-        const bool deferEmbTables = [] {
+        const bool deferEmbTables = [&] {
+            // Inkling runs its LM head from the quantized output matrix and
+            // never reads the F32/F16/Q8_K embedding tables.
+            if (config_.architecture == ARCH_INKLING2 ||
+                config_.architecture == ARCH_INKLING2_LOOP) {
+                return true;
+            }
 #ifdef USE_CUDA
             const char *e = std::getenv("TINYCODER_GPU");
             return !(e != nullptr && e[0] == '0');
@@ -676,7 +690,10 @@ namespace tinycoder {
         // logical-CPU count.
         if (!pool_) {
             size_t n = 0;
-            if (config_.nThreads > 0) {
+            if (const char *te = std::getenv("TINYCODER_NTHREADS");
+                te != nullptr && te[0] != '\0') {
+                n = static_cast<size_t>(std::atoi(te));
+            } else if (config_.nThreads > 0) {
                 n = static_cast<size_t>(config_.nThreads);
             } else if (ThreadPool::instance().isInitialized()) {
                 n = ThreadPool::instance().numThreads();
@@ -924,6 +941,28 @@ namespace tinycoder {
             return np::Array<float>(vec, np::Shape{n});
         };
 
+        // Helper to load any-rank F32 tensor as a flat vector.  Inkling's
+        // clip vectors and depth-attention queries are 2-D F32 ([headDim,
+        // nHeads], [rows, hidden]) and never go through a quantized matmul.
+        auto loadF32Flat = [&](const std::string &name) -> np::Array<float> {
+            auto info = loader.getTensorInfo(name);
+            if (!info)
+                return np::Array<float>{};
+            const uint8_t *data = loader.getTensor(name);
+            if (!data)
+                return np::Array<float>{};
+            uint64_t n = 1;
+            for (auto d: info->shape) n *= d;
+            if (info->type != GGML_TYPE_F32 || n == 0) {
+                std::cerr << "[TinyCoder] " << name << ": expected F32, got type "
+                          << info->type << std::endl;
+                return np::Array<float>{};
+            }
+            std::vector<float> vec(n);
+            std::memcpy(vec.data(), data, n * sizeof(float));
+            return np::Array<float>(vec, np::Shape{static_cast<size_t>(n)});
+        };
+
         // Load a quantized weight, converting a BF16 (type 30) tensor to F32.
         // The Prism Bonsai export stores ssm_alpha / ssm_beta as BF16; the engine
         // has no BF16 kernel, so convert the 2-byte bf16 values to F32 at load
@@ -1063,6 +1102,32 @@ namespace tinycoder {
         finalNorm_ = loadF32_1D("output_norm.weight");
         if (finalNorm_.empty()) {
             finalNorm_ = loadF32_1D("token_embd_norm.weight");
+        }
+
+        if (config_.architecture == ARCH_INKLING2 ||
+            config_.architecture == ARCH_INKLING2_LOOP) {
+            inklingTokNorm_ = loadF32_1D("token_embd_norm.weight");
+            inklingOutputResQuery_ = loadF32_1D("output_res_query.weight");
+            if (config_.inklingExpandedLayout) {
+                // Legacy/expanded layout: 2 queries per core block, grouped
+                // into one tensor each for (Q, FFN) and (K, V).
+                inklingLoopResQuery_ = loadF32Flat("loop_res_query.weight");
+                inklingLoopKvResQuery_ = loadF32Flat("loop_kv_res_query.weight");
+                const uint32_t core = config_.loopEnd - config_.loopStart;
+                if (inklingLoopResQuery_.size() != size_t(2) * core * config_.hiddenSize ||
+                    inklingLoopKvResQuery_.size() != size_t(2) * core * config_.hiddenSize) {
+                    std::cerr << "[TinyCoder] inkling2: bad legacy loop query sizes ("
+                              << inklingLoopResQuery_.size() << ", "
+                              << inklingLoopKvResQuery_.size() << ")" << std::endl;
+                    return false;
+                }
+            }
+            if (inklingTokNorm_.empty() || inklingOutputResQuery_.empty()) {
+                std::cerr << "[TinyCoder] inkling2: missing token/output norm or "
+                             "output_res_query"
+                          << std::endl;
+                return false;
+            }
         }
 
         // Load per-layer weights (architecture-aware)
@@ -1373,6 +1438,100 @@ namespace tinycoder {
                         return false;
                     }
                 }
+            } else if (config_.architecture == ARCH_INKLING2 ||
+                       config_.architecture == ARCH_INKLING2_LOOP) {
+                // ---- Inkling-2-Mini (looped MoE) ----
+                auto &w = layers_[i];
+                const bool isSwa = i < config_.slidingWindowPattern.size()
+                                           ? config_.slidingWindowPattern[i] != 0
+                                           : true;
+
+                w.attnQ = loadQuantized(prefix + "attn_q.weight");
+                w.attnK = loadQuantized(prefix + "attn_k.weight");
+                w.attnV = loadQuantized(prefix + "attn_v.weight");
+                w.attnO = loadQuantized(prefix + "attn_output.weight");
+                w.inkling.attnGate = loadQuantized(prefix + "attn_gate.weight");
+                w.inkling.attnRel = loadQuantized(prefix + "attn_rel.weight");
+                w.inkling.attnRelBias = loadQuantized(prefix + "attn_rel_bias.weight");
+                w.inkling.attnSinkProj =
+                        loadQuantizedBF16ToF32(prefix + "attn_sink_proj.weight");
+
+                w.inkling.attnQClip = loadF32Flat(prefix + "attn_q_clip.weight");
+                w.inkling.attnRelClip = loadF32Flat(prefix + "attn_rel_clip.weight");
+
+                // Short convolutions (F32 [n_conv, channels]).
+                w.inkling.attnKConv = loadQuantized(prefix + "attn_k_conv.weight");
+                w.inkling.attnVConv = loadQuantized(prefix + "attn_v_conv.weight");
+                w.inkling.attnPostConv = loadQuantized(prefix + "attn_post_conv.weight");
+                w.inkling.ffnPostConv = loadQuantized(prefix + "ffn_post_conv.weight");
+                if (isSwa) {
+                    w.rmsNormAttn = loadF32_1D(prefix + "attn_norm.weight");
+                } else {
+                    w.inkling.attnQInpNorm =
+                            loadF32_1D(prefix + "attn_q_inp_norm.weight");
+                    w.inkling.attnKInpNorm =
+                            loadF32_1D(prefix + "attn_k_inp_norm.weight");
+                    w.inkling.attnVInpNorm =
+                            loadF32_1D(prefix + "attn_v_inp_norm.weight");
+                    w.inkling.attnKConvProj =
+                            loadQuantized(prefix + "attn_k_conv_proj.weight");
+                    w.inkling.attnVConvProj =
+                            loadQuantized(prefix + "attn_v_conv_proj.weight");
+                }
+                if (i > 0) {
+                    w.inkling.attnResQuery =
+                            loadF32Flat(prefix + "attn_res_query.weight");
+                }
+                w.inkling.ffnResQuery = loadF32_1D(prefix + "ffn_res_query.weight");
+
+                w.rmsNormFFN = loadF32_1D(prefix + "ffn_norm.weight");
+                w.ffnGateInp = loadQuantized(prefix + "ffn_gate_inp.weight");
+                w.ffnGateUpExps = loadQuantized(prefix + "ffn_gate_up_exps.weight");
+                w.ffnDownExps = loadQuantized(prefix + "ffn_down_exps.weight");
+                w.inkling.expertProbsBias =
+                        loadF32_1D(prefix + "exp_probs_b.bias");
+                w.inkling.expertGateUpScale =
+                        loadF32_1D(prefix + "ffn_gate_up_exps.scale");
+                w.inkling.expertDownScale =
+                        loadF32_1D(prefix + "ffn_down_exps.scale");
+
+                if (i >= uint32_t(config_.loopStart) &&
+                    i < uint32_t(config_.loopEnd)) {
+                    if (!config_.inklingExpandedLayout) {
+                        w.inkling.msgQuery =
+                                loadQuantized(prefix + "loop_msg_query.weight");
+                    }
+                    // Control tensors.  The two layouts only rename them:
+                    //   mainline: loop_q_ctrl_* / loop_k_ctrl_* / loop_v_ctrl_* /
+                    //             loop_ffn_ctrl_*
+                    //   legacy:   loop_attn_*   / loop_k_*      / loop_v_*     /
+                    //             loop_mlp_*
+                    static const char *ctrlMain[4] = {"q", "k", "v", "ffn"};
+                    static const char *ctrlLegacy[4] = {"attn", "k", "v", "mlp"};
+                    for (int c = 0; c < 4; ++c) {
+                        const std::string base =
+                                config_.inklingExpandedLayout
+                                        ? "loop_" + std::string(ctrlLegacy[c])
+                                        : "loop_" + std::string(ctrlMain[c]) + "_ctrl";
+                        w.inkling.ctrlDown[c] =
+                                loadQuantized(prefix + base + "_down.weight");
+                        w.inkling.ctrlGain[c] =
+                                loadQuantized(prefix + base + "_gain.weight");
+                        w.inkling.ctrlForget[c] =
+                                loadQuantized(prefix + base + "_forget.weight");
+                    }
+                }
+
+                if (w.attnQ.empty() || w.attnK.empty() || w.attnV.empty() ||
+                    w.attnO.empty() || w.inkling.attnGate.empty() ||
+                    w.inkling.attnRel.empty() || w.inkling.attnRelBias.empty() ||
+                    w.ffnGateInp.empty() || w.ffnGateUpExps.empty() ||
+                    w.ffnDownExps.empty() || w.rmsNormFFN.empty()) {
+                    std::cerr << "[TinyCoder] Missing Inkling attention/MoE tensors "
+                                 "for block "
+                              << i << std::endl;
+                    return false;
+                }
             } else {
                 std::cerr << "[TinyCoder] Unknown architecture: " << config_.architecture
                           << " for layer " << i << std::endl;
@@ -1389,7 +1548,11 @@ namespace tinycoder {
     }
 
     bool Model::ensureHostKv(uint32_t firstCpuLayer) {
-        const uint32_t nLayers = config_.numLayers;
+        // Inkling owns one K/V slot per logical layer (the loop passes each
+        // keep their own cache), so the slot count is numKvSlots, not the
+        // number of physical weight blocks.
+        const uint32_t nLayers = config_.numKvSlots > 0 ? config_.numKvSlots
+                                                        : config_.numLayers;
         if (firstCpuLayer >= nLayers) {
             // The device owns every layer; no host slots are needed.
             hostKvFirst_ = firstCpuLayer;
@@ -1545,6 +1708,26 @@ namespace tinycoder {
                       << convChannels << " + gdn " << config_.ssmTimeStepRank
                       << "x" << headV << "x" << headV << ") = "
                       << (memBytes / (1024 * 1024)) << " MB" << std::endl;
+        }
+
+        if (config_.architecture == ARCH_INKLING2 ||
+            config_.architecture == ARCH_INKLING2_LOOP) {
+            const uint32_t kvDim = config_.numKVHeads * config_.headDim;
+            const uint32_t channels = 2 * kvDim + 2 * config_.hiddenSize;
+            const uint32_t nSlots = config_.numKvSlots > 0 ? config_.numKvSlots
+                                                           : config_.numLayers;
+            const uint32_t hist = config_.shortconvLCache > 1
+                                          ? config_.shortconvLCache - 1
+                                          : 0;
+            inklingConvState_.assign(
+                    nSlots, std::vector<float>(
+                                    static_cast<size_t>(hist) * channels, 0.0f));
+            std::cout << "[TinyCoder] Inkling short-conv state: " << nSlots
+                      << " slots x " << hist << " x " << channels << " = "
+                      << ((static_cast<uint64_t>(nSlots) * hist * channels *
+                           sizeof(float)) /
+                          (1024 * 1024))
+                      << " MB" << std::endl;
         }
 
         return true;
@@ -1820,6 +2003,15 @@ namespace tinycoder {
         for (auto &state: kvCache_.q35GdnState) {
             std::fill(state.begin(), state.end(), 0.0f);
         }
+#ifdef USE_CUDA
+        if (inklingGpu_) inklingGpu_->clearKVCache();
+#endif
+        // Inkling short-convolution history is recurrent state: without this,
+        // a second generate() would see the previous conversation's last three
+        // K/V/attention/FFN inputs.
+        for (auto &buf: inklingConvState_) {
+            std::fill(buf.begin(), buf.end(), 0.0f);
+        }
     }
 
     void Model::resetCpuKVState() {
@@ -1845,6 +2037,9 @@ namespace tinycoder {
         }
         for (auto &state: kvCache_.q35GdnState) {
             std::fill(state.begin(), state.end(), 0.0f);
+        }
+        for (auto &buf: inklingConvState_) {
+            std::fill(buf.begin(), buf.end(), 0.0f);
         }
     }
 

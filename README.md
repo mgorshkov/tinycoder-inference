@@ -2,7 +2,7 @@
 
 **High-performant local inference engine** for the [TinyCoder AI](https://github.com/mgorshkov/tinycoder) VS Code extension and the [TinyCoder OpenAI](https://github.com/mgorshkov/tinycoder-openai) project, which exposes the same engine through an OpenAI-compatible API. This repository contains **only the engine**: the C++/CUDA core (`src/cpp/core`), public headers (`include/`), unit tests (`unit_tests/`), benchmarks (`benchmarks/`), and build plumbing.
 
-The engine runs the **Qwen2.5** (`qwen2`), **Qwen3.6** and **Qwen3.8** (`qwen35` dense, `qwen35moe` mixture-of-experts), **Ornith**, **Gemma 4**, and Prism **Ternary-Bonsai** model families from **GGUF** or **EXL3** (`trellis` / `mul1`) checkpoints — e.g. `Qwen3.5-27B` at 1.60 bpw — with **mixed quantization**, **AMX/AVX-512/AVX2 CPU acceleration** (runtime SIMD dispatch), and a **CUDA GPU offload engine**. It is designed to run efficiently on limited hardware.
+The engine runs the **Qwen2.5** (`qwen2`), **Qwen3.6** and **Qwen3.8** (`qwen35` dense, `qwen35moe` mixture-of-experts), **Ornith**, **Gemma 4**, Prism **Ternary-Bonsai**, and **Inkling-2-Mini** (`inkling2` / `inkling2_loop`, looped MoE) model families from **GGUF** or **EXL3** (`trellis` / `mul1`) checkpoints — e.g. `Qwen3.5-27B` at 1.60 bpw — with **mixed quantization**, **AMX/AVX-512/AVX2 CPU acceleration** (runtime SIMD dispatch), and a **CUDA GPU offload engine**. It is designed to run efficiently on limited hardware.
 
 > **Written from scratch — no inference libraries or engines.** Every part of TinyCoder is original code in this repository: the C++/CUDA kernels, GEMV/GEMM and MMA schedules, GGUF and EXL3 loaders, quantizers/dequantizers, tokenizer, scheduler, KV cache, and CPU SIMD paths. It does **not** link, embed, vendor, or call llama.cpp, ggml, Candle, PyTorch, ExLlamaV3, or any other inference runtime; there is **no inference-library dependency** at build or run time. The only third-party code is non-inference plumbing: the [np](https://github.com/mgorshkov/np) array utility, a shared CMake config, and GoogleTest for unit tests (the CUDA Toolkit/cuBLAS is the system GPU runtime). All performance work is TinyCoder's own kernels.
 
@@ -17,7 +17,7 @@ The engine runs the **Qwen2.5** (`qwen2`), **Qwen3.6** and **Qwen3.8** (`qwen35`
 
 ### Strongly recommended (large speed-up)
 
-TinyCoder builds and runs with only the base toolchain, but **both items below are strongly recommended** — without them you get the unoptimised fallback, not the numbers in [BENCHMARKS-2080TI.md](benchmarks/BENCHMARKS-2080TI.md):
+TinyCoder builds and runs with only the base toolchain, but **both items below are strongly recommended** — without them you get the unoptimised fallback, not the numbers in [BENCHMARKS-2080TI.md](benchmarks/gpu/BENCHMARKS-2080TI.md):
 
 - **CUDA Toolkit** ≥ 11.0 + nvcc — **install this if you have any NVIDIA GPU.** CMake enables the GPU offload automatically when nvcc is on the `PATH` (`-DENABLE_CUDA=OFF` forces a CPU-only build); a CPU-only `tinycoder_bench` rejects `--gpu` with an explicit "needs a CUDA build" message rather than an unknown-option error. It enables the GPU offload engine on Turing / Ampere / Ada and newer (RTX 2080 Ti, RTX 3090, RTX 4090, RTX 5090). Without it the engine runs on the CPU only, which is several times to orders of magnitude slower depending on model size; on a model that does not fit in RAM it will not run at all.
 - **OpenMP** — **usually already present with the compiler**, so this normally costs nothing. It parallelises the CPU path across all cores; without it CPU inference is single-threaded.
@@ -69,8 +69,9 @@ This installs the static library and headers (`install(TARGETS tinycoder_core �
 
 GPU performance against llama.cpp and exllamav3 — the comparison table, the measurement
 protocol, and the procedure used for the exllamav3 baseline — lives in
-[BENCHMARKS-2080TI.md](benchmarks/BENCHMARKS-2080TI.md), with the Ampere table in
-[BENCHMARKS-3090.md](benchmarks/BENCHMARKS-3090.md).
+[BENCHMARKS-2080TI.md](benchmarks/gpu/BENCHMARKS-2080TI.md), with the Ampere table in
+[BENCHMARKS-3090.md](benchmarks/gpu/BENCHMARKS-3090.md). CPU numbers for the same
+checkpoints are in [BENCHMARKS-2X-XEON-E5-2686-V4.md](benchmarks/cpu/BENCHMARKS-2X-XEON-E5-2686-V4.md).
 
 ## Key Features
 
@@ -89,7 +90,6 @@ protocol, and the procedure used for the exllamav3 baseline — lives in
 - **EXL3 native kernels** — trellis reconstruct, GEMV and a fused prefill GEMM under [`cuda/exl3/`](src/cpp/core/cuda/exl3), with the cublasLt autotuned path as default and `TINYCODER_EXL3_LT=0` reproducing the older fixed-order k summation bit-for-bit
 - **Enabled by default** in builds compiled with `ENABLE_CUDA=ON`; all layers offloaded; automatic fallback to CPU when CUDA is unavailable or at the first forward error
 - **Two offload modes for models that exceed VRAM**: hybrid partial offload keeps the whole model in RAM and mirrors the first `numGpuLayers` layers to the GPU, and the MoE path additionally streams experts for the 35B-A3B checkpoint through a layer arena while the dense body stays resident
-- **Context window sized by memory, not by a constant** — `model.setContextLength(N)` (or `tinycoder_bench --ctx N`) asks for N tokens before the load; the planner measures free VRAM/RAM and grants the largest window that still fits the weights, the session's fixed ~1.4 GiB of scratch, and the K/V it is about to allocate. It sheds the int8 decode mirror first, then switches the K/V store to int8, so an 11 GB card holds **52,480** tokens for a 9B `q4_k_m` at f32 and **196,352** at int8 (27B EXL3: 2,560 f32 / **12,288** int8). A request that does not fit is reduced to the fit and the reason is printed; a window below 1024 tokens refuses the load. The default is unchanged at 2048 tokens, so every published throughput number still describes the shipped default. `TINYCODER_CONTEXT_DEBUG=1` prints the planner's inputs
 - Runtime controls: `TINYCODER_GPU=0` forces the CPU path, `TINYCODER_NGL` limits offload to N layers (unset → automatic VRAM fit), `TINYCODER_INT8_GEMM=0` disables the int8 prefill path, `TINYCODER_KV8=0` disables the int8 decode mirror (it follows the context plan by default), `TINYCODER_CONTEXT_KV8` pins the precision the planner may grant, `TINYCODER_GPU_VERBOSE=1` prints per-stage CUDA timings. Full list in [ENVIRONMENT.md](ENVIRONMENT.md).
 
 #### Supported GPUs
@@ -113,34 +113,10 @@ The CUDA offload engine runs natively on **Turing, Ampere and Ada GPUs — inclu
 
 All are fetched automatically; no system packages beyond a compiler, CMake, and (optionally) the CUDA Toolkit are required. No llama.cpp, ggml, Candle, PyTorch, or ExLlamaV3 code is used anywhere in the build.
 
-## Getting a Model
+## Models
 
-TinyCoder loads two checkpoint formats:
-
-- **GGUF** v3 — the llama.cpp/GGML container. Quantized K/IQ blocks, F32/F16 tensors, tokenizer and architecture metadata are read directly; `general.architecture` selects the model family.
-- **EXL3** — the ExLlamaV3 `trellis`/`mul1` checkpoint format (HF `safetensors` + `config.json` + `tokenizer.json`).
-
-Download the `.gguf` file and point the engine at it via `TINYCODER_MODEL_PATH` or the `Model::load()` API. For an **EXL3** checkpoint, download the HF checkpoint **directory** (e.g. `Qwen/Qwen3.5-27B-exl3-1.60bpw` — `config.json` + `*.safetensors` + `tokenizer.json`) and point the engine at the directory path; `Model::load` auto-selects [`EXL3Loader`](src/cpp/core/EXL3Loader.cpp).
-
-[`Model::load`](src/cpp/core/ModelLoad.cpp) detects the format automatically, and both formats use the same CUDA/CPU kernels, KV cache, and offload path.
-
-### Checkpoints behind the published benchmarks
-
-Every row in [BENCHMARKS-2080TI.md](benchmarks/BENCHMARKS-2080TI.md) and [BENCHMARKS-3090.md](benchmarks/BENCHMARKS-3090.md) was measured on one of these files; the link is the exact artefact, so a row can be reproduced rather than approximated:
-
-| Model | Quantization | Download |
-|---|---|---|
-| Qwen2.5-Coder-1.5B-Instruct | `q2_k` | [Qwen2.5-Coder-1.5B-Instruct-Q2_K.gguf](https://huggingface.co/unsloth/Qwen2.5-Coder-1.5B-Instruct-GGUF/resolve/main/Qwen2.5-Coder-1.5B-Instruct-Q2_K.gguf) |
-| Qwen2.5-Coder-1.5B-Instruct | `iq3_xxs` | [qwen2.5-coder-1.5b-iq3_xxs-imat.gguf](https://huggingface.co/ggml-org/Qwen2.5-Coder-1.5B-IQ3_XXS-GGUF/resolve/main/qwen2.5-coder-1.5b-iq3_xxs-imat.gguf) |
-| Qwen2.5-Coder-7B-Instruct | `iq2_s` | [Qwen2.5-Coder-7B-Instruct-IQ2_S.gguf](https://huggingface.co/ThomasBaruzier/Qwen2.5-Coder-7B-Instruct-GGUF/resolve/main/Qwen2.5-Coder-7B-Instruct-IQ2_S.gguf) |
-| Qwen2.5-Coder-7B-Instruct | `iq3_xxs` | [Qwen2.5-Coder-7B-Instruct-IQ3_XXS.gguf](https://huggingface.co/ThomasBaruzier/Qwen2.5-Coder-7B-Instruct-GGUF/resolve/main/Qwen2.5-Coder-7B-Instruct-IQ3_XXS.gguf) |
-| Ternary-Bonsai-2-27B (Prism) | `PQ2_0` | [Ternary-Bonsai-2-27B-PQ2_0.gguf](https://huggingface.co/prism-ml/Ternary-Bonsai-2-27B-gguf/resolve/main/Ternary-Bonsai-2-27B-PQ2_0.gguf) |
-| Ternary-Bonsai-2-27B (Prism) | `PTQ1_0` | [Ternary-Bonsai-2-27B-PTQ1_0.gguf](https://huggingface.co/prism-ml/Ternary-Bonsai-2-27B-gguf/resolve/main/Ternary-Bonsai-2-27B-PTQ1_0.gguf) |
-| Ornith-1.5-9B | `q4_k_m` | [Ornith-1.5-9B-Q4_K_M.gguf](https://huggingface.co/bartowski/Ornith-1.5-9B-GGUF/resolve/main/Ornith-1.5-9B-Q4_K_M.gguf) |
-| Ornith-1.5-35B-A3B | `q8_0` | [Ornith-1.5-35B-A3B-Q8_0.gguf](https://huggingface.co/AtomicChat/Ornith-1.5-35B-A3B-GGUF/resolve/main/Ornith-1.5-35B-A3B-Q8_0.gguf) |
-| Qwen3.8-27B (EXL3, directory) | `1.60bpw` | [turboderp/Qwen3.8-27B-exl3 — branch `SC_1.60bpw_H3`](https://huggingface.co/turboderp/Qwen3.8-27B-exl3/tree/SC_1.60bpw_H3) |
-
-The EXL3 row is a **branch of a multi-checkpoint repository**, so it has no single `resolve/main` file: download the branch as a directory (`config.json`, `*.safetensors`, tokenizer files) and point `Model::load` at the directory, per the paragraph above.
+Supported formats, checkpoints and the Inkling-2-Mini specifics are in
+[MODELS.md](MODELS.md).
 
 ## Usage (C++ API)
 

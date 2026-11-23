@@ -183,6 +183,35 @@ void gemvLaunchQ80F32Plain(const void *vx, const void *vy,
 void gemvLaunchQuantizeQ8F32(const void *x, void *vy, int kx,
                              int kx_padded, int num_rows,
                              void *stream);
+// Expert-indexed Q8_1 GEMV: rowsPer*nUsed rows in one launch, weight rows
+// reached through a device-side expert index (routed MoE, no host sync).
+#define DECL_GEMV_EXPERT(tag)                                                 \
+    void gemvLaunchExpert##tag(const void *vx, const void *vy, void *dst,     \
+                               int ncols_x, int nrows_x, int stride_col_y,    \
+                               const int *rowIdx, int rowsPer, void *stream);
+DECL_GEMV_EXPERT(Q4K)
+DECL_GEMV_EXPERT(Q5K)
+DECL_GEMV_EXPERT(Q6K)
+DECL_GEMV_EXPERT(Q80)
+DECL_GEMV_EXPERT(IQ2S)
+DECL_GEMV_EXPERT(IQ2XS)
+DECL_GEMV_EXPERT(IQ3S)
+DECL_GEMV_EXPERT(IQ3XXS)
+DECL_GEMV_EXPERT(Q20)
+// gemv/GemvExpertIq.cu: the same expert shape for the two i-quants the dense
+// decode file does not carry.  They reuse gemm/QuantDot.cuh's vec_dots.
+DECL_GEMV_EXPERT(IQ2XXS)
+DECL_GEMV_EXPERT(IQ1S)
+// Four-rows-per-warp variants of the same expert entries (decode gate/up):
+// one warp per four rows, shared Q8_1 activation row, no stride_col_y.
+#define DECL_GEMV_EXPERT4(tag)                                                \
+    void gemvLaunchExpert4##tag(const void *vx, const void *vy, void *dst,    \
+                                int ncols_x, int nrows_x, const int *rowIdx,  \
+                                int rowsPer, void *stream);
+DECL_GEMV_EXPERT4(IQ2XXS)
+DECL_GEMV_EXPERT4(IQ2XS)
+DECL_GEMV_EXPERT4(IQ2S)
+DECL_GEMV_EXPERT4(IQ1S)
 }
 
 namespace tinycoder::gpu {
@@ -199,6 +228,8 @@ namespace tinycoder::gpu {
         constexpr int kTypeIQ2XS_ = 17;
         constexpr int kTypeIQ3S_ = 21;
         constexpr int kTypeIQ3XXS_ = 18;
+        constexpr int kTypeIQ2XXS_ = 16;
+        constexpr int kTypeIQ1S_ = 19;
         constexpr int kInt8Y = 128;// weight rows per tile (Turing+)
 
         struct Int8Ctx {
@@ -716,16 +747,32 @@ namespace tinycoder::gpu {
                              rows, cols, seqLen);
             return false;
         }
-        if (seqLen < 8 || rows == 0 || cols == 0) return false;
-        // The activation quantizer pads each row to 512 values and the kernel
-        // derives its y row stride from that padding; every dense qwen35
-        // projection is aligned (4096 / 12288 / 2048).
-        if ((cols & 511u) != 0u) return false;
+        if (seqLen < 8 || rows == 0 || cols == 0) {
+            noteInt8Fallback("seqLen/rows/cols below the int8 floor", type, rows,
+                             cols, seqLen);
+            return false;
+        }
+        // The activation quantizer packs one Q8_1 block per 32 values and writes
+        // them in 128-value groups; a partial final group is simply not read by
+        // the kernel (it loops k/qk weight blocks, i.e. floor(k/128) groups for
+        // every type that reaches this point).  So K only has to be a multiple
+        // of 128, not of 512: Inkling's 2304 = 18*128 and 1152 = 9*128 dense
+        // projections are aligned, and their quantized rows are exactly
+        // (cols/128)*144 bytes, which is what yBytes below allocates.
+        if ((cols & 127u) != 0u) {
+            noteInt8Fallback("cols is not a multiple of 128", type, rows, cols,
+                             seqLen);
+            return false;
+        }
 
         const Int8Ctx &c = ctx();
         const size_t yBytes =
                 static_cast<size_t>(seqLen) * (static_cast<size_t>(cols) / 128u) * 144u;
-        if (!ensure(g_yq, g_yqBytes, yBytes)) return false;
+        if (!ensure(g_yq, g_yqBytes, yBytes)) {
+            noteInt8Fallback("cannot allocate the Q8_1 activation scratch", type,
+                             rows, cols, seqLen);
+            return false;
+        }
 
         cudaStream_t s = reinterpret_cast<cudaStream_t>(stream);
         if (type == kTypeQ6K_ || type == kTypeQ8_0_ || type == kTypeIQ2S_ ||
@@ -741,7 +788,11 @@ namespace tinycoder::gpu {
                     static_cast<int64_t>(cols), 0, 0, static_cast<int64_t>(cols),
                     static_cast<int64_t>(seqLen), 1, 1, static_cast<void *>(s));
         }
-        if (cudaGetLastError() != cudaSuccess) return false;
+        if (cudaGetLastError() != cudaSuccess) {
+            noteInt8Fallback("activation quantize launch failed", type, rows,
+                             cols, seqLen);
+            return false;
+        }
 
         int tileX = 128;
         if (seqLen < 64 || gemmSmemBytes(128, type) > static_cast<size_t>(c.smpbo))
@@ -893,6 +944,146 @@ namespace tinycoder::gpu {
         gemvIQ3XXSFusedGUF32PlainCuda1<<<dim3((rows + 3) / 4), dim3(32, 4), 0, s>>>(
                 wg, wu, g_mvq, gout, uout, static_cast<int>(cols),
                 static_cast<int>(rows), 0);
+        return cudaGetLastError() == cudaSuccess;
+    }
+
+    bool int8GemvExpert(int type, const void *w, const float *x, float *out,
+                        uint32_t rowsPer, uint32_t cols, const int32_t *idx,
+                        uint32_t nUsed, uint32_t xStride, void *stream) {
+        if (!int8GemmAvailable()) return false;
+        if (rowsPer == 0 || cols == 0 || nUsed == 0 || idx == nullptr)
+            return false;
+        // xStride 0: every expert reads the same activation row (gate/up).
+        // xStride == cols: the per-expert rows are contiguous (down).
+        if (xStride != 0 && xStride != cols) return false;
+        const uint32_t rows = rowsPer * nUsed;
+        const uint32_t colsPadded = (cols + 511u) & ~511u;
+        const uint32_t quantRows = (xStride == 0) ? 1u : nUsed;
+        const size_t need = static_cast<size_t>(quantRows) *
+                            (colsPadded / 32u) * 36u;
+        if (!ensure(g_mvq, g_mvqBytes, need)) return false;
+
+        cudaStream_t s = reinterpret_cast<cudaStream_t>(stream);
+        gemvLaunchQuantizeQ8F32(x, g_mvq, static_cast<int>(cols),
+                                static_cast<int>(colsPadded),
+                                static_cast<int>(quantRows),
+                                static_cast<void *>(s));
+        if (cudaGetLastError() != cudaSuccess) return false;
+        const int strideY =
+                (xStride == 0) ? 0 : static_cast<int>(colsPadded / 32u);
+        switch (type) {
+            case kTypeQ4K_:
+                gemvLaunchExpertQ4K(w, g_mvq, out, static_cast<int>(cols),
+                                    static_cast<int>(rows), strideY, idx,
+                                    static_cast<int>(rowsPer), s);
+                break;
+            case kTypeQ5K_:
+                gemvLaunchExpertQ5K(w, g_mvq, out, static_cast<int>(cols),
+                                    static_cast<int>(rows), strideY, idx,
+                                    static_cast<int>(rowsPer), s);
+                break;
+            case kTypeQ6K_:
+                gemvLaunchExpertQ6K(w, g_mvq, out, static_cast<int>(cols),
+                                    static_cast<int>(rows), strideY, idx,
+                                    static_cast<int>(rowsPer), s);
+                break;
+            case kTypeQ8_0_:
+                gemvLaunchExpertQ80(w, g_mvq, out, static_cast<int>(cols),
+                                    static_cast<int>(rows), strideY, idx,
+                                    static_cast<int>(rowsPer), s);
+                break;
+            case kTypeIQ2XS_:
+                gemvLaunchExpertIQ2XS(w, g_mvq, out, static_cast<int>(cols),
+                                      static_cast<int>(rows), strideY, idx,
+                                      static_cast<int>(rowsPer), s);
+                break;
+            case kTypeIQ2S_:
+                gemvLaunchExpertIQ2S(w, g_mvq, out, static_cast<int>(cols),
+                                     static_cast<int>(rows), strideY, idx,
+                                     static_cast<int>(rowsPer), s);
+                break;
+            case kTypeIQ3S_:
+                gemvLaunchExpertIQ3S(w, g_mvq, out, static_cast<int>(cols),
+                                     static_cast<int>(rows), strideY, idx,
+                                     static_cast<int>(rowsPer), s);
+                break;
+            case kTypeIQ3XXS_:
+                gemvLaunchExpertIQ3XXS(w, g_mvq, out, static_cast<int>(cols),
+                                       static_cast<int>(rows), strideY, idx,
+                                       static_cast<int>(rowsPer), s);
+                break;
+            case 42:// Q2_0, the expert-down type on the IQ2_XXS checkpoint
+                gemvLaunchExpertQ20(w, g_mvq, out, static_cast<int>(cols),
+                                    static_cast<int>(rows), strideY, idx,
+                                    static_cast<int>(rowsPer), s);
+                break;
+            // IQ2_XXS / IQ1_S: the routed gate/up experts of the Inkling
+            // IQ2_XXS checkpoint.  Same expert index, same Q8_1 activation
+            // buffer and same launch shape as the types above; only the
+            // dot-product body differs (gemv/GemvExpertIq.cu).
+            case kTypeIQ2XXS_:
+                gemvLaunchExpertIQ2XXS(w, g_mvq, out, static_cast<int>(cols),
+                                       static_cast<int>(rows), strideY, idx,
+                                       static_cast<int>(rowsPer), s);
+                break;
+            case kTypeIQ1S_:
+                gemvLaunchExpertIQ1S(w, g_mvq, out, static_cast<int>(cols),
+                                     static_cast<int>(rows), strideY, idx,
+                                     static_cast<int>(rowsPer), s);
+                break;
+            default:
+                return false;
+        }
+        return cudaGetLastError() == cudaSuccess;
+    }
+
+    // Gate/up counterpart of int8GemvExpert, four rows per warp.
+    //
+    // The one-row kernel launches one block per output row, so 18432 blocks per
+    // gate/up call each re-read the same Q8_1 activation row through a
+    // four-warp reduction.  This entry serves only the shared-activation shape
+    // (every expert reads the same row), which is exactly gate/up; it quantizes
+    // that row once with the same gemvLaunchQuantizeQ8F32 and launches the
+    // 4-rows-per-warp kernel in gemv/GemvExpertIq.cu.  The prefill path keeps
+    // calling int8GemvExpert, so its arithmetic is untouched.
+    bool int8GemvExpert4(int type, const void *w, const float *x, float *out,
+                         uint32_t rowsPer, uint32_t cols, const int32_t *idx,
+                         uint32_t nUsed, void *stream) {
+        if (!int8GemmAvailable()) return false;
+        if (rowsPer == 0 || cols == 0 || nUsed == 0 || idx == nullptr)
+            return false;
+        if (type != kTypeIQ2XXS_ && type != kTypeIQ2XS_ &&
+            type != kTypeIQ2S_ && type != kTypeIQ1S_)
+            return false;
+        // One quant block per 256 weights is what the kernel strides over.
+        if ((cols & 255u) != 0u) return false;
+        const uint32_t colsPadded = (cols + 511u) & ~511u;
+        const size_t need = static_cast<size_t>(colsPadded / 32u) * 36u;
+        if (!ensure(g_mvq, g_mvqBytes, need)) return false;
+        cudaStream_t s = reinterpret_cast<cudaStream_t>(stream);
+        gemvLaunchQuantizeQ8F32(x, g_mvq, static_cast<int>(cols),
+                                static_cast<int>(colsPadded), 1,
+                                static_cast<void *>(s));
+        if (cudaGetLastError() != cudaSuccess) return false;
+        const int rows = static_cast<int>(rowsPer * nUsed);
+        const int c = static_cast<int>(cols);
+        const int rp = static_cast<int>(rowsPer);
+        switch (type) {
+            case kTypeIQ2XXS_:
+                gemvLaunchExpert4IQ2XXS(w, g_mvq, out, c, rows, idx, rp, s);
+                break;
+            case kTypeIQ2XS_:
+                gemvLaunchExpert4IQ2XS(w, g_mvq, out, c, rows, idx, rp, s);
+                break;
+            case kTypeIQ2S_:
+                gemvLaunchExpert4IQ2S(w, g_mvq, out, c, rows, idx, rp, s);
+                break;
+            case kTypeIQ1S_:
+                gemvLaunchExpert4IQ1S(w, g_mvq, out, c, rows, idx, rp, s);
+                break;
+            default:
+                return false;
+        }
         return cudaGetLastError() == cudaSuccess;
     }
 
