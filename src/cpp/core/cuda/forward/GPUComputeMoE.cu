@@ -1654,37 +1654,170 @@ namespace tinycoder::gpu {
     // block (one warp per output row) cuts that traffic 16x; a plain one-token-per-
     // block version was measured slower than the per-token GEMV fallback.
 
+    // One warp walks a row, and warps stride over rows: the earlier version
+    // launched 32*nRows threads (1024 for a 32-row ssm_alpha/beta projection),
+    // which with this kernel's TP accumulators exceeded the register file and
+    // made the launch itself fail.  The failure was ignored, so the projection
+    // was never written AND the pending CUDA error was later consumed by
+    // int8Gemm's quantize check, which then falsely fell back to the integer
+    // prefill for every following projection.
     template<int TP>
     __global__ void q8SmallRowsGemm(const uint8_t *__restrict__ w,
                                     const float *__restrict__ x,
                                     float *__restrict__ y,
                                     uint32_t rows, uint32_t cols, uint32_t seqLen) {
+        const uint32_t warps = blockDim.x >> 5;
         const uint32_t warp = threadIdx.x >> 5;
         const uint32_t lane = threadIdx.x & 31u;
-        if (warp >= rows) return;
         const uint32_t tok0 = blockIdx.x * TP;
         const uint32_t nt = (seqLen - tok0 < TP) ? (seqLen - tok0) : TP;
         const uint32_t nb = cols / 32u;
-        const uint8_t *wr = w + static_cast<size_t>(warp) * nb * 34u;
         float acc[TP];
-        for (int t = 0; t < TP; ++t) acc[t] = 0.0f;
-        for (uint32_t b = lane; b < nb; b += 32u) {
-            const uint8_t *p = wr + static_cast<size_t>(b) * 34u;
-            const float d = __half2float(*reinterpret_cast<const __half *>(p));
-            const int8_t *q = reinterpret_cast<const int8_t *>(p + 2);
+        for (uint32_t row = warp; row < rows; row += warps) {
+            const uint8_t *wr = w + static_cast<size_t>(row) * nb * 34u;
+            for (int t = 0; t < TP; ++t) acc[t] = 0.0f;
+            for (uint32_t b = lane; b < nb; b += 32u) {
+                const uint8_t *p = wr + static_cast<size_t>(b) * 34u;
+                const float d = __half2float(*reinterpret_cast<const __half *>(p));
+                const int8_t *q = reinterpret_cast<const int8_t *>(p + 2);
+                for (uint32_t t = 0; t < nt; ++t) {
+                    const float *xb = x + static_cast<size_t>(tok0 + t) * cols + b * 32u;
+                    float sc = 0.0f;
+                    for (int i = 0; i < 32; ++i) sc += static_cast<float>(q[i]) * xb[i];
+                    acc[t] += d * sc;
+                }
+            }
             for (uint32_t t = 0; t < nt; ++t) {
-                const float *xb = x + static_cast<size_t>(tok0 + t) * cols + b * 32u;
-                float sc = 0.0f;
-                for (int i = 0; i < 32; ++i) sc += static_cast<float>(q[i]) * xb[i];
-                acc[t] += d * sc;
+                float a = acc[t];
+                for (uint32_t st = 16u; st > 0u; st >>= 1)
+                    a += __shfl_down_sync(0xffffffffu, a, st);
+                if (lane == 0)
+                    y[static_cast<size_t>(tok0 + t) * rows + row] = a;
             }
         }
+    }
+
+    // One warp per output row, with the token's activation row staged in
+    // shared memory once.  The plain version below re-reads the same
+    // activation from DRAM once per row (rows x redundancy: 168 MB for a
+    // 32-row projection at 512 tokens), which made these narrow Q8_0
+    // projections the prefill wall.  The per-lane b sequence and the warp
+    // reduction are unchanged, so the result is bit-identical.
+    template<int TP>
+    __global__ void q8SmallRowsGemmSmem(const uint8_t *__restrict__ w,
+                                        const float *__restrict__ x,
+                                        float *__restrict__ y,
+                                        uint32_t rows, uint32_t cols, uint32_t seqLen) {
+        extern __shared__ float xs[];
+        const uint32_t warps = blockDim.x >> 5;
+        const uint32_t warp = threadIdx.x >> 5;
+        const uint32_t lane = threadIdx.x & 31u;
+        const uint32_t tok0 = blockIdx.x * TP;
+        const uint32_t nt = (seqLen - tok0 < TP) ? (seqLen - tok0) : TP;
+        const uint32_t nb = cols / 32u;
+        float acc[TP];
+        // Same row striding and per-lane b sequence as the plain kernel, so
+        // the arithmetic is identical; only the activation source changes.
+        for (uint32_t row = warp; row < rows; row += warps) {
+            const uint8_t *wr = w + static_cast<size_t>(row) * nb * 34u;
+            for (int t = 0; t < TP; ++t) acc[t] = 0.0f;
+            for (uint32_t t = 0; t < nt; ++t) {
+                const float *xrow = x + static_cast<size_t>(tok0 + t) * cols;
+                // Pad each 32-float block to 33: without it every lane reads
+                // xs[b*32 + i], i.e. bank i for all lanes, a 32-way
+                // shared-memory conflict that made staging only 2x faster than
+                // the DRAM re-read it replaced.
+                for (uint32_t i = threadIdx.x; i < nb * 32u; i += blockDim.x) {
+                    const uint32_t pb = i >> 5u;
+                    const uint32_t pj = i & 31u;
+                    xs[pb * 33u + pj] = xrow[i];
+                }
+                __syncthreads();
+                for (uint32_t b = lane; b < nb; b += 32u) {
+                    const uint8_t *p = wr + static_cast<size_t>(b) * 34u;
+                    const float d = __half2float(*reinterpret_cast<const __half *>(p));
+                    const int8_t *q = reinterpret_cast<const int8_t *>(p + 2);
+                    const float *xb = xs + b * 33u;
+                    float sc = 0.0f;
+                    for (int i = 0; i < 32; ++i) sc += static_cast<float>(q[i]) * xb[i];
+                    acc[t] += d * sc;
+                }
+                __syncthreads();
+            }
+            for (uint32_t t = 0; t < nt; ++t) {
+                float a = acc[t];
+                for (uint32_t st = 16u; st > 0u; st >>= 1)
+                    a += __shfl_down_sync(0xffffffffu, a, st);
+                if (lane == 0)
+                    y[static_cast<size_t>(tok0 + t) * rows + row] = a;
+            }
+        }
+    }
+
+    // Two output rows per warp, one staged activation: with 16 warps this
+    // covers the 32-row ssm_alpha/beta projections with the activation read
+    // exactly once per token.  Per (row, token) the b sequence and the warp
+    // reduction match the plain kernel, so the result is bit-identical.
+    template<int TP>
+    __global__ void q8SmallRowsGemmSmem2(const uint8_t *__restrict__ w,
+                                         const float *__restrict__ x,
+                                         float *__restrict__ y,
+                                         uint32_t rows, uint32_t cols, uint32_t seqLen) {
+        extern __shared__ float xs[];
+        const uint32_t warps = blockDim.x >> 5;
+        const uint32_t warp = threadIdx.x >> 5;
+        const uint32_t lane = threadIdx.x & 31u;
+        const uint32_t tok0 = blockIdx.x * TP;
+        const uint32_t nt = (seqLen - tok0 < TP) ? (seqLen - tok0) : TP;
+        const uint32_t nb = cols / 32u;
+        const uint32_t r0 = warp;
+        const uint32_t r1 = warp + warps;
+        const bool a0 = r0 < rows;
+        const bool a1 = r1 < rows;
+        const uint8_t *w0 = a0 ? w + static_cast<size_t>(r0) * nb * 34u : w;
+        const uint8_t *w1 = a1 ? w + static_cast<size_t>(r1) * nb * 34u : w;
+        float acc0[TP], acc1[TP];
+        for (int t = 0; t < TP; ++t) acc0[t] = acc1[t] = 0.0f;
         for (uint32_t t = 0; t < nt; ++t) {
-            float a = acc[t];
+            const float *xrow = x + static_cast<size_t>(tok0 + t) * cols;
+            for (uint32_t i = threadIdx.x; i < nb * 32u; i += blockDim.x) {
+                const uint32_t pb = i >> 5u;
+                const uint32_t pj = i & 31u;
+                xs[pb * 33u + pj] = xrow[i];
+            }
+            __syncthreads();
+            for (uint32_t b = lane; b < nb; b += 32u) {
+                const float *xb = xs + b * 33u;
+                if (a0) {
+                    const uint8_t *p = w0 + static_cast<size_t>(b) * 34u;
+                    const float d = __half2float(*reinterpret_cast<const __half *>(p));
+                    const int8_t *q = reinterpret_cast<const int8_t *>(p + 2);
+                    float sc = 0.0f;
+                    for (int i = 0; i < 32; ++i) sc += static_cast<float>(q[i]) * xb[i];
+                    acc0[t] += d * sc;
+                }
+                if (a1) {
+                    const uint8_t *p = w1 + static_cast<size_t>(b) * 34u;
+                    const float d = __half2float(*reinterpret_cast<const __half *>(p));
+                    const int8_t *q = reinterpret_cast<const int8_t *>(p + 2);
+                    float sc = 0.0f;
+                    for (int i = 0; i < 32; ++i) sc += static_cast<float>(q[i]) * xb[i];
+                    acc1[t] += d * sc;
+                }
+            }
+            __syncthreads();
+        }
+        for (uint32_t t = 0; t < nt; ++t) {
+            float a = acc0[t];
             for (uint32_t st = 16u; st > 0u; st >>= 1)
                 a += __shfl_down_sync(0xffffffffu, a, st);
-            if (lane == 0)
-                y[static_cast<size_t>(tok0 + t) * rows + warp] = a;
+            if (a0 && lane == 0)
+                y[static_cast<size_t>(tok0 + t) * rows + r0] = a;
+            float b2 = acc1[t];
+            for (uint32_t st = 16u; st > 0u; st >>= 1)
+                b2 += __shfl_down_sync(0xffffffffu, b2, st);
+            if (a1 && lane == 0)
+                y[static_cast<size_t>(tok0 + t) * rows + r1] = b2;
         }
     }
 
@@ -1734,11 +1867,14 @@ namespace tinycoder::gpu {
         // pass once and replay it, refreshing only the token and position
         // device scalars.  A capture failure falls back to the eager path.
         const char *qgEnv = std::getenv("TINYCODER_Q35_GRAPH");
-        // Opt-in: capture works and replays correctly, but it measured +0.3%
-        // (74.4 -> 74.6 tok/s) -- the decode is GPU-kernel bound, not host
-        // launch bound, and the first decode pays a ~1.3 s capture.  Enable
-        // with TINYCODER_Q35_GRAPH=1 when the host is the bottleneck.
-        const bool graphOn = qgEnv != nullptr && qgEnv[0] != '\0' && qgEnv[0] != '0';
+        // Default ON: capture-and-replay removes the per-token host dispatch on
+        // the sequence==1 full-offload path.  Measured tg128, same binary,
+        // three runs each: Qwen3.5-4B 134.99 -> 135.68 (+0.5%), Ornith-9B
+        // 85.31 -> 85.77, 27B EXL3 neutral (30.12 / 30.04).  The capture cost
+        // is amortised even at n-gen 8 (133.60 -> 134.82), so short generations
+        // do not pay for it.  TINYCODER_Q35_GRAPH=0 restores eager dispatch.
+        const bool graphOn =
+                !(qgEnv != nullptr && qgEnv[0] == '0' && qgEnv[1] == '\0');
         const bool graphWanted = graphOn && seqLen == 1 && fullOffload &&
                                  !computeAllLogits && !graphCaptureFailed_;
         if (graphWanted && graphBuilt_) {
@@ -1916,6 +2052,14 @@ namespace tinycoder::gpu {
         static int g_pCnt = 0;
         static long g_pTotal = 0;
         static long g_pEnter = 0;
+        // TINYCODER_PROF_EVERY: reduce+print every N projection scopes. The
+        // 4000 default suits decode; a 512-token prefill makes only ~300, so
+        // profiling a prefill needs a smaller window.
+        static const long g_pEvery = [] {
+            const char *e = std::getenv("TINYCODER_PROF_EVERY");
+            const long v = e != nullptr ? std::strtol(e, nullptr, 10) : 4000;
+            return v > 0 ? v : 4000;
+        }();
         // Event pairs are RECORDED only and reduced in one batch after a single
         // stream sync: synchronising per call (the first version) serialised the
         // stream and inflated the small projections' measured share.
@@ -1944,7 +2088,7 @@ namespace tinycoder::gpu {
                     g_pS[g_pSN].nm = nm;
                     ++g_pSN;
                 }
-                if (++g_pTotal % 4000 == 0 && g_pSN > 0) {
+                if (++g_pTotal % g_pEvery == 0 && g_pSN > 0) {
                     cudaStreamSynchronize(g_stream);
                     g_pCnt = 0;
                     for (int i = 0; i < g_pSN; ++i) {
@@ -2125,18 +2269,34 @@ namespace tinycoder::gpu {
                                       m.type == kTypeIQ4NL)
                                              ? 32u
                                              : 256u;
-            // Optional Q4_K/Q6_K prefill via F16 dequant + cuBLAS; measured
-            // against the int8 stream-K path with TINYCODER_Q4_CUBLAS=1.
-            if (batchPrefill && !folded &&
-                (m.type == kTypeQ4K || m.type == kTypeQ6K) &&
-                std::getenv("TINYCODER_Q4_CUBLAS") != nullptr) {
+            // cuBLAS fp16 GEMM for a Q4_K/Q5_K prefill projection when its
+            // persistent fp16 twin is resident: the twin was built for exactly
+            // this, the GEMM needs no streaming dequant, and the fp16
+            // tensor-core path beats the int8 stream-k kernel on the shapes
+            // where the twin fits.  Without a twin the dequant is per-layer
+            // streaming and int8 wins, so the condition is the buffer, not a
+            // shape guess.  Measured pp512, Qwen3.5-4B: 3,766 -> 3,945 (all
+            // twins resident); Ornith-9B has only 17 twins and measured 5%
+            // slower when every Q4_K was forced through cuBLAS, which is what
+            // the twin test avoids.  TINYCODER_Q4_CUBLAS / _Q5_CUBLAS: =0
+            // disables, any other value forces it for every shape (for A/B).
+            auto cublasMode = [](const char *name) {
+                const char *e = std::getenv(name);
+                if (e == nullptr) return -1;
+                return e[0] == '0' ? 0 : 1;
+            };
+            static const int q4Mode = cublasMode("TINYCODER_Q4_CUBLAS");
+            static const int q5Mode = cublasMode("TINYCODER_Q5_CUBLAS");
+            const bool twinReady = m.f16Twin != nullptr;
+            if (batchPrefill && !folded && m.type == kTypeQ4K &&
+                (q4Mode == 1 || (q4Mode < 0 && twinReady))) {
                 std::string q4Err;
                 if (gemmQ8Cublas(m, x, y, seqLen, q4Err)) return true;
             }
             if (batchPrefill && !folded &&
                 (m.type == kTypeQ6K ||
                  (m.type == kTypeQ5K &&
-                  std::getenv("TINYCODER_Q5_CUBLAS") != nullptr))) {
+                  (q5Mode == 1 || (q5Mode < 0 && twinReady))))) {
                 std::string q6Err;
                 if (gemmQ8Cublas(m, x, y, seqLen, q6Err)) return true;
             }
@@ -2161,9 +2321,17 @@ namespace tinycoder::gpu {
             // rows goes through int8.
             // Narrow Q8_0 projections (rows < 128) cannot use the 128-row int8
             // tile, so batch them here instead of falling back to per-token GEMV.
-            // ON: 2449 -> 2497 pp512 on Ornith-9B-Q8_0, logits identical
-            // (21.191521 both ways), neutral on 9B q4_k_m (2470->2474) and 7B
-            // iq3_xxs (2742->2737).  TINYCODER_Q8_SMALL=0 disables.
+            // ON: the fp32-x batched dot matches the CPU oracle on the
+            // prompt-length logits (18.454 against the oracle's 18.453), while
+            // the fp16 cuBLAS fallback that replaces it drifts to 18.474 and
+            // the text gate's first answer then stops mid-function --
+            // disabling this kernel is even faster (pp512 3359 -> 4210 on
+            // Qwen3.5-4B) but numerically worse, so it stays on.  The staged
+            // variants below remove the kernel's redundant activation reads
+            // (they were re-read once per output row) without changing a
+            // single arithmetic result: pp512 3359 -> 3766.
+            // TINYCODER_Q8_SMALL=0 selects the cuBLAS fallback,
+            // TINYCODER_Q8_SMALL_SMEM=0 the un-staged kernel, for measurement.
             static const bool q8Small = [] {
                 const char *e = std::getenv("TINYCODER_Q8_SMALL");
                 return e == nullptr || e[0] != '0';
@@ -2171,25 +2339,65 @@ namespace tinycoder::gpu {
             if (q8Small && batchPrefill && !folded && m.type == kTypeQ8_0 &&
                 nRows < 128u &&
                 nRows > 0u && (nCols & 31u) == 0u && seqLen >= 4u) {
-                const uint32_t threads = 32u * nRows;
+                // Cap at 512 threads: 32*nRows overflowed the register file
+                // for the 32-row projections (see q8SmallRowsGemm).
+                const uint32_t threads = 32u * std::min<uint32_t>(nRows, 16u);
                 // Token blocking factor is a template parameter: a runtime array
                 // index forces the accumulators into local memory and cost 20%.
+                // Default 8: the grid is 512/8 = 64 blocks, so every SM gets
+                // one (512/16 left 32 of 68 idle).  Measured on Qwen3.5-4B
+                // pp512: 3,931 at 16, 3,975 at 8; neutral on Ornith-9B.
                 static const int tp = [] {
                     const char *e = std::getenv("TINYCODER_Q8_SMALL_TOK");
-                    const long v = e ? std::strtol(e, nullptr, 10) : 16;
-                    return (v == 8 || v == 16 || v == 32) ? static_cast<int>(v) : 16;
+                    const long v = e ? std::strtol(e, nullptr, 10) : 8;
+                    return (v == 4 || v == 8 || v == 16 || v == 32)
+                                   ? static_cast<int>(v)
+                                   : 16;
                 }();
-                auto launch = [&](auto kern, int bt) {
+                // Shared staging only when a token's row fits in 48 KB;
+                // otherwise keep the plain (re-read) kernel.
+                const uint32_t xBytes =
+                        (nCols / 32u) * 33u * static_cast<uint32_t>(sizeof(float));
+                auto launch = [&](auto kern, int bt, uint32_t smem) {
                     const uint32_t tb = (seqLen + bt - 1u) / bt;
-                    kern<<<tb, threads, 0, g_stream>>>(
+                    kern<<<tb, threads, smem, g_stream>>>(
                             reinterpret_cast<const uint8_t *>(m.q), x, y, nRows, nCols,
                             seqLen);
                 };
-                if (tp == 8) launch(q8SmallRowsGemm<8>, 8);
-                else if (tp == 32)
-                    launch(q8SmallRowsGemm<32>, 32);
-                else
-                    launch(q8SmallRowsGemm<16>, 16);
+                static const bool stagedOn = [] {
+                    const char *e = std::getenv("TINYCODER_Q8_SMALL_SMEM");
+                    return e == nullptr || e[0] != '0';
+                }();
+                const bool twoRows = nRows <= 2u * (threads / 32u);
+                if (stagedOn && twoRows && xBytes <= 48u * 1024u) {
+                    if (tp == 4) launch(q8SmallRowsGemmSmem2<4>, 4, xBytes);
+                    else if (tp == 8)
+                        launch(q8SmallRowsGemmSmem2<8>, 8, xBytes);
+                    else if (tp == 32)
+                        launch(q8SmallRowsGemmSmem2<32>, 32, xBytes);
+                    else
+                        launch(q8SmallRowsGemmSmem2<16>, 16, xBytes);
+                } else if (stagedOn && xBytes <= 48u * 1024u) {
+                    if (tp == 4) launch(q8SmallRowsGemmSmem<4>, 4, xBytes);
+                    else if (tp == 8)
+                        launch(q8SmallRowsGemmSmem<8>, 8, xBytes);
+                    else if (tp == 32)
+                        launch(q8SmallRowsGemmSmem<32>, 32, xBytes);
+                    else
+                        launch(q8SmallRowsGemmSmem<16>, 16, xBytes);
+                } else if (tp == 4) {
+                    launch(q8SmallRowsGemm<4>, 4, 0);
+                } else if (tp == 8) {
+                    launch(q8SmallRowsGemm<8>, 8, 0);
+                } else if (tp == 32) {
+                    launch(q8SmallRowsGemm<32>, 32, 0);
+                } else {
+                    launch(q8SmallRowsGemm<16>, 16, 0);
+                }
+                // Never report success for a launch that did not happen: the
+                // projection would be left unwritten and the pending error
+                // would be misattributed to the next caller.
+                if (cudaGetLastError() != cudaSuccess) return false;
                 return true;
             }
             if (q8Int8 && batchPrefill && !folded && m.type == kTypeQ8_0 &&

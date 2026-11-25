@@ -25,6 +25,7 @@ Columns follow the same benchmark defaults as the 2080 Ti file:
 |---|---|---|---|---|---|---|---|---|---|
 | [Qwen2.5-Coder-1.5B `q2_k`](https://huggingface.co/unsloth/Qwen2.5-Coder-1.5B-Instruct-GGUF/resolve/main/Qwen2.5-Coder-1.5B-Instruct-Q2_K.gguf) | 0.7 GB | full offload | — | — | llama.cpp | — | — | — | — |
 | [Qwen2.5-Coder-1.5B `iq3_xxs`](https://huggingface.co/ggml-org/Qwen2.5-Coder-1.5B-IQ3_XXS-GGUF/resolve/main/qwen2.5-coder-1.5b-iq3_xxs-imat.gguf) | 0.9 GB | full offload | — | — | llama.cpp | — | — | — | — |
+| [Qwen3.5-4B `Q4_K_M`](https://huggingface.co/LocalScribe/Qwen3.5-4B-Q4_K_M.gguf/resolve/main/Qwen3.5-4B-Q4_K_M.gguf) | 2.6 GB | full offload | — | — | llama.cpp | — | — | — | — |
 | [Qwen2.5-Coder-7B `iq2_s`](https://huggingface.co/ThomasBaruzier/Qwen2.5-Coder-7B-Instruct-GGUF/resolve/main/Qwen2.5-Coder-7B-Instruct-IQ2_S.gguf) | 2.4 GB | full offload | — | — | llama.cpp | — | — | — | — |
 | [Qwen2.5-Coder-7B `iq3_xxs`](https://huggingface.co/ThomasBaruzier/Qwen2.5-Coder-7B-Instruct-GGUF/resolve/main/Qwen2.5-Coder-7B-Instruct-IQ3_XXS.gguf) | 2.9 GB | full offload | — | — | llama.cpp | — | — | — | — |
 | [Ternary-Bonsai-2-27B `pq2_0` (Prism)](https://huggingface.co/prism-ml/Ternary-Bonsai-2-27B-gguf/resolve/main/Ternary-Bonsai-2-27B-PQ2_0.gguf) | 6.7 GB | full offload | — | — | PrismML llama.cpp (fork) | — | — | — | — |

@@ -148,8 +148,8 @@ namespace tinycoder::detail {
 
     /// @brief Matrix-vector multiply with FP16-stored weights (return-value version).
     ///        Computes y_j = sum_i x[i] * W_f16[j][i] for j in [0, rows).
-    np::Array<float> deqMatMulVecF16(const uint16_t *W_f16, const float *x,
-                                     uint32_t rows, uint32_t cols);
+    tinycoder::Array<float> deqMatMulVecF16(const uint16_t *W_f16, const float *x,
+                                            uint32_t rows, uint32_t cols);
 
     /// @brief Matrix-vector multiply with FP16-stored weights (out-parameter version).
     void deqMatMulVecF16(const uint16_t *W_f16, const float *x,

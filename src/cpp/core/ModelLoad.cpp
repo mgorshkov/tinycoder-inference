@@ -932,41 +932,41 @@ namespace tinycoder {
         };
 
         // Helper to load a 1D F32 tensor (norms, etc.)
-        auto loadF32_1D = [&](const std::string &name) -> np::Array<float> {
+        auto loadF32_1D = [&](const std::string &name) -> tinycoder::Array<float> {
             auto info = loader.getTensorInfo(name);
             if (!info)
-                return np::Array<float>{};
+                return tinycoder::Array<float>{};
 
             const uint8_t *data = loader.getTensor(name);
             if (!data)
-                return np::Array<float>{};
+                return tinycoder::Array<float>{};
 
             uint32_t n = static_cast<uint32_t>(info->shape[0]);
             std::vector<float> vec(n);
             std::memcpy(vec.data(), data, n * sizeof(float));
-            return np::Array<float>(vec, np::Shape{n});
+            return tinycoder::Array<float>(vec, tinycoder::Shape{n});
         };
 
         // Helper to load any-rank F32 tensor as a flat vector.  Inkling's
         // clip vectors and depth-attention queries are 2-D F32 ([headDim,
         // nHeads], [rows, hidden]) and never go through a quantized matmul.
-        auto loadF32Flat = [&](const std::string &name) -> np::Array<float> {
+        auto loadF32Flat = [&](const std::string &name) -> tinycoder::Array<float> {
             auto info = loader.getTensorInfo(name);
             if (!info)
-                return np::Array<float>{};
+                return tinycoder::Array<float>{};
             const uint8_t *data = loader.getTensor(name);
             if (!data)
-                return np::Array<float>{};
+                return tinycoder::Array<float>{};
             uint64_t n = 1;
             for (auto d: info->shape) n *= d;
             if (info->type != GGML_TYPE_F32 || n == 0) {
                 std::cerr << "[TinyCoder] " << name << ": expected F32, got type "
                           << info->type << std::endl;
-                return np::Array<float>{};
+                return tinycoder::Array<float>{};
             }
             std::vector<float> vec(n);
             std::memcpy(vec.data(), data, n * sizeof(float));
-            return np::Array<float>(vec, np::Shape{static_cast<size_t>(n)});
+            return tinycoder::Array<float>(vec, tinycoder::Shape{static_cast<size_t>(n)});
         };
 
         // Load a quantized weight, converting a BF16 (type 30) tensor to F32.
@@ -1610,10 +1610,10 @@ namespace tinycoder {
             return false;
         }
         try {
-            kvCache_.k = np::Array<float>(
-                    np::Shape{count, maxSeq, config_.numKVHeads, config_.headDim});
-            kvCache_.v = np::Array<float>(
-                    np::Shape{count, maxSeq, config_.numKVHeads, config_.headDim});
+            kvCache_.k = tinycoder::Array<float>(
+                    tinycoder::Shape{count, maxSeq, config_.numKVHeads, config_.headDim});
+            kvCache_.v = tinycoder::Array<float>(
+                    tinycoder::Shape{count, maxSeq, config_.numKVHeads, config_.headDim});
         } catch (const std::exception &e) {
             std::cerr << "[TinyCoder] host K/V allocation failed (" << e.what()
                       << "): " << count << " slots x " << maxSeq << " tokens"

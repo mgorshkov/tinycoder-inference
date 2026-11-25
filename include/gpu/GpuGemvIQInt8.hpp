@@ -773,6 +773,9 @@ bool launchQGemm(int type, const void *wq, const float *x, float *out,
                  uint32_t rowBytes, uint32_t blocksPerRow,
                  uint8_t *q8kBatch, uint64_t q8kBatchBytes) {
     if (seqLen == 0 || rows == 0 || cols == 0) return true;
+    if (std::getenv("TINYCODER_INT8_DBG") != nullptr)
+        std::fprintf(stderr, "[qgemm] type=%u k=%u n=%u m=%u\n", type, cols, rows,
+                     seqLen);
     // ---- the int8 tensor-core INT8 path (int8 tensor cores, default ON) --------
     // A full shared-memory-tiled mul_mat_q: 128-token tiles on Turing
     // (stream-k), Q8_1 INT8-layout activations, mma.s8.m8n8k16 over the

@@ -2,11 +2,22 @@
 
 **High-performant local inference engine** for the [TinyCoder AI](https://github.com/mgorshkov/tinycoder) VS Code extension and the [TinyCoder OpenAI](https://github.com/mgorshkov/tinycoder-openai) project, which exposes the same engine through an OpenAI-compatible API. This repository contains **only the engine**: the C++/CUDA core (`src/cpp/core`), public headers (`include/`), unit tests (`unit_tests/`), benchmarks (`benchmarks/`), and build plumbing.
 
-The engine runs the **Qwen2.5** (`qwen2`), **Qwen3.6** and **Qwen3.8** (`qwen35` dense, `qwen35moe` mixture-of-experts), **Ornith**, **Gemma 4**, Prism **Ternary-Bonsai**, and **Inkling-2-Mini** (`inkling2` / `inkling2_loop`, looped MoE) model families from **GGUF** or **EXL3** (`trellis` / `mul1`) checkpoints — e.g. `Qwen3.5-27B` at 1.60 bpw — with **mixed quantization**, **AMX/AVX-512/AVX2 CPU acceleration** (runtime SIMD dispatch), and a **CUDA GPU offload engine**. It is designed to run efficiently on limited hardware.
+The engine runs the **Qwen2.5** (`qwen2`), **Qwen3.5**, **Qwen3.6** and **Qwen3.8** (`qwen35` dense, `qwen35moe` mixture-of-experts), **Ornith**, **Gemma 4**, Prism **Ternary-Bonsai**, and **Inkling-2-Mini** (`inkling2` / `inkling2_loop`, looped MoE) model families from **GGUF** or **EXL3** (`trellis` / `mul1`) checkpoints — e.g. `Qwen3.5-27B` at 1.60 bpw — with **mixed quantization**, **AMX/AVX-512/AVX2 CPU acceleration** (runtime SIMD dispatch), and a **CUDA GPU offload engine**. It is designed to run efficiently on limited hardware.
 
-> **Written from scratch — no inference libraries or engines.** Every part of TinyCoder is original code in this repository: the C++/CUDA kernels, GEMV/GEMM and MMA schedules, GGUF and EXL3 loaders, quantizers/dequantizers, tokenizer, scheduler, KV cache, and CPU SIMD paths. It does **not** link, embed, vendor, or call llama.cpp, ggml, Candle, PyTorch, ExLlamaV3, or any other inference runtime; there is **no inference-library dependency** at build or run time. The only third-party code is non-inference plumbing: the [np](https://github.com/mgorshkov/np) array utility, a shared CMake config, and GoogleTest for unit tests (the CUDA Toolkit/cuBLAS is the system GPU runtime). All performance work is TinyCoder's own kernels.
+**Written from scratch — no inference libraries or engines.** Every part of
+TinyCoder is original code in this repository: the C++/CUDA kernels, GEMV/GEMM
+and MMA schedules, GGUF and EXL3 loaders, quantizers/dequantizers, tokenizer,
+scheduler, KV cache, and CPU SIMD paths. It does **not** link, embed, vendor, or
+call llama.cpp, ggml, Candle, PyTorch, ExLlamaV3, or any other inference
+runtime; there is **no inference-library dependency** at build or run time. The
+only third-party code is non-inference plumbing: a shared CMake config and
+GoogleTest for unit tests (the CUDA Toolkit/cuBLAS is the system GPU runtime).
+All performance work is TinyCoder's own kernels.
 
-> **GPU support.** The CUDA engine runs natively on **Turing, Ampere and Ada GPUs — including the RTX 2080 Ti, RTX 3090, RTX 4090 and RTX 5090** — plus newer architectures via forward-compatible PTX JIT, with runtime capability dispatch and a CPU fallback. See [Supported GPUs](#supported-gpus).
+**GPU support.** The CUDA engine runs natively on **Turing, Ampere and Ada
+GPUs — including the RTX 2080 Ti, RTX 3090, RTX 4090 and RTX 5090** — plus newer
+architectures via forward-compatible PTX JIT, with runtime capability dispatch
+and a CPU fallback. See [Supported GPUs](#supported-gpus).
 
 ## Build & Install
 
@@ -14,6 +25,11 @@ The engine runs the **Qwen2.5** (`qwen2`), **Qwen3.6** and **Qwen3.8** (`qwen35`
 
 - **C++20 compiler** (GCC ≥ 13, Clang ≥ 14, or MSVC 2019+)
 - **CMake** ≥ 3.18
+- **x86-64 or aarch64.** The AVX2 / AVX-512 / AMX CPU kernels are x86-only and are
+  selected at configure time. On aarch64 (e.g. Jetson Orin) the engine builds with
+  its scalar CPU path — no x86 intrinsics are referenced — and inference runs on the
+  GPU. Pass `-DCMAKE_CUDA_ARCHITECTURES=87` for Orin native SASS; an explicit value
+  overrides the default `75;80;86` list.
 
 ### Strongly recommended (large speed-up)
 
@@ -28,9 +44,14 @@ TinyCoder builds and runs with only the base toolchain, but **both items below a
 ./scripts/build.sh                          # GPU build (-DENABLE_CUDA=ON) — default
 ./scripts/build.sh --no-cuda                # CPU-only build (-DENABLE_CUDA=OFF)
 ./scripts/build.sh --cpu --no-tests         # CPU-only static lib, no tests/bench
+./scripts/build.sh --no-clean               # reuse the existing build tree
 ```
 
-The script configures CMake, builds `tinycoder_core` (+ `tinycoder_test` and `tinycoder_bench`), and runs CTest.
+The script **deletes the build tree first** (a stale `CMakeCache.txt` otherwise
+keeps describing an old configuration), configures CMake, builds
+`tinycoder_core` (+ `tinycoder_test` and `tinycoder_bench`), and runs CTest.
+Pass `--no-clean` (or `TINYCODER_CLEAN=0`) for incremental rebuilds; it only
+deletes something recognisable as a build tree.
 
 ### Manual build
 
@@ -49,7 +70,7 @@ ctest --test-dir build --output-on-failure
 
 ### Consuming as a library
 
-The engine is designed to be embedded via `FetchContent` — the [TinyCoder extension](https://github.com/mgorshkov/tinycoder) does exactly this (it provides its own `np`/`cmake` targets and adds the N-API bridge on top of `tinycoder_core`):
+The engine is designed to be embedded via `FetchContent` — the [TinyCoder extension](https://github.com/mgorshkov/tinycoder) does exactly this (it provides its own `cmake` target and adds the N-API bridge on top of `tinycoder_core`):
 
 ```cmake
 FetchContent_Declare(tinycoder_inference
@@ -107,7 +128,6 @@ The CUDA offload engine runs natively on **Turing, Ampere and Ada GPUs — inclu
 
 **No inference-library dependency.** The engine, kernels, loaders, and tokenizers are written from scratch in this repository. The only external packages are non-inference plumbing:
 
-- **[np library](https://github.com/mgorshkov/np)** — NumPy-style arrays with SIMD/CUDA acceleration (fetched via `FetchContent`)
 - **[shared cmake config](https://github.com/mgorshkov/cmake)** — compiler checks, CUDA setup, OpenMP (fetched via `FetchContent`)
 - **Google Test** — unit tests only (fetched via `FetchContent`)
 

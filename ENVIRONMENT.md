@@ -65,6 +65,7 @@ default (almost always the optimized path).
 | `TINYCODER_Q4K_4XW` | `0` restores the generic 1-row-per-warp Q4_K Q8_K decode GEMV (default **on**, 2026-10-29). `kQGemvQ4KxQ8K_4xW` gives Q4_K the same 4-rows-per-warp / all-32-lanes-load / 8× `__dp4a` shape already used by Q5_K/Q6_K, for the dense-qwen35 models' largest quant class (Q4_K ≈2.7 GB of Ornith-1.5-9B's 5.9 GB). Bit-exact with `kQGemvKxQ8K<kTypeQ4K>` (integer sum exact + order-free; same volatile no-FMA float fold). Measured (Ornith-1.5-9B, pp128/tg32): tg **13.80 → 25.24 tok/s (+83%)**, 64/64 tests + 160-token greedy stream byte-identical |
 | `TINYCODER_L2NORM_SMEM` | `0` restores the redundant-body `kQ35L2NormRepeat` (default **on**, 2026-10-29). The original recomputed the same `headK`-wide double L2 norm for every element of a slice's `headK*nVHeads` output (O(`headK²·nVHeads`) double adds per token per recurrent layer — the hottest kernel on the dense qwen35 prefill). The fast path computes each slice's `iq/ik` once into shared memory, bit-identically. Measured (Ornith-1.5-9B): tg16 **25.4 → 41.1 tok/s (+62%)**, pp128 **27.5 → 47.2 tok/s (+72%)**; nvprof `kQ35L2NormRepeat` 4286 → 57 µs |
 | `TINYCODER_Q4K_BSY` | warps per block for `kQGemvQ4KxQ8K_4xW` (default `8`, 2026-10-29). A/B `1/2/4/8` on the sustained decode measured **40.7–41.2 tok/s** (within clock noise) — the 4xW grid already fills the 68 SMs, so block shape does not move the wall; the knob is kept for profiler experiments |
+| `TINYCODER_FORCE_SCALAR` | Any value except `0` routes every runtime SIMD dispatch (mat-vec kernels, Q2_K/Q4_K/Q6_K batch kernels and the sampling scan) to its scalar implementation. This is the reference path for A/B and bisecting; the build itself is unchanged |
 | `TINYCODER_EXL3_F16` | `1` forces materializing the full host F16 copy of every EXL3 linear at load (slow, ~54 GB for a 27B checkpoint). Default **off**: the GPU path uploads the packed trellis and materializes only the LM head/embedding; the F16 copy is built lazily if a CPU accessor asks for it |
 | `TINYCODER_INT8_GEMM` | **On by default (2026-11-04)** — int8 tensor-core GEMM prefill (`mma.s8.m8n8k16`, stream-k on sm_75) and GEMV decode (one warp per row, Q8_1 activations) for Q4_K/Q5_K/Q6_K/Q8_0 (+Q2_K/Q3_K for GEMV). Prefill reads the RAW GGUF weights (zero extra VRAM) with a 128-token tile; decode uses the same `vec_dot` / 4-warp shape. Set `0` to disable both and fall back to the integer Q8_K GEMM (prefill) / the in-tree quantized GEMV (decode); `TINYCODER_PREFILL_EXACT=1` does the same for prefill only. Measured (Ornith-1.5-9B, pp512/tg128): prefill **84 → 2,209 tok/s**, decode **46 → 74.4 tok/s** |
 
@@ -75,8 +76,8 @@ sets the ones it needs; everything else follows these defaults.
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `ENABLE_CUDA` | OFF | CUDA GPU acceleration (ON in `scripts/build.sh`) |
-| `ENABLE_AVX2` | ON | AVX2 + FMA optimizations |
+| `ENABLE_CUDA` | ON when nvcc is found | CUDA GPU acceleration (OFF forces the CPU build) |
+| `ENABLE_AVX2` | ON on x86 | AVX2 + FMA optimizations (forced OFF on aarch64) |
 | `ENABLE_AVX512` | OFF | AVX-512 optimizations |
 | `ENABLE_AMX` | OFF | Intel AMX (Advanced Matrix Extensions) |
 | `ENABLE_OPENMP` | ON | OpenMP thread parallelism |
@@ -86,3 +87,11 @@ sets the ones it needs; everything else follows these defaults.
 | `TINYCODER_STEAL_CHUNK` | 4 | Work-stealing chunk size (tiles) for fused FFN |
 | `BUILD_SHARED_LIBS` | OFF | Build a shared library instead of static |
 | `BUILD_TESTS` | ON | Build unit tests and benchmarks |
+
+The AVX2 / AVX-512 / AMX kernels are x86-only. On a non-x86 host (aarch64, e.g.
+Jetson Orin) those options are forced off before the shared CMake config turns
+them into `-mavx2`/`-mavx512f`/`-mamx-*` flags, and the engine builds with its
+scalar CPU path. An explicit `-DCMAKE_CUDA_ARCHITECTURES=87` overrides the
+default `75;80;86` list for native Orin SASS. CMake older than 3.26 does not
+know the `CUDA20` dialect, so it compiles the `.cu` sources as CUDA C++17;
+newer CMake keeps CUDA C++20.

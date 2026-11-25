@@ -16,16 +16,23 @@ with the old and new path in the same binary.
 
 | Model | File size | GPU mode TinyCoder | **TinyCoder pp512** | **TinyCoder tg128** | Baseline engine | **Baseline pp512** | **Baseline tg128** |
 |---|---|---|---|---|---|---|---|
-| [Qwen2.5-Coder-1.5B `q2_k`](https://huggingface.co/unsloth/Qwen2.5-Coder-1.5B-Instruct-GGUF/resolve/main/Qwen2.5-Coder-1.5B-Instruct-Q2_K.gguf) | 0.7 GB | full offload | **12,239.8 tok/s** | **325.9 tok/s** | llama.cpp | 7,679.2 tok/s | 321.6 tok/s |
+| [Qwen2.5-Coder-1.5B `q2_k`](https://huggingface.co/unsloth/Qwen2.5-Coder-1.5B-Instruct-GGUF/resolve/main/Qwen2.5-Coder-1.5B-Instruct-Q2_K.gguf) | 0.7 GB | full offload | **12,274.6 tok/s** | **347.4 tok/s** | llama.cpp | 7,708.6 tok/s | 321.5 tok/s |
 | [Qwen2.5-Coder-1.5B `iq3_xxs`](https://huggingface.co/ggml-org/Qwen2.5-Coder-1.5B-IQ3_XXS-GGUF/resolve/main/qwen2.5-coder-1.5b-iq3_xxs-imat.gguf) | 0.9 GB | full offload | **12,243.4 tok/s** | **273.8 tok/s** | llama.cpp | 10,007.0 tok/s | 262.2 tok/s |
+| [Qwen3.5-4B `Q4_K_M`](https://huggingface.co/LocalScribe/Qwen3.5-4B-Q4_K_M.gguf/resolve/main/Qwen3.5-4B-Q4_K_M.gguf) | 2.6 GB | full offload | **4,212.5 tok/s** | **135.6 tok/s** | llama.cpp | 4,123.2 tok/s | 133.6 tok/s |
 | [Qwen2.5-Coder-7B `iq2_s`](https://huggingface.co/ThomasBaruzier/Qwen2.5-Coder-7B-Instruct-GGUF/resolve/main/Qwen2.5-Coder-7B-Instruct-IQ2_S.gguf) | 2.4 GB | full offload | **2,765.7 tok/s** | 87.7 tok/s | llama.cpp | 2,482.0 tok/s | **96.5 tok/s** |
 | [Qwen2.5-Coder-7B `iq3_xxs`](https://huggingface.co/ThomasBaruzier/Qwen2.5-Coder-7B-Instruct-GGUF/resolve/main/Qwen2.5-Coder-7B-Instruct-IQ3_XXS.gguf) | 2.9 GB | full offload | **3,060.5 tok/s** | 93.5 tok/s | llama.cpp | 2,938.0 tok/s | **97.4 tok/s** |
 | [Ternary-Bonsai-2-27B `pq2_0` (Prism)](https://huggingface.co/prism-ml/Ternary-Bonsai-2-27B-gguf/resolve/main/Ternary-Bonsai-2-27B-PQ2_0.gguf) | 6.7 GB | full offload | **880.6 tok/s** | **51.73 tok/s** | PrismML llama.cpp (fork) | 878.5 tok/s | 50.36 tok/s |
 | [Ternary-Bonsai-2-27B `ptq1_0` (Prism)](https://huggingface.co/prism-ml/Ternary-Bonsai-2-27B-gguf/resolve/main/Ternary-Bonsai-2-27B-PTQ1_0.gguf) | 5.5 GB | full offload | **880.7 tok/s** | 51.73 tok/s | PrismML llama.cpp (fork) | 848.1 tok/s | **65.29 tok/s** |
-| [Ornith-1.5-9B `q4_k_m`](https://huggingface.co/bartowski/Ornith-1.5-9B-GGUF/resolve/main/Ornith-1.5-9B-Q4_K_M.gguf) | 5.9 GB | full offload | 2,538.1 tok/s | 83.3 tok/s | llama.cpp | **2,640.1 tok/s** | **84.1 tok/s** |
+| [Ornith-1.5-9B `q4_k_m`](https://huggingface.co/bartowski/Ornith-1.5-9B-GGUF/resolve/main/Ornith-1.5-9B-Q4_K_M.gguf) | 5.9 GB | full offload | 2,575.7 tok/s | **85.8 tok/s** | llama.cpp | **2,652.0 tok/s** | 84.2 tok/s |
 | [Ornith-1.5-35B-A3B `q8_0` → `q4_k` experts](https://huggingface.co/AtomicChat/Ornith-1.5-35B-A3B-GGUF/resolve/main/Ornith-1.5-35B-A3B-Q8_0.gguf) | 34.4 GB | **hybrid only** (experts in RAM, layer arena) | **133.4 tok/s** | **24.10 tok/s** | llama.cpp `-ncmoe 99` | 132.2 tok/s | 17.1 tok/s |
 | [Inkling-2-Mini `iq2_xxs`](https://huggingface.co/unsloth/Inkling-2-Mini-GGUF/resolve/main/Inkling-2-Mini-UD-IQ2_XXS.gguf) | 8.5 GB | full offload | **1200.0 tok/s** | **47.0 tok/s** | llama.cpp CUDA (`-ngl 99`, ctx 2048) | 883.6 tok/s | 44.3 tok/s |
 | [Qwen3.8-27B EXL3 `1.60bpw`](https://huggingface.co/turboderp/Qwen3.8-27B-exl3/tree/SC_1.60bpw_H3) | 8.6 GB | full offload | **725.8 tok/s** | **29.83 tok/s** | exllamav3 1.6.6 | 716.8 tok/s | 23.67 tok/s |
+
+The Qwen3.5-4B row and the re-measured 1.5B / 9B rows were taken on the same reference
+box (driver 595.91.07) with three alternating pairs of `llama-bench -p 512 -n 128 -t 36 -r 1
+-ngl 99` and `tinycoder_bench --n-prompts 512 --n-gen 128 --threads 36`; means over the
+three pairs, spread (max - min)/2. The 27B EXL3 TinyCoder cells were re-checked the same
+way (three serial runs: pp512 725.1 +/- 1.3, tg128 29.79 +/- 0.04) and unchanged.
 
 The Ornith-1.5-35B-A3B row describes **one configuration only**: the hybrid mode in which
 the expert FFNs live in system RAM and both columns run the same expert-offload mode

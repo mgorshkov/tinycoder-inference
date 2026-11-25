@@ -53,7 +53,7 @@ namespace tinycoder {
     ///   skipping tiny std::vector bananas like norms/embeddings.
     //
     /// Available on Linux only; on other platforms it is a no-op. Safe to call
-    /// after std::vector/np::Array resize/move (the realloc'd buffer remains
+    /// after a std::vector/tinycoder::Array allocation or move (the buffer stays
     /// heap-resident and madvise works on any mapped private anonymous range).
     //
     // Opt-in: `TINYCODER_HUGE_PAGES=1` enables the hints. **Default OFF**

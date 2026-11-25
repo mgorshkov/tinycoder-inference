@@ -30,24 +30,9 @@
 #include <string>
 #include <vector>
 
-// Model.hpp pulls in np/Array.hpp -> <immintrin.h>, and GCC 13's
-// amxtileintrin.h emits two AMX builtins that nvcc's cudafe++ front end does
-// not know.  They only appear inside unused inline wrappers, so neutralise the
-// two names before the header is parsed; that keeps the host-only Model
-// interface out of the device pass without touching the third-party np tree.
-#if defined(__CUDACC__) || defined(__NVCC__)
-#define __builtin_ia32_ldtilecfg(x) ((void) 0)
-#define __builtin_ia32_sttilecfg(x) ((void) 0)
-#endif
+// Host-only: the CPU reference path this device graph mirrors.
 #ifndef __CUDA_ARCH__
-// np (pulled in by Model.hpp) carries `#pragma omp` inside its templates.  The
-// host pass of a CUDA translation unit has no -fopenmp, so gcc reports every
-// one of them as an unknown pragma -- 44 sites, none of them ours and none of
-// them reachable from this file.  Suppress that class for the include only.
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wunknown-pragmas"
 #include "Model.hpp"
-#pragma GCC diagnostic pop
 #endif
 
 namespace tinycoder::gpu {
@@ -587,7 +572,7 @@ namespace tinycoder::gpu {
         }
 
         // ---- model-level weights ---------------------------------------------
-        auto raw = [&](const np::Array<float> &a, uint64_t want,
+        auto raw = [&](const tinycoder::Array<float> &a, uint64_t want,
                        const char *what) -> const void * {
             if (a.size() < want) {
                 err = std::string("bad size for ") + what + ": " +

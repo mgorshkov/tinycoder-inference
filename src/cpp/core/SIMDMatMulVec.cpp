@@ -31,8 +31,8 @@ SOFTWARE.
 #include <cstring>
 #include <limits>
 
-// Include np library's CPU feature detection
-#include <np/internal/CpuDispatch.hpp>
+// Runtime ISA detection (scalar on non-x86).
+#include "CpuFeatures.hpp"
 
 // ============================================================================
 // Scalar (no SIMD) implementations — always available
@@ -271,13 +271,20 @@ namespace {
         int is = 0;
         for (int n = 0; n < 256; n += 128) {
             for (int j = 0; j < 4; ++j) {
+                // qs_expanded is in element order: the 128-element chunk at
+                // offset n holds four 32-element sub-chunks, and sub-chunk j
+                // starts at j*32 within it.  (The pointer advances by 128 per
+                // chunk.)  Omitting the j*32 term re-read sub-chunk 0 four
+                // times and made the scalar path disagree with the vector
+                // kernels; the Q2_K parity tests catch it on a non-AVX2 host.
+                const int off = j * 32;
                 uint8_t sc = scales[is++];
                 float dl = d * (sc & 0xF);
                 float ml = dmin * (sc >> 4);
                 double sum_xq = 0.0, sum_x = 0.0;
                 int base = n + j * 32;
                 for (int l = 0; l < 16; ++l) {
-                    sum_xq += static_cast<double>(x[base + l]) * qs_expanded[l];
+                    sum_xq += static_cast<double>(x[base + l]) * qs_expanded[off + l];
                     sum_x += static_cast<double>(x[base + l]);
                 }
                 dot += static_cast<double>(dl) * sum_xq - static_cast<double>(ml) * sum_x;
@@ -288,11 +295,13 @@ namespace {
                 sum_xq = 0.0;
                 sum_x = 0.0;
                 for (int l = 0; l < 16; ++l) {
-                    sum_xq += static_cast<double>(x[base + 16 + l]) * qs_expanded[16 + l];
+                    sum_xq += static_cast<double>(x[base + 16 + l]) *
+                              qs_expanded[off + 16 + l];
                     sum_x += static_cast<double>(x[base + 16 + l]);
                 }
                 dot += static_cast<double>(dl) * sum_xq - static_cast<double>(ml) * sum_x;
             }
+            qs_expanded += 128;
         }
         return static_cast<float>(dot);
     }
@@ -362,9 +371,12 @@ namespace {
                 int base = n + j * 32;
                 int g = (n / 128) * 8 + j * 2;
 
+                // See dotProductQ2_K_PrePacked_Scalar: sub-chunk j starts at
+                // j*32 within the 128-element chunk qs_expanded points at.
+                const int off = j * 32;
                 int sum_xq = 0;
                 for (int l = 0; l < 16; ++l) {
-                    sum_xq += static_cast<int>(q8->qs[base + l]) * qs_expanded[l];
+                    sum_xq += static_cast<int>(q8->qs[base + l]) * qs_expanded[off + l];
                 }
                 dot += static_cast<double>(dl) * d * sum_xq - static_cast<double>(ml) * d * q8->bsums[g];
 
@@ -373,7 +385,8 @@ namespace {
                 ml = dmin * (sc >> 4);
                 sum_xq = 0;
                 for (int l = 0; l < 16; ++l) {
-                    sum_xq += static_cast<int>(q8->qs[base + 16 + l]) * qs_expanded[16 + l];
+                    sum_xq += static_cast<int>(q8->qs[base + 16 + l]) *
+                              qs_expanded[off + 16 + l];
                 }
                 dot += static_cast<double>(dl) * d * sum_xq - static_cast<double>(ml) * d * q8->bsums[g + 1];
             }
@@ -400,8 +413,8 @@ namespace tinycoder {
         static std::atomic<void (*)(float *, const float *, float, uint32_t)> s_impl{nullptr};
         auto impl = s_impl.load(std::memory_order_acquire);
         if (!impl) {
-            using np::internal::SimdLevel;
-            SimdLevel level = np::internal::max_simd_level();
+            using tinycoder::cpu::SimdLevel;
+            SimdLevel level = tinycoder::cpu::maxSimdLevel();
             switch (level) {
 #if defined(__AVX512F__) && defined(__FMA__)
                 case SimdLevel::AVX512:
@@ -427,8 +440,8 @@ namespace tinycoder {
         static std::atomic<float (*)(const float *, const float *, uint32_t)> s_impl{nullptr};
         auto impl = s_impl.load(std::memory_order_acquire);
         if (!impl) {
-            using np::internal::SimdLevel;
-            SimdLevel level = np::internal::max_simd_level();
+            using tinycoder::cpu::SimdLevel;
+            SimdLevel level = tinycoder::cpu::maxSimdLevel();
             switch (level) {
 #if defined(__AVX512F__) && defined(__FMA__)
                 case SimdLevel::AVX512:
@@ -456,8 +469,8 @@ namespace tinycoder {
         static std::atomic<float (*)(const float *, const uint16_t *, uint32_t)> s_impl{nullptr};
         auto impl = s_impl.load(std::memory_order_acquire);
         if (!impl) {
-            using np::internal::SimdLevel;
-            SimdLevel level = np::internal::max_simd_level();
+            using tinycoder::cpu::SimdLevel;
+            SimdLevel level = tinycoder::cpu::maxSimdLevel();
             switch (level) {
 #if defined(__AVX512F__) && defined(__FMA__)
                 case SimdLevel::AVX512:
@@ -485,8 +498,8 @@ namespace tinycoder {
         static std::atomic<float (*)(const float *, const uint16_t *, uint32_t)> s_impl{nullptr};
         auto impl = s_impl.load(std::memory_order_acquire);
         if (!impl) {
-            using np::internal::SimdLevel;
-            SimdLevel level = np::internal::max_simd_level();
+            using tinycoder::cpu::SimdLevel;
+            SimdLevel level = tinycoder::cpu::maxSimdLevel();
             switch (level) {
 #if defined(__AVX512F__) && defined(__FMA__)
                 case SimdLevel::AVX512:
@@ -513,8 +526,8 @@ namespace tinycoder {
         static std::atomic<void (*)(const float *, float *, const float *, uint32_t, float)> s_impl{nullptr};
         auto impl = s_impl.load(std::memory_order_acquire);
         if (!impl) {
-            using np::internal::SimdLevel;
-            SimdLevel level = np::internal::max_simd_level();
+            using tinycoder::cpu::SimdLevel;
+            SimdLevel level = tinycoder::cpu::maxSimdLevel();
             switch (level) {
 #if defined(__AVX512F__) && defined(__FMA__)
                 case SimdLevel::AVX512:
@@ -540,8 +553,8 @@ namespace tinycoder {
         static std::atomic<void (*)(float *, uint32_t)> s_impl{nullptr};
         auto impl = s_impl.load(std::memory_order_acquire);
         if (!impl) {
-            using np::internal::SimdLevel;
-            SimdLevel level = np::internal::max_simd_level();
+            using tinycoder::cpu::SimdLevel;
+            SimdLevel level = tinycoder::cpu::maxSimdLevel();
             switch (level) {
 #if defined(__AVX512F__) && defined(__FMA__)
                 case SimdLevel::AVX512:
@@ -567,8 +580,8 @@ namespace tinycoder {
         static std::atomic<void (*)(float *, uint32_t)> s_impl{nullptr};
         auto impl = s_impl.load(std::memory_order_acquire);
         if (!impl) {
-            using np::internal::SimdLevel;
-            SimdLevel level = np::internal::max_simd_level();
+            using tinycoder::cpu::SimdLevel;
+            SimdLevel level = tinycoder::cpu::maxSimdLevel();
             switch (level) {
 #if defined(__AVX512F__) && defined(__FMA__)
                 case SimdLevel::AVX512:
@@ -594,8 +607,8 @@ namespace tinycoder {
         static std::atomic<void (*)(float *, const float *, uint32_t)> s_impl{nullptr};
         auto impl = s_impl.load(std::memory_order_acquire);
         if (!impl) {
-            using np::internal::SimdLevel;
-            SimdLevel level = np::internal::max_simd_level();
+            using tinycoder::cpu::SimdLevel;
+            SimdLevel level = tinycoder::cpu::maxSimdLevel();
             switch (level) {
 #if defined(__AVX512F__) && defined(__FMA__)
                 case SimdLevel::AVX512:
@@ -621,8 +634,8 @@ namespace tinycoder {
         static std::atomic<void (*)(float *, const float *, uint32_t)> s_impl{nullptr};
         auto impl = s_impl.load(std::memory_order_acquire);
         if (!impl) {
-            using np::internal::SimdLevel;
-            SimdLevel level = np::internal::max_simd_level();
+            using tinycoder::cpu::SimdLevel;
+            SimdLevel level = tinycoder::cpu::maxSimdLevel();
             switch (level) {
 #if defined(__AVX512F__) && defined(__FMA__)
                 case SimdLevel::AVX512:
@@ -648,8 +661,8 @@ namespace tinycoder {
         static std::atomic<void (*)(float *, float, uint32_t)> s_impl{nullptr};
         auto impl = s_impl.load(std::memory_order_acquire);
         if (!impl) {
-            using np::internal::SimdLevel;
-            SimdLevel level = np::internal::max_simd_level();
+            using tinycoder::cpu::SimdLevel;
+            SimdLevel level = tinycoder::cpu::maxSimdLevel();
             switch (level) {
 #if defined(__AVX512F__) && defined(__FMA__)
                 case SimdLevel::AVX512:
@@ -675,8 +688,8 @@ namespace tinycoder {
         static std::atomic<float (*)(const uint8_t *, const float *)> s_impl{nullptr};
         auto impl = s_impl.load(std::memory_order_acquire);
         if (!impl) {
-            using np::internal::SimdLevel;
-            SimdLevel level = np::internal::max_simd_level();
+            using tinycoder::cpu::SimdLevel;
+            SimdLevel level = tinycoder::cpu::maxSimdLevel();
             switch (level) {
 #if defined(__AVX2__) && defined(__FMA__)
                 case SimdLevel::AVX2:
@@ -700,8 +713,8 @@ namespace tinycoder {
         static std::atomic<float (*)(const uint8_t *, const float *)> s_impl{nullptr};
         auto impl = s_impl.load(std::memory_order_acquire);
         if (!impl) {
-            using np::internal::SimdLevel;
-            SimdLevel level = np::internal::max_simd_level();
+            using tinycoder::cpu::SimdLevel;
+            SimdLevel level = tinycoder::cpu::maxSimdLevel();
             switch (level) {
 #if defined(__AVX2__) && defined(__FMA__)
                 case SimdLevel::AVX2:
@@ -722,8 +735,8 @@ namespace tinycoder {
         static std::atomic<float (*)(const uint8_t *, const float *)> s_impl{nullptr};
         auto impl = s_impl.load(std::memory_order_acquire);
         if (!impl) {
-            using np::internal::SimdLevel;
-            SimdLevel level = np::internal::max_simd_level();
+            using tinycoder::cpu::SimdLevel;
+            SimdLevel level = tinycoder::cpu::maxSimdLevel();
             switch (level) {
 #if defined(__AVX2__) && defined(__FMA__)
                 case SimdLevel::AVX2:
@@ -745,8 +758,8 @@ namespace tinycoder {
         static std::atomic<float (*)(const uint8_t *, const Q8KBlock *)> s_impl{nullptr};
         auto impl = s_impl.load(std::memory_order_acquire);
         if (!impl) {
-            using np::internal::SimdLevel;
-            SimdLevel level = np::internal::max_simd_level();
+            using tinycoder::cpu::SimdLevel;
+            SimdLevel level = tinycoder::cpu::maxSimdLevel();
             switch (level) {
 #if defined(__AVX512F__) && defined(__FMA__)
                 case SimdLevel::AVX512:
@@ -777,8 +790,8 @@ namespace tinycoder {
         static std::atomic<void (*)(const uint8_t *, const float *, uint32_t, uint32_t, float *)> s_impl{nullptr};
         auto impl = s_impl.load(std::memory_order_acquire);
         if (!impl) {
-            using np::internal::SimdLevel;
-            SimdLevel level = np::internal::max_simd_level();
+            using tinycoder::cpu::SimdLevel;
+            SimdLevel level = tinycoder::cpu::maxSimdLevel();
             switch (level) {
 #if defined(__AVX2__) && defined(__FMA__)
                 case SimdLevel::AVX2:
@@ -841,8 +854,8 @@ namespace tinycoder {
                 s_impl{nullptr};
         auto impl = s_impl.load(std::memory_order_acquire);
         if (!impl) {
-            using np::internal::SimdLevel;
-            SimdLevel level = np::internal::max_simd_level();
+            using tinycoder::cpu::SimdLevel;
+            SimdLevel level = tinycoder::cpu::maxSimdLevel();
             switch (level) {
 #if defined(__AVX2__) && defined(__FMA__)
                 case SimdLevel::AVX2:
@@ -915,8 +928,8 @@ namespace tinycoder {
                 s_impl{nullptr};
         auto impl = s_impl.load(std::memory_order_acquire);
         if (!impl) {
-            using np::internal::SimdLevel;
-            SimdLevel level = np::internal::max_simd_level();
+            using tinycoder::cpu::SimdLevel;
+            SimdLevel level = tinycoder::cpu::maxSimdLevel();
             switch (level) {
 #if defined(__AVX2__) && defined(__FMA__)
                 case SimdLevel::AVX2:
@@ -999,8 +1012,8 @@ namespace tinycoder {
                 s_impl{nullptr};
         auto impl = s_impl.load(std::memory_order_acquire);
         if (!impl) {
-            using np::internal::SimdLevel;
-            SimdLevel level = np::internal::max_simd_level();
+            using tinycoder::cpu::SimdLevel;
+            SimdLevel level = tinycoder::cpu::maxSimdLevel();
             switch (level) {
 #if defined(__AVX2__) && defined(__FMA__)
                 case SimdLevel::AVX2:
@@ -1059,8 +1072,8 @@ namespace tinycoder {
         static std::atomic<float (*)(const Q8KBlock *, const Q8KBlock *)> s_impl{nullptr};
         auto impl = s_impl.load(std::memory_order_acquire);
         if (!impl) {
-            using np::internal::SimdLevel;
-            SimdLevel level = np::internal::max_simd_level();
+            using tinycoder::cpu::SimdLevel;
+            SimdLevel level = tinycoder::cpu::maxSimdLevel();
             switch (level) {
 #if defined(__AVX512F__) && defined(__FMA__)
                 case SimdLevel::AVX512:
@@ -1092,11 +1105,11 @@ namespace tinycoder {
         static std::atomic<int> s_level{-1};
         int level = s_level.load(std::memory_order_acquire);
         if (level < 0) {
-            level = static_cast<int>(np::internal::max_simd_level());
+            level = static_cast<int>(tinycoder::cpu::maxSimdLevel());
             s_level.store(level, std::memory_order_release);
         }
 #if defined(__AVX2__) && defined(__FMA__)
-        if (level >= static_cast<int>(np::internal::SimdLevel::AVX2)) {
+        if (level >= static_cast<int>(tinycoder::cpu::SimdLevel::AVX2)) {
             simd::matMulVecBatchQ8K_Q8K_AVX2(W_q8k, X, seqLen, rows, cols, out);
             return true;
         }
@@ -1124,11 +1137,11 @@ namespace tinycoder {
         static std::atomic<int> s_level{-1};
         int level = s_level.load(std::memory_order_acquire);
         if (level < 0) {
-            level = static_cast<int>(np::internal::max_simd_level());
+            level = static_cast<int>(tinycoder::cpu::maxSimdLevel());
             s_level.store(level, std::memory_order_release);
         }
 #if defined(__AVX2__) && defined(__FMA__)
-        if (level >= static_cast<int>(np::internal::SimdLevel::AVX2)) {
+        if (level >= static_cast<int>(tinycoder::cpu::SimdLevel::AVX2)) {
             simd::matMulVecBatchF32_AVX2(W_f32, X, seqLen, rows, cols, out);
             return true;
         }
@@ -1152,11 +1165,11 @@ namespace tinycoder {
         static std::atomic<int> s_level{-1};
         int level = s_level.load(std::memory_order_acquire);
         if (level < 0) {
-            level = static_cast<int>(np::internal::max_simd_level());
+            level = static_cast<int>(tinycoder::cpu::maxSimdLevel());
             s_level.store(level, std::memory_order_release);
         }
 #if defined(__AVX2__) && defined(__FMA__)
-        if (level >= static_cast<int>(np::internal::SimdLevel::AVX2)) {
+        if (level >= static_cast<int>(tinycoder::cpu::SimdLevel::AVX2)) {
             simd::matMulVecBatchQ4K_Q8K_AVX2(W_q4k, X, seqLen, rows, cols, out);
             return true;
         }
@@ -1182,11 +1195,11 @@ namespace tinycoder {
         static std::atomic<int> s_level{-1};
         int level = s_level.load(std::memory_order_acquire);
         if (level < 0) {
-            level = static_cast<int>(np::internal::max_simd_level());
+            level = static_cast<int>(tinycoder::cpu::maxSimdLevel());
             s_level.store(level, std::memory_order_release);
         }
 #if defined(__AVX2__) && defined(__FMA__)
-        if (level >= static_cast<int>(np::internal::SimdLevel::AVX2)) {
+        if (level >= static_cast<int>(tinycoder::cpu::SimdLevel::AVX2)) {
             simd::matMulVecBatchQ3K_Q8K_AVX2(W_q3k, X, seqLen, rows, cols, out,
                                              residual);
             return true;
@@ -1214,11 +1227,11 @@ namespace tinycoder {
         static std::atomic<int> s_level{-1};
         int level = s_level.load(std::memory_order_acquire);
         if (level < 0) {
-            level = static_cast<int>(np::internal::max_simd_level());
+            level = static_cast<int>(tinycoder::cpu::maxSimdLevel());
             s_level.store(level, std::memory_order_release);
         }
 #if defined(__AVX2__) && defined(__FMA__)
-        if (level >= static_cast<int>(np::internal::SimdLevel::AVX2)) {
+        if (level >= static_cast<int>(tinycoder::cpu::SimdLevel::AVX2)) {
             simd::matMulVecBatchQ6K_Q8K_AVX2(W_q6k, X, seqLen, rows, cols, out);
             return true;
         }
@@ -1248,11 +1261,11 @@ namespace tinycoder {
         static std::atomic<int> s_level{-1};
         int level = s_level.load(std::memory_order_acquire);
         if (level < 0) {
-            level = static_cast<int>(np::internal::max_simd_level());
+            level = static_cast<int>(tinycoder::cpu::maxSimdLevel());
             s_level.store(level, std::memory_order_release);
         }
 #if defined(__AVX2__) && defined(__FMA__)
-        if (level >= static_cast<int>(np::internal::SimdLevel::AVX2)) {
+        if (level >= static_cast<int>(tinycoder::cpu::SimdLevel::AVX2)) {
             simd::matMulVecBatchQ2K_Compact_Q8K_AVX2(W_q2k, X, seqLen, rows,
                                                      cols, out);
             return true;
@@ -1279,11 +1292,11 @@ namespace tinycoder {
         static std::atomic<int> s_level{-1};
         int level = s_level.load(std::memory_order_acquire);
         if (level < 0) {
-            level = static_cast<int>(np::internal::max_simd_level());
+            level = static_cast<int>(tinycoder::cpu::maxSimdLevel());
             s_level.store(level, std::memory_order_release);
         }
 #if defined(__AVX2__) && defined(__FMA__)
-        if (level >= static_cast<int>(np::internal::SimdLevel::AVX2)) {
+        if (level >= static_cast<int>(tinycoder::cpu::SimdLevel::AVX2)) {
             simd::matMulVecBatchQ5K_Q8K_AVX2(W_q5k, X, seqLen, rows, cols, out);
             return true;
         }
@@ -1308,11 +1321,11 @@ namespace tinycoder {
         static std::atomic<int> s_level{-1};
         int level = s_level.load(std::memory_order_acquire);
         if (level < 0) {
-            level = static_cast<int>(np::internal::max_simd_level());
+            level = static_cast<int>(tinycoder::cpu::maxSimdLevel());
             s_level.store(level, std::memory_order_release);
         }
 #if defined(__AVX2__) && defined(__FMA__)
-        if (level >= static_cast<int>(np::internal::SimdLevel::AVX2)) {
+        if (level >= static_cast<int>(tinycoder::cpu::SimdLevel::AVX2)) {
             simd::matMulVecBatchIQ4XS_Q8K_AVX2(W_iq4xs, X, seqLen, rows, cols, out);
             return true;
         }
@@ -1337,11 +1350,11 @@ namespace tinycoder {
         static std::atomic<int> s_level{-1};
         int level = s_level.load(std::memory_order_acquire);
         if (level < 0) {
-            level = static_cast<int>(np::internal::max_simd_level());
+            level = static_cast<int>(tinycoder::cpu::maxSimdLevel());
             s_level.store(level, std::memory_order_release);
         }
 #if defined(__AVX2__) && defined(__FMA__)
-        if (level >= static_cast<int>(np::internal::SimdLevel::AVX2)) {
+        if (level >= static_cast<int>(tinycoder::cpu::SimdLevel::AVX2)) {
             simd::matMulVecBatchIQ4NL_Q8K_AVX2(W_iq4nl, X, seqLen, rows, cols, out);
             return true;
         }
@@ -1370,11 +1383,11 @@ namespace tinycoder {
         static std::atomic<int> s_level{-1};
         int level = s_level.load(std::memory_order_acquire);
         if (level < 0) {
-            level = static_cast<int>(np::internal::max_simd_level());
+            level = static_cast<int>(tinycoder::cpu::maxSimdLevel());
             s_level.store(level, std::memory_order_release);
         }
 #if defined(__AVX2__) && defined(__FMA__)
-        if (level >= static_cast<int>(np::internal::SimdLevel::AVX2)) {
+        if (level >= static_cast<int>(tinycoder::cpu::SimdLevel::AVX2)) {
             simd::matMulVecBatchQ8_0_Q8K_AVX2(W_q8_0, X, seqLen, rows, cols, out);
             return true;
         }
@@ -1407,11 +1420,11 @@ namespace tinycoder {
         static std::atomic<int> s_level{-1};
         int level = s_level.load(std::memory_order_acquire);
         if (level < 0) {
-            level = static_cast<int>(np::internal::max_simd_level());
+            level = static_cast<int>(tinycoder::cpu::maxSimdLevel());
             s_level.store(level, std::memory_order_release);
         }
 #if defined(__AVX2__) && defined(__FMA__)
-        if (level >= static_cast<int>(np::internal::SimdLevel::AVX2)) {
+        if (level >= static_cast<int>(tinycoder::cpu::SimdLevel::AVX2)) {
             // Dispatch to the Q2_K ffnDown variant when the caller supplies a
             // load-time compact Q2_K re-quant copy (Lever C), else the raw
             // Q3_K variant. Same 9-arg shape, different block stride.
@@ -1456,11 +1469,11 @@ namespace tinycoder {
         static std::atomic<int> s_level{-1};
         int level = s_level.load(std::memory_order_acquire);
         if (level < 0) {
-            level = static_cast<int>(np::internal::max_simd_level());
+            level = static_cast<int>(tinycoder::cpu::maxSimdLevel());
             s_level.store(level, std::memory_order_release);
         }
 #if defined(__AVX2__) && defined(__FMA__)
-        if (level >= static_cast<int>(np::internal::SimdLevel::AVX2)) {
+        if (level >= static_cast<int>(tinycoder::cpu::SimdLevel::AVX2)) {
             simd::matMulVecFusedGateUpDownQ2K_Q2K_Compact_AVX2(
                     gateData, upData, downQ2kData, x,
                     gRows, hRows, cols, out,
@@ -1502,8 +1515,8 @@ namespace tinycoder {
                 s_impl{nullptr};
         auto impl = s_impl.load(std::memory_order_acquire);
         if (!impl) {
-            using np::internal::SimdLevel;
-            SimdLevel level = np::internal::max_simd_level();
+            using tinycoder::cpu::SimdLevel;
+            SimdLevel level = tinycoder::cpu::maxSimdLevel();
             switch (level) {
 #if defined(__AVX2__) && defined(__FMA__)
                 case SimdLevel::AVX2:
@@ -1609,8 +1622,8 @@ namespace tinycoder {
                 s_impl{nullptr};
         auto impl = s_impl.load(std::memory_order_acquire);
         if (!impl) {
-            using np::internal::SimdLevel;
-            SimdLevel level = np::internal::max_simd_level();
+            using tinycoder::cpu::SimdLevel;
+            SimdLevel level = tinycoder::cpu::maxSimdLevel();
             switch (level) {
 #if defined(__AVX2__) && defined(__FMA__)
                 case SimdLevel::AVX2:
@@ -1687,8 +1700,8 @@ namespace tinycoder {
         static std::atomic<float (*)(const Q8KBlock *, const Q8KBlock *)> s_impl{nullptr};
         auto impl = s_impl.load(std::memory_order_acquire);
         if (!impl) {
-            using np::internal::SimdLevel;
-            SimdLevel level = np::internal::max_simd_level();
+            using tinycoder::cpu::SimdLevel;
+            SimdLevel level = tinycoder::cpu::maxSimdLevel();
             switch (level) {
 #if defined(__AVX512F__) && defined(__FMA__)
                 case SimdLevel::AVX512:

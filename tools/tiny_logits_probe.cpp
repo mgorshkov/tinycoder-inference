@@ -305,7 +305,7 @@ int main(int argc, char **argv) {
         // recurrent state + conv state, EXL3 fused GEMV) across steps, which is
         // what Model::generate() actually uses; exl3_decode_agree restarts from
         // a fresh batched prefill for every position it checks.
-        auto top1 = [&](const np::Array<float> &l, float *outLogit,
+        auto top1 = [&](const tinycoder::Array<float> &l, float *outLogit,
                         int32_t *outId) {
             const float *row = l.size() <= (size_t) vocabSize
                                        ? l.data()
@@ -313,7 +313,10 @@ int main(int argc, char **argv) {
             int best = -1;
             float bv = -1e30f;
             for (int64_t k = 0; k < vocabSize; ++k)
-                if (std::isfinite(row[k]) && row[k] > bv) { bv = row[k]; best = (int32_t) k; }
+                if (std::isfinite(row[k]) && row[k] > bv) {
+                    bv = row[k];
+                    best = (int32_t) k;
+                }
             *outId = best;
             *outLogit = bv;
         };
@@ -327,7 +330,7 @@ int main(int argc, char **argv) {
         std::vector<float> chainLogit;
         for (int step = 0; step < seqGen; ++step) {
             model.clearKVCache();
-            np::Array<float> pre = model.forward(ids, false);
+            tinycoder::Array<float> pre = model.forward(ids, false);
             float l = 0.f;
             int32_t id = -1;
             top1(pre, &l, &id);
@@ -340,7 +343,7 @@ int main(int argc, char **argv) {
         // disagree, the decode-time state update (GDN recurrent + conv state)
         // is diverging from what a batched prefill computes for the same ids.
         model.clearKVCache();
-        np::Array<float> live = model.forward(
+        tinycoder::Array<float> live = model.forward(
                 std::vector<int32_t>(ids.begin(), ids.begin() + (long) base), false);
         for (int step = 0; step < seqGen; ++step) {
             float l = 0.f;
@@ -362,7 +365,7 @@ int main(int argc, char **argv) {
 
     printf("  forward(computeAllLogits=false) ...\n");
     auto f0 = std::chrono::high_resolution_clock::now();
-    np::Array<float> logits = model.forward(toks, false);
+    tinycoder::Array<float> logits = model.forward(toks, false);
     auto f1 = std::chrono::high_resolution_clock::now();
     if (logits.size() == 0) {
         // The engine refuses a request that does not fit the window (it used

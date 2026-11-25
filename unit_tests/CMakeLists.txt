@@ -58,8 +58,8 @@ if(ENABLE_CUDA AND NOT APPLE AND EXISTS "/usr/lib/x86_64-linux-gnu/libstdc++.so.
 endif()
 
 # ---- Standalone logits probe (diagnostic; not a gtest) ----
-# Links the same way as tinycoder_test so CUDA separable compilation,
-# np, and tinycoder_core are all wired correctly for tools/tiny_logits_probe.cpp.
+# Links the same way as tinycoder_test so CUDA separable compilation and
+# tinycoder_core are all wired correctly for tools/tiny_logits_probe.cpp.
 add_executable(tiny_logits_probe
     ../tools/tiny_logits_probe.cpp
 )

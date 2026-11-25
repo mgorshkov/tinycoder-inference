@@ -817,12 +817,18 @@ TEST(DequantizeTest, Q2_K_Q8KernelVsReference) {
         blockData[i] = static_cast<uint8_t>((i << 4) | (15 - i));
     }
 
-    // Set qs[64]: pack 2-bit values (0, 1, 2, 3) into each byte
+    // Set qs[64]: pack 2-bit values (0, 1, 2, 3) into each byte.
+    //
+    // Pseudo-random, NOT periodic: a period-4 pattern makes every 32-element
+    // sub-chunk identical, which hides a wrong qs_expanded offset. The scalar
+    // Q2_K kernel had exactly that defect; this pattern exposes it.
+    uint32_t rng = 0x2545F491u;
     for (int i = 0; i < 64; ++i) {
         uint8_t byteVal = 0;
         for (int b = 0; b < 4; ++b) {
-            uint8_t val = static_cast<uint8_t>((i * 4 + b) % 4);
-            byteVal |= (val << (b * 2));
+            rng = rng * 1664525u + 1013904223u;
+            uint8_t val = static_cast<uint8_t>((rng >> 16) & 0x3);
+            byteVal |= static_cast<uint8_t>(val << (b * 2));
         }
         blockData[16 + i] = byteVal;
     }

@@ -664,6 +664,11 @@ TEST_P(SampleQuestionTest, AnswersQuestion) {
     // that gets a benchmark row must be added here in the same change.
     const bool isOrnith9B = (cfg.architecture == ARCH_QWEN35 &&
                              cfg.hiddenSize == 4096 && cfg.numLayers == 32);
+    // Qwen3.5-4B (qwen35 dense hybrid, hidden 2560, 32 layers).  Same
+    // architecture family as the 27B above, so the same content-based
+    // assertions apply.
+    const bool isQwen354B = (cfg.architecture == ARCH_QWEN35 &&
+                             cfg.hiddenSize == 2560 && cfg.numLayers == 32);
     // Inkling-2-Mini (looped MoE, 24 physical blocks, hidden 2304).  It answers
     // the same content-based question ("What is the capital of France?" ->
     // "The capital of France is Paris."), so it joins the gate instead of
@@ -672,8 +677,8 @@ TEST_P(SampleQuestionTest, AnswersQuestion) {
                              cfg.architecture == ARCH_INKLING2_LOOP) &&
                             cfg.hiddenSize == 2304 && cfg.numLayers == 24);
     if (!isGptQwen025B && !isQwen25Coder7B && !isQwen25Coder15B &&
-        !isQwen3527B && !isBonsai && !isQwen35MoE && !isOrnith9B &&
-        !isInkling) {
+        !isQwen3527B && !isQwen354B && !isBonsai && !isQwen35MoE &&
+        !isOrnith9B && !isInkling) {
         GTEST_SKIP() << "generation keyword assertions validated against the "
                         "IQ3_XXS Qwen2-0.5B and Qwen2.5-Coder-7B reference "
                         "models plus the Qwen3.6-27B (qwen35) model; loaded "
@@ -691,8 +696,8 @@ TEST_P(SampleQuestionTest, AnswersQuestion) {
     const uint32_t maxGenTokens =
             isQwen25Coder7B ? 96u
                             : (isOrnith9B ? 384u
-                                          : ((isQwen3527B || isBonsai || isQwen35MoE ||
-                                              isInkling)
+                                          : ((isQwen3527B || isQwen354B || isBonsai ||
+                                              isQwen35MoE || isInkling)
                                                      ? 160u
                                                      : 64u));
 
@@ -1033,7 +1038,7 @@ TEST_F(ModelTest, CompareBatchVsSequentialPrefill) {
 
     // Extract last token logits
     uint32_t lastIdx = static_cast<uint32_t>(tokens.size()) - 1;
-    np::Array<float> batchLastLogits(np::Shape{vocabSize});
+    tinycoder::Array<float> batchLastLogits(tinycoder::Shape{vocabSize});
     for (uint32_t i = 0; i < vocabSize; ++i) {
         batchLastLogits.set(i, batchLogitsAll.get(lastIdx * vocabSize + i));
     }
@@ -1072,7 +1077,7 @@ TEST_F(ModelTest, CompareBatchVsSequentialPrefill) {
     ASSERT_FALSE(seqLogitsAll.empty());
 
     // Extract logits (seqLen=1, so position 0)
-    np::Array<float> seqLastLogits(np::Shape{vocabSize});
+    tinycoder::Array<float> seqLastLogits(tinycoder::Shape{vocabSize});
     for (uint32_t i = 0; i < vocabSize; ++i) {
         seqLastLogits.set(i, seqLogitsAll.get(i));
     }
@@ -1203,7 +1208,7 @@ TEST_F(ModelTest, CompareBatchVsSequentialPrefill) {
 
     // (a) reference: token by token from a clean cache.
     SharedTestEnv::model->clearKVCache();
-    np::Array<float> shortRef;
+    tinycoder::Array<float> shortRef;
     for (int32_t t: shortTokens) {
         shortRef = SharedTestEnv::model->forward({t});
     }

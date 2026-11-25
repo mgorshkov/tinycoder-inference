@@ -216,8 +216,8 @@ namespace tinycoder {
 
     }// namespace
 
-    np::Array<float> Model::forwardInkling(const std::vector<int32_t> &tokens,
-                                           bool computeAllLogits) {
+    tinycoder::Array<float> Model::forwardInkling(const std::vector<int32_t> &tokens,
+                                                  bool computeAllLogits) {
         const uint32_t hidden = config_.hiddenSize;
         const uint32_t nHeads = config_.numAttentionHeads;
         const uint32_t nKvHeads = config_.numKVHeads;
@@ -245,7 +245,7 @@ namespace tinycoder {
             extent == 0 || nExperts == 0 || nUsed == 0) {
             std::cerr << "[TinyCoder] Inkling forward: incomplete geometry"
                       << std::endl;
-            return np::Array<float>{};
+            return tinycoder::Array<float>{};
         }
         if (inklingConvState_.size() != slots) {
             inklingConvState_.assign(
@@ -296,9 +296,9 @@ namespace tinycoder {
         std::vector<const float *> states;
         states.reserve(8);
 
-        np::Array<float> logits(
-                np::Shape{computeAllLogits ? size_t(seqLen) : size_t(1),
-                          size_t(vocab)});
+        tinycoder::Array<float> logits(
+                tinycoder::Shape{computeAllLogits ? size_t(seqLen) : size_t(1),
+                                 size_t(vocab)});
 
         double profQ = 0, profC = 0, profT = 0, profA = 0, profO = 0, profF = 0, profM = 0;
         auto nowT = [] { return std::chrono::steady_clock::now(); };
@@ -351,7 +351,7 @@ namespace tinycoder {
                 if (emb.size() != hidden) {
                     std::cerr << "[TinyCoder] Inkling: bad embedding row"
                               << std::endl;
-                    return np::Array<float>{};
+                    return tinycoder::Array<float>{};
                 }
                 rmsNormVec(emb.data(), inklingTokNorm_.data(), x.data(), hidden);
                 if (const char *dd = std::getenv("TINYCODER_INKLING_DUMP")) {
@@ -785,7 +785,7 @@ namespace tinycoder {
                     if (mq == nullptr) {
                         std::cerr << "[TinyCoder] Inkling: missing loop_msg_query"
                                   << std::endl;
-                        return np::Array<float>{};
+                        return tinycoder::Array<float>{};
                     }
                     // The bank is the previous pass's blocks after its first
                     // core block, plus that pass's output.
@@ -796,7 +796,7 @@ namespace tinycoder {
                     if (bankStates.empty()) {
                         std::cerr << "[TinyCoder] Inkling: empty message bank"
                                   << std::endl;
-                        return np::Array<float>{};
+                        return tinycoder::Array<float>{};
                     }
                     mixStates(bankStates, mq, 4, hidden, msgMixed.data(),
                               bankNormed, bankScores);

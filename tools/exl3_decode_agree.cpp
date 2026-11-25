@@ -163,7 +163,7 @@ int main(int argc, char **argv) {
     auto runSeq = [&](size_t begin, size_t end) -> std::vector<float> {
         std::vector<int32_t> chunk(stream.begin() + static_cast<long>(begin),
                                    stream.begin() + static_cast<long>(end));
-        np::Array<float> lg = model.forward(chunk, false);
+        tinycoder::Array<float> lg = model.forward(chunk, false);
         const size_t n = lg.size();
         const float *row = n <= static_cast<size_t>(vocab)
                                    ? lg.data()
@@ -183,7 +183,7 @@ int main(int argc, char **argv) {
             model.clearKVCache();
             std::vector<int32_t> chunk(stream.begin(),
                                        stream.begin() + static_cast<long>(n));
-            np::Array<float> lg = model.forward(chunk, false);
+            tinycoder::Array<float> lg = model.forward(chunk, false);
             const size_t sz = lg.size();
             const float *row = sz <= static_cast<size_t>(vocab)
                                        ? lg.data()
@@ -223,8 +223,8 @@ int main(int argc, char **argv) {
         const int nGen = std::max(1, atoi(genEnv));
         printf("\n=== greedy continuation (%d tokens) ===\n", nGen);
         model.clearKVCache();
-        np::Array<float> lg = model.forward(stream, false);
-        auto top1Of = [&](const np::Array<float> &l) {
+        tinycoder::Array<float> lg = model.forward(stream, false);
+        auto top1Of = [&](const tinycoder::Array<float> &l) {
             const size_t sz = l.size();
             const float *row = sz <= static_cast<size_t>(vocab)
                                        ? l.data()
@@ -232,7 +232,10 @@ int main(int argc, char **argv) {
             int best = -1;
             float bv = -1e30f;
             for (int64_t i = 0; i < vocab; ++i)
-                if (std::isfinite(row[i]) && row[i] > bv) { bv = row[i]; best = static_cast<int>(i); }
+                if (std::isfinite(row[i]) && row[i] > bv) {
+                    bv = row[i];
+                    best = static_cast<int>(i);
+                }
             return std::make_pair(best, bv);
         };
         auto px = top1Of(lg);
@@ -240,7 +243,7 @@ int main(int argc, char **argv) {
         int32_t cur = static_cast<int32_t>(px.first);
         for (int i = 1; i < nGen; ++i) {
             std::vector<int32_t> one{cur};
-            np::Array<float> l2 = model.forward(one, false);
+            tinycoder::Array<float> l2 = model.forward(one, false);
             auto p2 = top1Of(l2);
             printf("  gen[%2d] id=%-7d logit=%.6f\n", i, p2.first, p2.second);
             fflush(stdout);
@@ -259,7 +262,7 @@ int main(int argc, char **argv) {
         model.clearKVCache();
         for (size_t n = 1; n <= stream.size(); ++n) {
             std::vector<int32_t> one{stream[n - 1]};
-            np::Array<float> lg = model.forward(one, false);
+            tinycoder::Array<float> lg = model.forward(one, false);
             const size_t sz = lg.size();
             const float *row = sz <= static_cast<size_t>(vocab)
                                        ? lg.data()

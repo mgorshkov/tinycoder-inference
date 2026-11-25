@@ -17,6 +17,18 @@ cmake_minimum_required(VERSION 3.18.0)
 project(tinycoder_inference VERSION 0.5.0 DESCRIPTION "High-Performant local inference engine" LANGUAGES CXX)
 enable_testing()
 
+# ---- Target architecture ----
+# The CPU SIMD kernels (AVX2 / AVX-512 / AMX) are x86-only. On aarch64
+# (e.g. Jetson Orin) the engine builds and runs with its scalar
+# CPU path; the model work happens on the GPU. Detect that here, before the
+# shared Config.cmake turns the ENABLE_* options into -mavx2/-mavx512f/-mamx-*
+# compile options -- GCC on ARM rejects those flags outright.
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64|AMD64|i[3-6]86)$")
+    set(TINYCODER_ARCH_X86 ON)
+else()
+    set(TINYCODER_ARCH_X86 OFF)
+endif()
+
 # ---- Options ----
 # CUDA defaults to ON when nvcc is present: a plain `cmake -B build` on a GPU box
 # should produce the offload build, and a CPU-only default was a trap -- it built
@@ -69,6 +81,17 @@ option(ENABLE_AVX512 "Enable AVX-512 optimizations (default: ON when the host CP
 option(ENABLE_AVX512_VBMI "Enable AVX-512 VBMI (byte permutes; Ice Lake+) optimizations" OFF)
 option(ENABLE_AVX512_VBMI2 "Enable AVX-512 VBMI2 (byte compress/expand; Ice Lake+) optimizations" OFF)
 option(ENABLE_AMX "Enable AMX (Advanced Matrix Extensions) optimizations" OFF)
+if(NOT TINYCODER_ARCH_X86)
+    foreach(_tinycoder_x86_option
+            ENABLE_AVX2 ENABLE_AVX512 ENABLE_AVX512_VBMI ENABLE_AVX512_VBMI2 ENABLE_AMX)
+        if(${_tinycoder_x86_option})
+            message(STATUS "tinycoder: ${_tinycoder_x86_option}=ON ignored on "
+                           "${CMAKE_SYSTEM_PROCESSOR} (x86-only SIMD)")
+        endif()
+        set(${_tinycoder_x86_option} OFF)
+    endforeach()
+    unset(_tinycoder_x86_option)
+endif()
 option(ENABLE_OPENMP "Enable OpenMP parallelization" ON)
 option(BUILD_SHARED_LIBS "Build shared library" OFF)
 option(TINYCODER_FFN_STEAL "Fused FFN kernel uses chunked work-stealing scheduling" ON)
@@ -99,32 +122,74 @@ if(NOT cmake_SOURCE_DIR)
     FetchContent_MakeAvailable(cmake)
 endif()
 
+# The shared Config.cmake hard-codes `set(CMAKE_CUDA_ARCHITECTURES 75 80 86)`,
+# which shadows a -DCMAKE_CUDA_ARCHITECTURES=... from the command line (normal
+# variables win over cache variables). That silently ignored a native-arch
+# request such as -DCMAKE_CUDA_ARCHITECTURES=87 on Jetson Orin. Remember the
+# user's value here and restore it below.
+set(TINYCODER_USER_CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}")
+
 # Apply global cmake options (compiler checks, CUDA setup, OpenMP, etc.)
 include(${cmake_SOURCE_DIR}/Config.cmake)
 
-# ---- Fetch np library ----
-# Only fetch when not already provided by an embedding parent project.
-if(NOT TARGET np)
-    FetchContent_Declare(
-        np
-        GIT_REPOSITORY https://github.com/mgorshkov/np.git
-        GIT_TAG main
-        GIT_SHALLOW TRUE
-        CMAKE_ARGS
-        -DENABLE_CUDA=${ENABLE_CUDA}
-        -DENABLE_OPENMP=${ENABLE_OPENMP}
-        -DENABLE_SSE2=${ENABLE_SSE2}
-        -DENABLE_SSE3=${ENABLE_SSE3}
-        -DENABLE_AVX=${ENABLE_AVX}
-        -DENABLE_AVX2=${ENABLE_AVX2}
-        -DENABLE_AVX512=${ENABLE_AVX512}
-        -DENABLE_AVX512_VBMI=${ENABLE_AVX512_VBMI}
-        -DENABLE_AVX512_VBMI2=${ENABLE_AVX512_VBMI2}
-        -DENABLE_AMX=${ENABLE_AMX}
-        -DBUILD_SHARED_LIBS=${BUILD_SHARED_LIBS}
-        -DDEBUG_INFO=${DEBUG_INFO}
-    )
-    FetchContent_MakeAvailable(np)
+if(ENABLE_CUDA AND TINYCODER_USER_CUDA_ARCHITECTURES)
+    # The engine needs sm_75+: the int8 tensor-core GEMM (mma.s8.m8n8k16), the
+    # decode GEMV builtins (__dp4a is sm_61+) and int8GemmAvailable()'s runtime
+    # check all assume it.  A stale cache from an older configure can still
+    # carry something like 52; honouring it produces a wall of "identifier
+    # __dp4a is undefined" errors from nvcc, so drop unsupported entries and
+    # fall back to the shared config's list when none survive.
+    set(_tc_default_archs "${CMAKE_CUDA_ARCHITECTURES}")
+    set(_tc_user_archs "")
+    set(_tc_arch_kw FALSE)
+    foreach(_a IN LISTS TINYCODER_USER_CUDA_ARCHITECTURES)
+        string(REGEX REPLACE "[-].*$" "" _n "${_a}")
+        if(_n MATCHES "^[0-9]+$")
+            if(_n GREATER_EQUAL 75)
+                list(APPEND _tc_user_archs "${_a}")
+            endif()
+        else()
+            # "native" / "all" / "all-major": CMake resolves these itself, so
+            # keep the original list rather than filtering it.
+            set(_tc_arch_kw TRUE)
+        endif()
+    endforeach()
+    if(_tc_arch_kw)
+        set(_tc_user_archs "${TINYCODER_USER_CUDA_ARCHITECTURES}")
+    endif()
+    if(_tc_user_archs)
+        set(CMAKE_CUDA_ARCHITECTURES "${_tc_user_archs}")
+        if(NOT "${_tc_user_archs}" STREQUAL "${TINYCODER_USER_CUDA_ARCHITECTURES}")
+            message(WARNING "tinycoder: dropped CUDA architectures below sm_75 from "
+                            "'${TINYCODER_USER_CUDA_ARCHITECTURES}' (the engine requires "
+                            "sm_75+); using '${CMAKE_CUDA_ARCHITECTURES}'")
+        else()
+            message(STATUS "tinycoder: CUDA architectures from the command line: "
+                           "${CMAKE_CUDA_ARCHITECTURES}")
+        endif()
+    else()
+        message(WARNING "tinycoder: CMAKE_CUDA_ARCHITECTURES="
+                        "'${TINYCODER_USER_CUDA_ARCHITECTURES}' has no architecture "
+                        ">= sm_75, which this engine requires; using "
+                        "'${_tc_default_archs}' (delete the stale cache entry or pass "
+                        "-DCMAKE_CUDA_ARCHITECTURES=75;80;86)")
+    endif()
+    unset(_tc_user_archs)
+    unset(_tc_default_archs)
+endif()
+
+# The shared Config.cmake requests CUDA C++20 unconditionally. CMake only knows
+# the CUDA20 dialect from 3.26 on; on older CMake (Ubuntu 22.04 ships 3.22, the
+# JetPack 6 default) the target dies with:
+#   Target "tinycoder_core" requires the language dialect "CUDA20" ...
+#   CMake does not know the compile flags to use to enable it.
+# None of the .cu sources need C++20, so fall back to CUDA C++17 there instead
+# of requiring a CMake upgrade on the device. Newer CMake keeps 20.
+if(ENABLE_CUDA AND CMAKE_VERSION VERSION_LESS 3.26)
+    set(CMAKE_CUDA_STANDARD 17)
+    set(CMAKE_CUDA_STANDARD_REQUIRED ON)
+    message(STATUS "tinycoder: CMake ${CMAKE_VERSION} has no CUDA20 dialect; "
+                   "using CUDA C++17 (nvcc ${CMAKE_CUDA_COMPILER_VERSION})")
 endif()
 
 # ---- Core engine library ----
@@ -172,10 +237,9 @@ if(ENABLE_CUDA)
                        "ncu source lines at 2-3x fatbin size")
     endif()
     # Benign nvlink noise: CMake's separable-compilation device-link step
-    # passes the host-only static archives (-ldl/-lrt/-lpthread pulled in via
-    # the np/Threads link interface) to nvlink, which cannot use host static
-    # archives and prints "Skipping incompatible ... when searching for -l..."
-    # for every (arch, target).  They are a toolchain artifact, not code
+    # passes host-only static archives (-ldl/-lrt/-lpthread) to nvlink, which
+    # cannot use them and prints "Skipping incompatible ... when searching for
+    # -l..." for every (arch, target).  They are a toolchain artifact, not code
     # warnings, and cannot be removed from the link line without breaking the
     # host link.  nvcc forwards -Xnvlink options to nvlink only during the
     # -dlink stage (ignored at plain compile), so carrying -Xnvlink -w in
@@ -187,6 +251,7 @@ endif()
 set(TINYCODER_HEADERS
     include/AlignedVector.hpp
     include/ChatTemplateRenderer.hpp
+    include/CpuFeatures.hpp
     include/EXL3Codec.hpp
     include/EXL3Kernels.hpp
     include/EXL3Loader.hpp
@@ -210,6 +275,7 @@ set(TINYCODER_HEADERS
     include/SIMDMatMulVec.hpp
     include/SIMDMatMulVecInternal.hpp
     include/ThreadPool.hpp
+    include/TinyArray.hpp
     include/Tokenizer.hpp
 )
 
@@ -292,12 +358,13 @@ add_library(tinycoder_core STATIC ${TINYCODER_CORE_SOURCES})
 target_include_directories(tinycoder_core
     PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/include
-    ${np_SOURCE_DIR}/include
 )
 
+# The engine uses std::thread (ThreadPool) directly.
+find_package(Threads REQUIRED)
 target_link_libraries(tinycoder_core
     PUBLIC
-    np
+    Threads::Threads
 )
 
 set_target_properties(tinycoder_core PROPERTIES
@@ -371,6 +438,11 @@ else()
 endif()
 message(STATUS "  Tests:         ${BUILD_TESTS}")
 message(STATUS "  C++ Standard:  ${CMAKE_CXX_STANDARD}")
-message(STATUS "  np library:    ${np_SOURCE_DIR}")
+message(STATUS "  Architecture:  ${CMAKE_SYSTEM_PROCESSOR} "
+               "(${CMAKE_SIZEOF_VOID_P}-byte, x86 SIMD: ${TINYCODER_ARCH_X86})")
+if(ENABLE_CUDA)
+    message(STATUS "  CUDA archs:    ${CMAKE_CUDA_ARCHITECTURES}")
+    message(STATUS "  CUDA standard: ${CMAKE_CUDA_STANDARD}")
+endif()
 message(STATUS "  Output:        ${CMAKE_BINARY_DIR}/libtinycoder_core.a")
 message(STATUS "")
