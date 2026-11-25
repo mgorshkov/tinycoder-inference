@@ -31,21 +31,14 @@ SOFTWARE.
 #include <cstdlib>
 #include <vector>
 
-#include <np/Array.hpp>
-// np::internal::max_simd_level() / SimdLevel for the runtime ISA choice in
-// matMulVecBatchSIMD (the AVX-512 kernels are only compiled in an AVX-512
-// build, and even there a non-AVX-512 host must not execute them).
-#include <np/internal/CpuDispatch.hpp>
-
-#ifdef USE_CUDA
-#include <np/internal/cuda/Dot1d2d.hpp>
-#endif
+#include "CpuFeatures.hpp"
+#include "TinyArray.hpp"
 
 namespace tinycoder {
 
-    np::Array<float> QuantizedMatrix::matMulVec(const float *x) const {
+    tinycoder::Array<float> QuantizedMatrix::matMulVec(const float *x) const {
         // Allocate result and delegate to the out-parameter version
-        np::Array<float> result(np::Shape{rows});
+        tinycoder::Array<float> result(tinycoder::Shape{rows});
         matMulVec(x, result.data());
         return result;
     }
@@ -76,10 +69,10 @@ namespace tinycoder {
     // AVX-512 variants for the same two types (SIMDMatMulVecAVX512.cpp). They
     // are compiled only when the AVX-512 TU is (-mavx512f), i.e. an
     // ENABLE_AVX512 build; this mirrors the existing Q4_K/Q6_K AVX-512 arms in
-    // SIMDMatMulVec.cpp, which are guarded the same way because np's
-    // add_compile_options() then gives every TU __AVX512F__. In a non-AVX-512
-    // build the guard is false and the dispatch below falls back to the AVX2
-    // wrapper.
+    // SIMDMatMulVec.cpp, which are guarded the same way because the shared
+    // CMake config then adds -mavx512f to every TU, defining __AVX512F__. In a
+    // non-AVX-512 build the guard is false and the dispatch below falls back to
+    // the AVX2 wrapper.
 #if defined(__AVX512F__) && defined(__FMA__)
     namespace simd {
         void matMulVecBatchNVFP4_AVX512(const uint8_t *data, const float *x,
@@ -97,7 +90,7 @@ namespace tinycoder {
     // checks for AVX2 at runtime).
     static bool hostHasAVX512() {
         static const bool ok =
-                np::internal::max_simd_level() >= np::internal::SimdLevel::AVX512;
+                tinycoder::cpu::maxSimdLevel() >= tinycoder::cpu::SimdLevel::AVX512;
         return ok;
     }
 #endif
@@ -260,7 +253,7 @@ namespace tinycoder {
         //   1. Allocating a large float buffer for the full dequantized matrix
         //      (e.g., 13.76M elements = ~55 MB for ffnGate)
         //   2. The memory bandwidth bottleneck of writing/reading all those floats
-        //   3. The overhead of copying into np::Array for the dot product
+        //   3. The overhead of copying into tinycoder::Array for the dot product
         //
         // For F32 matrices, we still use the CUDA/CPU path.
 
@@ -342,9 +335,9 @@ namespace tinycoder {
         }
     }
 
-    np::Array<float> QuantizedMatrix::matMulVecRows(const float *x, uint32_t rowStart, uint32_t numRows) const {
+    tinycoder::Array<float> QuantizedMatrix::matMulVecRows(const float *x, uint32_t rowStart, uint32_t numRows) const {
         // Allocate result and delegate to the out-parameter version
-        np::Array<float> result(np::Shape{numRows});
+        tinycoder::Array<float> result(tinycoder::Shape{numRows});
         matMulVecRows(x, rowStart, numRows, result.data());
         return result;
     }

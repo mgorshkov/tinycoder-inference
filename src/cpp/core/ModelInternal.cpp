@@ -63,9 +63,9 @@ namespace tinycoder::detail {
     /// Computes y_j = sum_i x[i] * W_f16[j][i] for j in [0, rows).
     /// W_f16 is stored as FP16 (uint16_t) to halve memory bandwidth.
     /// Uses F16C _mm256_cvtph_ps for on-the-fly FP16->FP32 conversion.
-    np::Array<float> deqMatMulVecF16(const uint16_t *W_f16, const float *x,
-                                     uint32_t rows, uint32_t cols) {
-        np::Array<float> result(np::Shape{rows});
+    tinycoder::Array<float> deqMatMulVecF16(const uint16_t *W_f16, const float *x,
+                                            uint32_t rows, uint32_t cols) {
+        tinycoder::Array<float> result(tinycoder::Shape{rows});
         deqMatMulVecF16(W_f16, x, rows, cols, result.data());
         return result;
     }

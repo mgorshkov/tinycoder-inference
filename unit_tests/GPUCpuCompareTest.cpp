@@ -104,7 +104,7 @@ static std::string parisChatPrompt() {
 /// row - the other rows are uninitialized padding. The GPU engine returns a
 /// compact [1, vocabSize] array. Normalize both to the flat last-token row so
 /// the comparisons operate on identical shapes.
-static np::Array<float> lastLogitRow(np::Array<float> logits) {
+static tinycoder::Array<float> lastLogitRow(tinycoder::Array<float> logits) {
     const uint32_t vocab = SharedTestEnv::config.vocabSize;
     if (logits.size() <= vocab) {
         // Single-token pass: shapes already agree ([1, vocabSize]).
@@ -112,7 +112,7 @@ static np::Array<float> lastLogitRow(np::Array<float> logits) {
     }
 
     // Multi-token pass: strip everything except the last token's row.
-    np::Array<float> lastRow = np::Array<float>(np::Shape{vocab});
+    tinycoder::Array<float> lastRow = tinycoder::Array<float>(tinycoder::Shape{vocab});
     const float *src = logits.data() + (logits.size() - vocab);
     std::memcpy(lastRow.data(), src, vocab * sizeof(float));
     return lastRow;
@@ -121,8 +121,8 @@ static np::Array<float> lastLogitRow(np::Array<float> logits) {
 /// @brief Run one forward pass with the GPU engine explicitly enabled or
 /// disabled via $TINYCODER_GPU, returning ONLY the last token's logits.
 /// Clears BOTH KV caches first (fresh-session semantics).
-static np::Array<float> forwardLastLogits(const std::vector<int32_t> &tokens,
-                                          bool wantGpu) {
+static tinycoder::Array<float> forwardLastLogits(const std::vector<int32_t> &tokens,
+                                                 bool wantGpu) {
     if (wantGpu) {
         setenv("TINYCODER_GPU", "1", 1);
     } else {
@@ -134,7 +134,7 @@ static np::Array<float> forwardLastLogits(const std::vector<int32_t> &tokens,
 }
 
 /// @brief Top-N (logit, id) pairs in descending logit order.
-static std::vector<std::pair<float, int32_t>> topN(const np::Array<float> &logits,
+static std::vector<std::pair<float, int32_t>> topN(const tinycoder::Array<float> &logits,
                                                    size_t n) {
     std::vector<std::pair<float, int32_t>> v;
     v.reserve(logits.size());
@@ -149,7 +149,7 @@ static std::vector<std::pair<float, int32_t>> topN(const np::Array<float> &logit
 }
 
 static void printTop(tinycoder::Tokenizer &tok, const std::string &label,
-                     const np::Array<float> &logits, size_t n) {
+                     const tinycoder::Array<float> &logits, size_t n) {
     std::cout << "  " << label << ":";
     auto top = topN(logits, n);
     for (const auto &kv: top) {
@@ -214,11 +214,11 @@ TEST_F(GPUCpuCompareTest, ParisPromptLogitsAgree) {
               << tokens.size() << " prompt tokens" << std::endl;
 
     // CPU logits (the known-good reference path).
-    np::Array<float> cpuLogits = forwardLastLogits(tokens, /*wantGpu=*/false);
+    tinycoder::Array<float> cpuLogits = forwardLastLogits(tokens, /*wantGpu=*/false);
     ASSERT_FALSE(cpuLogits.empty());
 
     // GPU logits (the offload engine).
-    np::Array<float> gpuLogits = forwardLastLogits(tokens, /*wantGpu=*/true);
+    tinycoder::Array<float> gpuLogits = forwardLastLogits(tokens, /*wantGpu=*/true);
     ASSERT_FALSE(gpuLogits.empty());
 
     const uint32_t vocab = static_cast<uint32_t>(cpuLogits.size());

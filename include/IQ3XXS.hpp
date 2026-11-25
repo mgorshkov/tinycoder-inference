@@ -31,7 +31,7 @@ SOFTWARE.
 #include <cstring>
 #include <vector>
 
-#include <np/Array.hpp>
+#include "TinyArray.hpp"
 
 #include "ThreadPool.hpp"
 
@@ -145,10 +145,10 @@ namespace tinycoder {
             });
         }
 
-        /// @brief Dequantize a single block into np::Array<float>.
+        /// @brief Dequantize a single block into tinycoder::Array<float>.
         /// @param block The quantized block
         /// @return Dequantized float array of size BLOCK_SIZE
-        static np::Array<float> dequantizeBlock(const Block &block) {
+        static tinycoder::Array<float> dequantizeBlock(const Block &block) {
             std::array<float, BLOCK_SIZE> result{};
             float scale = decodeScale(block.scale);
 
@@ -172,11 +172,11 @@ namespace tinycoder {
                 result[i] = (static_cast<float>(static_cast<int32_t>(val) - 4)) * scale;
             }
 
-            return np::Array<float>(result);
+            return tinycoder::Array<float>(result);
         }
 
         /// @brief Dequantize multiple blocks into a contiguous float array.
-        static np::Array<float> dequantize(const Block *blocks, uint32_t numBlocks) {
+        static tinycoder::Array<float> dequantize(const Block *blocks, uint32_t numBlocks) {
             std::vector<float> result(numBlocks * BLOCK_SIZE);
 
             ThreadPool::current().parallelFor(0, numBlocks, [&](uint32_t b) {
@@ -185,12 +185,12 @@ namespace tinycoder {
                             BLOCK_SIZE * sizeof(float));
             });
 
-            return np::Array<float>(result, np::Shape{numBlocks * BLOCK_SIZE});
+            return tinycoder::Array<float>(result, tinycoder::Shape{numBlocks * BLOCK_SIZE});
         }
 
-        /// @brief Dequantize a weight matrix (2D: rows x cols) into np::Array<float>.
-        static np::Array<float> dequantizeMatrix(const Block *blocks, uint32_t rows,
-                                                 uint32_t cols) {
+        /// @brief Dequantize a weight matrix (2D: rows x cols) into tinycoder::Array<float>.
+        static tinycoder::Array<float> dequantizeMatrix(const Block *blocks, uint32_t rows,
+                                                        uint32_t cols) {
             uint32_t blocksPerRow = (cols + BLOCK_SIZE - 1) / BLOCK_SIZE;
 
             std::vector<float> result(rows * cols);
@@ -208,7 +208,7 @@ namespace tinycoder {
                 }
             });
 
-            return np::Array<float>(result, np::Shape{rows, cols});
+            return tinycoder::Array<float>(result, tinycoder::Shape{rows, cols});
         }
 
         /// @brief Decode a 6-bit scale value to float.

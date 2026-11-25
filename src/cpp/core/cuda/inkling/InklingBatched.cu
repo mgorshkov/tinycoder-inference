@@ -80,12 +80,6 @@
 #include <string>
 #include <vector>
 
-// See InklingForward.cu: Model.hpp pulls in np -> immintrin, and GCC's
-// amxtileintrin.h emits builtins cudafe++ does not know.
-#if defined(__CUDACC__) || defined(__NVCC__)
-#define __builtin_ia32_ldtilecfg(x) ((void) 0)
-#define __builtin_ia32_sttilecfg(x) ((void) 0)
-#endif
 #ifndef __CUDA_ARCH__
 #include "Model.hpp"
 #endif

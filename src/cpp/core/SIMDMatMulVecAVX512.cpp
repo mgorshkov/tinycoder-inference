@@ -424,7 +424,7 @@ namespace tinycoder::simd {
     // int8 accumulate because it changes every 16 or 64 elements). That adds
     // tile setup and copy cost while saving no arithmetic, so there is no AMX
     // path for these types. (The engine has no AMX code at all; ENABLE_AMX only
-    // forwards to the np dependency.)
+    // forwards to the scalar fallback.)
     namespace {
 
         inline float dotBlockFMA16_AVX512(const float *w, const float *x,

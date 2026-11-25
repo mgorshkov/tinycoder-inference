@@ -58,19 +58,18 @@ PREFLIGHT_FAIL=0
 # non-zero return here fired the FAIL branch on a passing line.
 pf() { printf '  %-46s %s\n' "$1" "$2"; [ "$2" = FAIL ] && PREFLIGHT_FAIL=1; return 0; }
 
-# 1. The build needs three git repos (mgorshkov/cmake, np, googletest) via
+# 1. The build needs two git repos (mgorshkov/cmake, googletest) via
 #    FetchContent. On a box with no network that clone fails and nothing builds;
-#    FETCHCONTENT_FULLY_DISCONNECTED plus the three *_SOURCE_DIR vars make the
+#    FETCHCONTENT_FULLY_DISCONNECTED plus the two *_SOURCE_DIR vars make the
 #    build offline. Tested on the reference box: configures and builds clean.
 CACHED_DEPS=0
 for d in ${FETCHCONTENT_SOURCE_DIR_CMAKE:+/}${FETCHCONTENT_SOURCE_DIR_CMAKE:-x} \
-         ${FETCHCONTENT_SOURCE_DIR_NP:+x}${FETCHCONTENT_SOURCE_DIR_NP:-x} \
          ${FETCHCONTENT_SOURCE_DIR_GOOGLETEST:+x}${FETCHCONTENT_SOURCE_DIR_GOOGLETEST:-x}; do
   [ -d "$d" ] && CACHED_DEPS=$((CACHED_DEPS + 1))
 done
 if [ "${FETCHCONTENT_FULLY_DISCONNECTED:-OFF}" = "ON" ]; then
-  [ "$CACHED_DEPS" -eq 3 ] && pf "offline deps (3 source dirs)" ok \
-                           || pf "offline deps (need all 3 source dirs)" FAIL
+  [ "$CACHED_DEPS" -eq 2 ] && pf "offline deps (2 source dirs)" ok \
+                           || pf "offline deps (need both source dirs)" FAIL
 elif [ -d "build-1.0/_deps/cmake-src" ]; then
   pf "dependency sources present" ok
 else

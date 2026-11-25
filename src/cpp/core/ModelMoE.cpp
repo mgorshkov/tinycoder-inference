@@ -93,7 +93,7 @@ namespace tinycoder {
             }
 
             // Step 2: Router - compute expert scores
-            np::Array<float> routerOut = w.ffnGateInp.matMulVec(normedInput.data());
+            tinycoder::Array<float> routerOut = w.ffnGateInp.matMulVec(normedInput.data());
             std::memcpy(routerScores.data(), routerOut.data(), expertCount * sizeof(float));
 
             // Step 3: Select top-k experts
@@ -116,14 +116,14 @@ namespace tinycoder {
 
                 // Step 4a: Gate+Up projection for this expert
                 // Gate: rows [expertIdx * expertFF * 2, expertIdx * expertFF * 2 + expertFF)
-                np::Array<float> gateRow = w.ffnGateUpExps.matMulVecRows(
+                tinycoder::Array<float> gateRow = w.ffnGateUpExps.matMulVecRows(
                         normedInput.data(),
                         expertIdx * expertFF * 2,
                         expertFF);
                 std::memcpy(gateBuf.data(), gateRow.data(), expertFF * sizeof(float));
 
                 // Up: rows [expertIdx * expertFF * 2 + expertFF, (expertIdx+1) * expertFF * 2)
-                np::Array<float> upRow = w.ffnGateUpExps.matMulVecRows(
+                tinycoder::Array<float> upRow = w.ffnGateUpExps.matMulVecRows(
                         normedInput.data(),
                         expertIdx * expertFF * 2 + expertFF,
                         expertFF);
@@ -137,7 +137,7 @@ namespace tinycoder {
 
                 // Step 4c: Down projection for this expert
                 // rows [expertIdx * hiddenSize, (expertIdx+1) * hiddenSize)
-                np::Array<float> downRow = w.ffnDownExps.matMulVecRows(
+                tinycoder::Array<float> downRow = w.ffnDownExps.matMulVecRows(
                         gateBuf.data(),
                         expertIdx * hiddenSize,
                         hiddenSize);

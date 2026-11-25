@@ -5,6 +5,8 @@
 #            5090) via CUDA, plus the unit tests and benchmarks when BUILD_TESTS=ON.
 #
 # This script:
+#   0. Removes the existing build tree for a from-scratch build (default; pass
+#      --no-clean / --incremental or TINYCODER_CLEAN=0 to reuse it).
 #   1. Configures the CMake build tree.
 #   2. Builds tinycoder_core (plus tinycoder_test and tinycoder_bench).
 #   3. Runs CTest when the tests are enabled.
@@ -41,6 +43,10 @@
 #   --cuda           GPU build: -DENABLE_CUDA=ON (default)
 #   --no-cuda | --cpu   CPU-only build: -DENABLE_CUDA=OFF
 #   --no-tests       Skip unit tests and benchmarks: -DBUILD_TESTS=OFF
+#   --clean          Delete the build tree first (default)
+#   --no-clean | --incremental   Reuse the existing build tree (fast rebuilds;
+#                    a stale CMakeCache.txt survives, so use --clean after
+#                    pulling changes to the build configuration)
 #
 # Parallelism:
 #   TINYCODER_BUILD_DIR   Build tree (default: build)
@@ -71,6 +77,10 @@ TESTS_FLAGS="-DBUILD_TESTS=ON"     # tests + bench are the default
 # Build tree: override with TINYCODER_BUILD_DIR (e.g. to keep a CPU and a CUDA
 # tree side by side).
 BUILD_DIR="${TINYCODER_BUILD_DIR:-build}"
+# Clean by default: a reused tree keeps a stale CMakeCache.txt, which is how a
+# cached CMAKE_CUDA_ARCHITECTURES=52 once turned a supported build into a wall
+# of __dp4a errors.  --no-clean / --incremental / TINYCODER_CLEAN=0 opt out.
+CLEAN="${TINYCODER_CLEAN:-1}"
 EXTRA_CMAKE_ARGS=()
 
 # ---- Parallelism ----
@@ -120,6 +130,12 @@ for arg in "$@"; do
         --no-tests)
             TESTS_FLAGS="-DBUILD_TESTS=OFF"
             ;;
+        --clean)
+            CLEAN=1
+            ;;
+        --no-clean|--incremental)
+            CLEAN=0
+            ;;
         --help|-h)
             usage
             exit 0
@@ -153,9 +169,35 @@ done
 ROOT_DIR="$(readlink -f "$(dirname "$BASH_SOURCE")/..")"
 cd "${ROOT_DIR}"
 
+# Delete the build tree, but only something that is recognisably a build tree:
+# a CMake cache, or a build*/ directory directly inside this repository.  A
+# typo in TINYCODER_BUILD_DIR must never turn into an rm -rf of source.
+clean_build_dir() {
+    [[ -e "${BUILD_DIR}" ]] || return 0
+    local abs
+    abs="$(readlink -f -- "${BUILD_DIR}" 2>/dev/null || true)"
+    if [[ -z "${abs}" || "${abs}" == "/" || "${abs}" == "${HOME}" || \
+          "${abs}" == "${ROOT_DIR}" ]]; then
+        echo "ERROR: refusing to delete '${BUILD_DIR}'" >&2
+        exit 1
+    fi
+    if [[ -f "${BUILD_DIR}/CMakeCache.txt" ]]; then
+        : # a CMake build tree, whatever it is called
+    elif [[ "${abs}" == "${ROOT_DIR}/"* && "$(basename "${abs}")" == build* ]]; then
+        : # a build*/ directory inside the repo (e.g. after a failed configure)
+    else
+        echo "ERROR: refusing to delete '${BUILD_DIR}': it is not a CMake" >&2
+        echo "       build tree. Delete it manually if that is intended." >&2
+        exit 1
+    fi
+    echo "Removing '${BUILD_DIR}' for a from-scratch build"
+    rm -rf -- "${BUILD_DIR:?}"
+}
+
 echo "=== TinyCoder Inference Engine for NVIDIA GPUs (Turing / Ampere / Ada) Build ==="
 echo "Root: ${ROOT_DIR}"
 echo "Build dir: ${BUILD_DIR}"
+echo "Clean build: $([[ "${CLEAN}" == 1 ]] && echo yes || echo "no (incremental)")"
 echo "Parallel jobs: ${JOBS}"
 if [[ "${CUDA_FLAGS}" == "-DENABLE_CUDA=ON" ]]; then
     echo "Mode: GPU offload build (-DENABLE_CUDA=ON)"
@@ -165,6 +207,12 @@ fi
 if [[ ${#EXTRA_CMAKE_ARGS[@]} -gt 0 ]]; then
     echo "Extra CMake args:"
     printf '  %s\n' "${EXTRA_CMAKE_ARGS[@]}"
+fi
+
+if [[ "${CLEAN}" == "1" ]]; then
+    echo ""
+    echo "--- Step 0/3: Removing the existing build tree ---"
+    clean_build_dir
 fi
 
 # ---- 1. Configure ----

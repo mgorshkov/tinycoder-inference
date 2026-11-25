@@ -32,6 +32,10 @@
 //   TINYCODER_TOKEN_TIMES=1 prints per-token decode ms (tagged [tg-times]).
 // -----------------------------------------------------------------------------
 
+#if defined(__AVX2__)
+#include <immintrin.h>
+#endif
+
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -76,7 +80,74 @@ namespace {
         return t;
     }
 
+    // Greedy argmax over the full vocabulary.  This runs INSIDE the timed
+    // decode region (once per generated token), so it is part of the measured
+    // tg128 the way llama-bench's device-side argmax is part of its number: a
+    // scalar branch-per-element pass over 248k floats cost a visible fraction
+    // of a 7.6 ms token.  Ties keep the first (lowest) index, like the scalar
+    // loop this replaces.
     int32_t argmaxTop(const float *logits, int32_t vocabSize) {
+#if defined(__AVX2__)
+        // TINYCODER_ARGMAX_SCALAR=1 takes the scalar loop below, so the two
+        // can be diffed on the same checkpoint (TINYCODER_DUMP_TOKENS=1).
+        static const bool scalarOnly = [] {
+            const char *e = std::getenv("TINYCODER_ARGMAX_SCALAR");
+            return e != nullptr && e[0] != '0';
+        }();
+        if (!scalarOnly) {
+            int32_t best = 0;
+            float bestVal = logits[0];
+            int32_t i = 0;
+            if (vocabSize >= 8) {
+                __m256 vMax = _mm256_loadu_ps(logits);
+                __m256i vIdx = _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7);
+                __m256i vBestIdx = vIdx;
+                const __m256i eight = _mm256_set1_epi32(8);
+                for (i = 8; i + 8 <= vocabSize; i += 8) {
+                    // Advance the index vector BEFORE the blend: it must hold
+                    // this block's indices, not the previous block's.
+                    vIdx = _mm256_add_epi32(vIdx, eight);
+                    const __m256 v = _mm256_loadu_ps(logits + i);
+                    const __m256 mask = _mm256_cmp_ps(v, vMax, _CMP_GT_OQ);
+                    vMax = _mm256_blendv_ps(vMax, v, mask);
+                    vBestIdx = _mm256_blendv_epi8(
+                            vBestIdx, vIdx, _mm256_castps_si256(mask));
+                }
+                alignas(32) float vals[8];
+                alignas(32) int32_t idxs[8];
+                _mm256_store_ps(vals, vMax);
+                _mm256_store_si256(reinterpret_cast<__m256i *>(idxs), vBestIdx);
+                bestVal = vals[0];
+                best = idxs[0];
+                for (int k = 1; k < 8; ++k) {
+                    if (vals[k] > bestVal ||
+                        (vals[k] == bestVal && idxs[k] < best)) {
+                        bestVal = vals[k];
+                        best = idxs[k];
+                    }
+                }
+            }
+            for (; i < vocabSize; ++i) {
+                if (logits[i] > bestVal) {
+                    bestVal = logits[i];
+                    best = i;
+                }
+            }
+            return best;
+        }
+#endif
+        int32_t best = 0;
+        float bestVal = logits[0];
+        for (int32_t i = 1; i < vocabSize; ++i) {
+            if (logits[i] > bestVal) {
+                bestVal = logits[i];
+                best = i;
+            }
+        }
+        return best;
+    }
+
+    int32_t argmaxScalar(const float *logits, int32_t vocabSize) {
         int32_t best = 0;
         float bestVal = logits[0];
         for (int32_t i = 1; i < vocabSize; ++i) {
@@ -159,6 +230,13 @@ namespace {
             const double tTok0 = tokenTimes ? nowMs() : 0.0;
             logits = model.forward({tok}, false);
             tok = argmaxTop(logits.data(), vocabSize);
+            if (const char *ac = std::getenv("TINYCODER_ARGMAX_CHECK");
+                ac != nullptr && ac[0] != '0') {
+                const int32_t ref = argmaxScalar(logits.data(), vocabSize);
+                if (ref != tok)
+                    std::fprintf(stderr,
+                                 "[argmax] MISMATCH simd=%d scalar=%d\n", tok, ref);
+            }
             ++gen;
             if (tokenTimes) tokenMs.push_back(nowMs() - tTok0);
         }

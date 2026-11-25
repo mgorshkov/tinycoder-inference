@@ -35,10 +35,10 @@ SOFTWARE.
 #include "SIMDMatMulVecInternal.hpp"
 #include "ThreadPool.hpp"
 
-// Runtime SIMD level (np::internal::max_simd_level / SimdLevel) for the
-// dispatch wrappers at the bottom of this file. Those wrappers sit OUTSIDE the
-// __AVX2__ guard so they exist in a non-AVX2 build and return false.
-#include <np/internal/CpuDispatch.hpp>
+// Runtime SIMD level for the dispatch wrappers at the bottom of this file.
+// Those wrappers sit OUTSIDE the __AVX2__ guard so they exist in a non-AVX2
+// build (and on aarch64, where the level is always SCALAR) and return false.
+#include "CpuFeatures.hpp"
 
 #include <atomic>
 #include <cmath>
@@ -6654,8 +6654,9 @@ namespace tinycoder::simd {
 // they mirror. A false return makes QuantizedMatrix fall back to the scalar
 // dequantize+dot path, so a non-AVX2 host still computes correct output.
 //
-// An AVX-512 build (ENABLE_AVX512=ON) compiles EVERY TU with -mavx512f (np's
-// add_compile_options), so __AVX512F__ is defined here too; the wrappers then
+// An AVX-512 build (ENABLE_AVX512=ON) compiles EVERY TU with -mavx512f (the
+// shared CMake config's add_compile_options), so __AVX512F__ is defined here
+// too; the wrappers then
 // prefer the 16-wide kernels for direct callers as well (e.g. ModelMoE's batch
 // prefill), not just for QuantizedMatrix's dispatch. In a non-AVX-512 build the
 // guard is false, no AVX-512 symbol is referenced, and the AVX2 kernel runs.
@@ -6682,14 +6683,28 @@ namespace tinycoder {
         static std::atomic<int> s_level{-1};
         int level = s_level.load(std::memory_order_acquire);
         if (level < 0) {
-            level = static_cast<int>(np::internal::max_simd_level());
+            level = static_cast<int>(tinycoder::cpu::maxSimdLevel());
             s_level.store(level, std::memory_order_release);
         }
-        if (level < static_cast<int>(np::internal::SimdLevel::AVX2)) {
+        if (level < static_cast<int>(tinycoder::cpu::SimdLevel::AVX2)) {
             return false;
         }
+#if defined(__AVX2__) && defined(__FMA__)
         return simd::matMulVecBatchIQGeneric_SIMD(type, data, x, seqLen, rows,
                                                   cols, out);
+#else
+        // Non-AVX2 build (aarch64, or ENABLE_AVX2=OFF): the kernel was not
+        // compiled, so report "unavailable" and let the caller use the scalar
+        // path.  Without this branch the reference above is a compile error.
+        (void) type;
+        (void) data;
+        (void) x;
+        (void) seqLen;
+        (void) rows;
+        (void) cols;
+        (void) out;
+        return false;
+#endif
     }
 
     bool matMulVecBatchNVFP4_SIMD(const uint8_t *data, const float *x,
@@ -6698,17 +6713,17 @@ namespace tinycoder {
         static std::atomic<int> s_level{-1};
         int level = s_level.load(std::memory_order_acquire);
         if (level < 0) {
-            level = static_cast<int>(np::internal::max_simd_level());
+            level = static_cast<int>(tinycoder::cpu::maxSimdLevel());
             s_level.store(level, std::memory_order_release);
         }
 #if defined(__AVX512F__) && defined(__FMA__)
-        if (level >= static_cast<int>(np::internal::SimdLevel::AVX512)) {
+        if (level >= static_cast<int>(tinycoder::cpu::SimdLevel::AVX512)) {
             simd::matMulVecBatchNVFP4_AVX512(data, x, seqLen, rows, cols, out);
             return true;
         }
 #endif
 #if defined(__AVX2__) && defined(__FMA__)
-        if (level >= static_cast<int>(np::internal::SimdLevel::AVX2)) {
+        if (level >= static_cast<int>(tinycoder::cpu::SimdLevel::AVX2)) {
             simd::matMulVecBatchNVFP4_AVX2(data, x, seqLen, rows, cols, out);
             return true;
         }
@@ -6728,17 +6743,17 @@ namespace tinycoder {
         static std::atomic<int> s_level{-1};
         int level = s_level.load(std::memory_order_acquire);
         if (level < 0) {
-            level = static_cast<int>(np::internal::max_simd_level());
+            level = static_cast<int>(tinycoder::cpu::maxSimdLevel());
             s_level.store(level, std::memory_order_release);
         }
 #if defined(__AVX512F__) && defined(__FMA__)
-        if (level >= static_cast<int>(np::internal::SimdLevel::AVX512)) {
+        if (level >= static_cast<int>(tinycoder::cpu::SimdLevel::AVX512)) {
             simd::matMulVecBatchQ2_0_AVX512(data, x, seqLen, rows, cols, out);
             return true;
         }
 #endif
 #if defined(__AVX2__) && defined(__FMA__)
-        if (level >= static_cast<int>(np::internal::SimdLevel::AVX2)) {
+        if (level >= static_cast<int>(tinycoder::cpu::SimdLevel::AVX2)) {
             simd::matMulVecBatchQ2_0_AVX2(data, x, seqLen, rows, cols, out);
             return true;
         }
@@ -6758,17 +6773,17 @@ namespace tinycoder {
         static std::atomic<int> s_level{-1};
         int level = s_level.load(std::memory_order_acquire);
         if (level < 0) {
-            level = static_cast<int>(np::internal::max_simd_level());
+            level = static_cast<int>(tinycoder::cpu::maxSimdLevel());
             s_level.store(level, std::memory_order_release);
         }
 #if defined(__AVX512F__) && defined(__FMA__)
-        if (level >= static_cast<int>(np::internal::SimdLevel::AVX512)) {
+        if (level >= static_cast<int>(tinycoder::cpu::SimdLevel::AVX512)) {
             simd::matMulVecBatchIQ1S_AVX512(data, x, seqLen, rows, cols, out);
             return true;
         }
 #endif
 #if defined(__AVX2__) && defined(__FMA__)
-        if (level >= static_cast<int>(np::internal::SimdLevel::AVX2)) {
+        if (level >= static_cast<int>(tinycoder::cpu::SimdLevel::AVX2)) {
             simd::matMulVecBatchIQ1S_AVX2(data, x, seqLen, rows, cols, out);
             return true;
         }

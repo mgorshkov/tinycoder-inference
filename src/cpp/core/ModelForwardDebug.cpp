@@ -63,7 +63,7 @@ namespace tinycoder {
         uint32_t vocabSize = config_.vocabSize;
 
         // Allocate hidden state: [seqLen, hiddenSize]
-        np::Array<float> hidden = np::Array<float>(np::Shape{seqLen, hiddenSize});
+        tinycoder::Array<float> hidden = tinycoder::Array<float>(tinycoder::Shape{seqLen, hiddenSize});
         float *hiddenData = hidden.data();
 
         // Token embeddings
@@ -78,29 +78,29 @@ namespace tinycoder {
         }
 
         // Pre-allocate per-layer buffers
-        np::Array<float> attnNorm = np::Array<float>(np::Shape{seqLen, hiddenSize});
+        tinycoder::Array<float> attnNorm = tinycoder::Array<float>(tinycoder::Shape{seqLen, hiddenSize});
         float *attnNormData = attnNorm.data();
 
-        np::Array<float> q = np::Array<float>(np::Shape{seqLen, nHeads, headDim});
-        np::Array<float> k = np::Array<float>(np::Shape{seqLen, nKVHeads, headDim});
-        np::Array<float> v = np::Array<float>(np::Shape{seqLen, nKVHeads, headDim});
+        tinycoder::Array<float> q = tinycoder::Array<float>(tinycoder::Shape{seqLen, nHeads, headDim});
+        tinycoder::Array<float> k = tinycoder::Array<float>(tinycoder::Shape{seqLen, nKVHeads, headDim});
+        tinycoder::Array<float> v = tinycoder::Array<float>(tinycoder::Shape{seqLen, nKVHeads, headDim});
         float *qData = q.data();
         float *kData = k.data();
         float *vData = v.data();
 
-        np::Array<float> attnOut = np::Array<float>(np::Shape{seqLen, nHeads, headDim});
+        tinycoder::Array<float> attnOut = tinycoder::Array<float>(tinycoder::Shape{seqLen, nHeads, headDim});
         float *attnOutData = attnOut.data();
-        np::Array<float> attnProj = np::Array<float>(np::Shape{seqLen, hiddenSize});
+        tinycoder::Array<float> attnProj = tinycoder::Array<float>(tinycoder::Shape{seqLen, hiddenSize});
         float *attnProjData = attnProj.data();
 
         uint32_t intermediateSize = config_.intermediateSize;
-        np::Array<float> ffnNorm = np::Array<float>(np::Shape{seqLen, hiddenSize});
+        tinycoder::Array<float> ffnNorm = tinycoder::Array<float>(tinycoder::Shape{seqLen, hiddenSize});
         float *ffnNormData = ffnNorm.data();
-        np::Array<float> gate = np::Array<float>(np::Shape{seqLen, intermediateSize});
-        np::Array<float> up = np::Array<float>(np::Shape{seqLen, intermediateSize});
+        tinycoder::Array<float> gate = tinycoder::Array<float>(tinycoder::Shape{seqLen, intermediateSize});
+        tinycoder::Array<float> up = tinycoder::Array<float>(tinycoder::Shape{seqLen, intermediateSize});
         float *gateData = gate.data();
         float *upData = up.data();
-        np::Array<float> ffnOut = np::Array<float>(np::Shape{seqLen, hiddenSize});
+        tinycoder::Array<float> ffnOut = tinycoder::Array<float>(tinycoder::Shape{seqLen, hiddenSize});
         float *ffnOutData = ffnOut.data();
 
         // Process through all transformer layers
@@ -132,7 +132,7 @@ namespace tinycoder {
                     const float *hRowPtr = attnNormData + s * hiddenSize;
 
                     // Step 1: Input projection (hiddenSize → ssmInnerSize)
-                    np::Array<float> ssmIn = w.ssmOut.matMulVec(hRowPtr);
+                    tinycoder::Array<float> ssmIn = w.ssmOut.matMulVec(hRowPtr);
                     float *ssmInData = ssmIn.data();
 
                     // Step 2: Conv1d with past buffer
@@ -186,8 +186,8 @@ namespace tinycoder {
                     }
 
                     // Step 6: Output projection back to hiddenSize using attnO
-                    np::Array<float> projRow = deqMatMulVecF16(w.attnO_deq_f16.data(), ssmOut.data(),
-                                                               w.attnO.rows, w.attnO.cols);
+                    tinycoder::Array<float> projRow = deqMatMulVecF16(w.attnO_deq_f16.data(), ssmOut.data(),
+                                                                      w.attnO.rows, w.attnO.cols);
                     float *projPtr = attnProjData + s * hiddenSize;
                     std::memcpy(projPtr, projRow.data(), hiddenSize * sizeof(float));
                 }
@@ -211,7 +211,7 @@ namespace tinycoder {
                     const float *hRowPtr = attnNormData + s * hiddenSize;
 
                     // Q
-                    np::Array<float> qRow = w.attnQ.matMulVec(hRowPtr);
+                    tinycoder::Array<float> qRow = w.attnQ.matMulVec(hRowPtr);
                     float *qRowPtr = qData + s * nHeads * headDim;
                     std::memcpy(qRowPtr, qRow.data(), nHeads * headDim * sizeof(float));
                     if (config_.architecture == ARCH_QWEN2 && !w.attnQBias.empty()) {
@@ -219,7 +219,7 @@ namespace tinycoder {
                     }
 
                     // K
-                    np::Array<float> kRow = w.attnK.matMulVec(hRowPtr);
+                    tinycoder::Array<float> kRow = w.attnK.matMulVec(hRowPtr);
                     float *kRowPtr = kData + s * nKVHeads * headDim;
                     std::memcpy(kRowPtr, kRow.data(), nKVHeads * headDim * sizeof(float));
                     if (config_.architecture == ARCH_QWEN2 && !w.attnKBias.empty()) {
@@ -227,7 +227,7 @@ namespace tinycoder {
                     }
 
                     // V
-                    np::Array<float> vRow = w.attnV.matMulVec(hRowPtr);
+                    tinycoder::Array<float> vRow = w.attnV.matMulVec(hRowPtr);
                     float *vRowPtr = vData + s * nKVHeads * headDim;
                     std::memcpy(vRowPtr, vRow.data(), nKVHeads * headDim * sizeof(float));
                     if (config_.architecture == ARCH_QWEN2 && !w.attnVBias.empty()) {
@@ -266,8 +266,8 @@ namespace tinycoder {
                 // Output projection (using dequantized F32 weights for exact float dot product)
                 for (uint32_t s = 0; s < seqLen; ++s) {
                     const float *attnRowPtr = attnOutData + s * nHeads * headDim;
-                    np::Array<float> projRow = deqMatMulVecF16(w.attnO_deq_f16.data(), attnRowPtr,
-                                                               w.attnO.rows, w.attnO.cols);
+                    tinycoder::Array<float> projRow = deqMatMulVecF16(w.attnO_deq_f16.data(), attnRowPtr,
+                                                                      w.attnO.rows, w.attnO.cols);
                     float *projPtr = attnProjData + s * hiddenSize;
                     std::memcpy(projPtr, projRow.data(), hiddenSize * sizeof(float));
                 }
@@ -328,12 +328,12 @@ namespace tinycoder {
                     const float *ffnRowPtr = ffnNormData + s * hiddenSize;
 
                     // Gate projection
-                    np::Array<float> gateRow = w.ffnGate.matMulVec(ffnRowPtr);
+                    tinycoder::Array<float> gateRow = w.ffnGate.matMulVec(ffnRowPtr);
                     float *gatePtr = gateData + s * intermediateSize;
                     std::memcpy(gatePtr, gateRow.data(), intermediateSize * sizeof(float));
 
                     // Up projection
-                    np::Array<float> upRow = w.ffnUp.matMulVec(ffnRowPtr);
+                    tinycoder::Array<float> upRow = w.ffnUp.matMulVec(ffnRowPtr);
                     float *upPtr = upData + s * intermediateSize;
                     std::memcpy(upPtr, upRow.data(), intermediateSize * sizeof(float));
                 }
@@ -357,8 +357,8 @@ namespace tinycoder {
                 // Down projection (using dequantized F32 weights for exact float dot product)
                 for (uint32_t s = 0; s < seqLen; ++s) {
                     const float *ffnActPtr = gateData + s * intermediateSize;
-                    np::Array<float> downRow = deqMatMulVecF16(w.ffnDown_deq_f16.data(), ffnActPtr,
-                                                               w.ffnDown.rows, w.ffnDown.cols);
+                    tinycoder::Array<float> downRow = deqMatMulVecF16(w.ffnDown_deq_f16.data(), ffnActPtr,
+                                                                      w.ffnDown.rows, w.ffnDown.cols);
                     float *outPtr = ffnOutData + s * hiddenSize;
                     std::memcpy(outPtr, downRow.data(), hiddenSize * sizeof(float));
                 }
@@ -395,7 +395,7 @@ namespace tinycoder {
         std::vector<float> hiddenState(hiddenData, hiddenData + seqLen * hiddenSize);
 
         // LM head (logits)
-        np::Array<float> logits = np::Array<float>(np::Shape{seqLen, vocabSize});
+        tinycoder::Array<float> logits = tinycoder::Array<float>(tinycoder::Shape{seqLen, vocabSize});
         float *logitsData = logits.data();
 
         if (lmHeadTied_) {
@@ -496,7 +496,7 @@ namespace tinycoder {
         uint32_t maxSeqLen = config_.maxSeqLen;
 
         // Allocate hidden state: [seqLen, hiddenSize]
-        np::Array<float> hidden = np::Array<float>(np::Shape{seqLen, hiddenSize});
+        tinycoder::Array<float> hidden = tinycoder::Array<float>(tinycoder::Shape{seqLen, hiddenSize});
         float *hiddenData = hidden.data();
 
         // Token embeddings
@@ -511,29 +511,29 @@ namespace tinycoder {
         }
 
         // Pre-allocate per-layer buffers
-        np::Array<float> attnNorm = np::Array<float>(np::Shape{seqLen, hiddenSize});
+        tinycoder::Array<float> attnNorm = tinycoder::Array<float>(tinycoder::Shape{seqLen, hiddenSize});
         float *attnNormData = attnNorm.data();
 
-        np::Array<float> q = np::Array<float>(np::Shape{seqLen, nHeads, headDim});
-        np::Array<float> k = np::Array<float>(np::Shape{seqLen, nKVHeads, headDim});
-        np::Array<float> v = np::Array<float>(np::Shape{seqLen, nKVHeads, headDim});
+        tinycoder::Array<float> q = tinycoder::Array<float>(tinycoder::Shape{seqLen, nHeads, headDim});
+        tinycoder::Array<float> k = tinycoder::Array<float>(tinycoder::Shape{seqLen, nKVHeads, headDim});
+        tinycoder::Array<float> v = tinycoder::Array<float>(tinycoder::Shape{seqLen, nKVHeads, headDim});
         float *qData = q.data();
         float *kData = k.data();
         float *vData = v.data();
 
-        np::Array<float> attnOut = np::Array<float>(np::Shape{seqLen, nHeads, headDim});
+        tinycoder::Array<float> attnOut = tinycoder::Array<float>(tinycoder::Shape{seqLen, nHeads, headDim});
         float *attnOutData = attnOut.data();
-        np::Array<float> attnProj = np::Array<float>(np::Shape{seqLen, hiddenSize});
+        tinycoder::Array<float> attnProj = tinycoder::Array<float>(tinycoder::Shape{seqLen, hiddenSize});
         float *attnProjData = attnProj.data();
 
         uint32_t intermediateSize = config_.intermediateSize;
-        np::Array<float> ffnNorm = np::Array<float>(np::Shape{seqLen, hiddenSize});
+        tinycoder::Array<float> ffnNorm = tinycoder::Array<float>(tinycoder::Shape{seqLen, hiddenSize});
         float *ffnNormData = ffnNorm.data();
-        np::Array<float> gate = np::Array<float>(np::Shape{seqLen, intermediateSize});
-        np::Array<float> up = np::Array<float>(np::Shape{seqLen, intermediateSize});
+        tinycoder::Array<float> gate = tinycoder::Array<float>(tinycoder::Shape{seqLen, intermediateSize});
+        tinycoder::Array<float> up = tinycoder::Array<float>(tinycoder::Shape{seqLen, intermediateSize});
         float *gateData = gate.data();
         float *upData = up.data();
-        np::Array<float> ffnOut = np::Array<float>(np::Shape{seqLen, hiddenSize});
+        tinycoder::Array<float> ffnOut = tinycoder::Array<float>(tinycoder::Shape{seqLen, hiddenSize});
         float *ffnOutData = ffnOut.data();
 
         // Process through all transformer layers
@@ -565,7 +565,7 @@ namespace tinycoder {
                     const float *hRowPtr = attnNormData + s * hiddenSize;
 
                     // Step 1: Input projection (hiddenSize → ssmInnerSize)
-                    np::Array<float> ssmIn = w.ssmOut.matMulVec(hRowPtr);
+                    tinycoder::Array<float> ssmIn = w.ssmOut.matMulVec(hRowPtr);
                     float *ssmInData = ssmIn.data();
 
                     // Step 2: Conv1d with past buffer
@@ -624,8 +624,8 @@ namespace tinycoder {
                     }
 
                     // Step 6: Output projection back to hiddenSize using attnO
-                    np::Array<float> projRow = deqMatMulVecF16(w.attnO_deq_f16.data(), ssmOut.data(),
-                                                               w.attnO.rows, w.attnO.cols);
+                    tinycoder::Array<float> projRow = deqMatMulVecF16(w.attnO_deq_f16.data(), ssmOut.data(),
+                                                                      w.attnO.rows, w.attnO.cols);
                     float *projPtr = attnProjData + s * hiddenSize;
                     std::memcpy(projPtr, projRow.data(), hiddenSize * sizeof(float));
                 }
@@ -650,7 +650,7 @@ namespace tinycoder {
                     const float *hRowPtr = attnNormData + s * hiddenSize;
 
                     // Q
-                    np::Array<float> qRow = w.attnQ.matMulVec(hRowPtr);
+                    tinycoder::Array<float> qRow = w.attnQ.matMulVec(hRowPtr);
                     float *qRowPtr = qData + s * nHeads * headDim;
                     std::memcpy(qRowPtr, qRow.data(), nHeads * headDim * sizeof(float));
                     if (config_.architecture == ARCH_QWEN2 && !w.attnQBias.empty()) {
@@ -658,7 +658,7 @@ namespace tinycoder {
                     }
 
                     // K
-                    np::Array<float> kRow = w.attnK.matMulVec(hRowPtr);
+                    tinycoder::Array<float> kRow = w.attnK.matMulVec(hRowPtr);
                     float *kRowPtr = kData + s * nKVHeads * headDim;
                     std::memcpy(kRowPtr, kRow.data(), nKVHeads * headDim * sizeof(float));
                     if (config_.architecture == ARCH_QWEN2 && !w.attnKBias.empty()) {
@@ -666,7 +666,7 @@ namespace tinycoder {
                     }
 
                     // V
-                    np::Array<float> vRow = w.attnV.matMulVec(hRowPtr);
+                    tinycoder::Array<float> vRow = w.attnV.matMulVec(hRowPtr);
                     float *vRowPtr = vData + s * nKVHeads * headDim;
                     std::memcpy(vRowPtr, vRow.data(), nKVHeads * headDim * sizeof(float));
                     if (config_.architecture == ARCH_QWEN2 && !w.attnVBias.empty()) {
@@ -708,8 +708,8 @@ namespace tinycoder {
                 // Output projection (using dequantized F32 weights for exact float dot product)
                 for (uint32_t s = 0; s < seqLen; ++s) {
                     const float *attnRowPtr = attnOutData + s * nHeads * headDim;
-                    np::Array<float> projRow = deqMatMulVecF16(w.attnO_deq_f16.data(), attnRowPtr,
-                                                               w.attnO.rows, w.attnO.cols);
+                    tinycoder::Array<float> projRow = deqMatMulVecF16(w.attnO_deq_f16.data(), attnRowPtr,
+                                                                      w.attnO.rows, w.attnO.cols);
                     float *projPtr = attnProjData + s * hiddenSize;
                     std::memcpy(projPtr, projRow.data(), hiddenSize * sizeof(float));
                 }
@@ -772,12 +772,12 @@ namespace tinycoder {
                     const float *ffnRowPtr = ffnNormData + s * hiddenSize;
 
                     // Gate projection
-                    np::Array<float> gateRow = w.ffnGate.matMulVec(ffnRowPtr);
+                    tinycoder::Array<float> gateRow = w.ffnGate.matMulVec(ffnRowPtr);
                     float *gatePtr = gateData + s * intermediateSize;
                     std::memcpy(gatePtr, gateRow.data(), intermediateSize * sizeof(float));
 
                     // Up projection
-                    np::Array<float> upRow = w.ffnUp.matMulVec(ffnRowPtr);
+                    tinycoder::Array<float> upRow = w.ffnUp.matMulVec(ffnRowPtr);
                     float *upPtr = upData + s * intermediateSize;
                     std::memcpy(upPtr, upRow.data(), intermediateSize * sizeof(float));
                 }
@@ -803,8 +803,8 @@ namespace tinycoder {
                 // Down projection (using dequantized F32 weights for exact float dot product)
                 for (uint32_t s = 0; s < seqLen; ++s) {
                     const float *ffnActPtr = gateData + s * intermediateSize;
-                    np::Array<float> downRow = deqMatMulVecF16(w.ffnDown_deq_f16.data(), ffnActPtr,
-                                                               w.ffnDown.rows, w.ffnDown.cols);
+                    tinycoder::Array<float> downRow = deqMatMulVecF16(w.ffnDown_deq_f16.data(), ffnActPtr,
+                                                                      w.ffnDown.rows, w.ffnDown.cols);
                     float *outPtr = ffnOutData + s * hiddenSize;
                     std::memcpy(outPtr, downRow.data(), hiddenSize * sizeof(float));
                 }
@@ -870,7 +870,7 @@ namespace tinycoder {
         uint32_t maxSeqLen = config_.maxSeqLen;
 
         // Allocate hidden state: [seqLen, hiddenSize]
-        np::Array<float> hidden = np::Array<float>(np::Shape{seqLen, hiddenSize});
+        tinycoder::Array<float> hidden = tinycoder::Array<float>(tinycoder::Shape{seqLen, hiddenSize});
         float *hiddenData = hidden.data();
 
         // Token embeddings
@@ -885,29 +885,29 @@ namespace tinycoder {
         }
 
         // Pre-allocate per-layer buffers
-        np::Array<float> attnNorm = np::Array<float>(np::Shape{seqLen, hiddenSize});
+        tinycoder::Array<float> attnNorm = tinycoder::Array<float>(tinycoder::Shape{seqLen, hiddenSize});
         float *attnNormData = attnNorm.data();
 
-        np::Array<float> q = np::Array<float>(np::Shape{seqLen, nHeads, headDim});
-        np::Array<float> k = np::Array<float>(np::Shape{seqLen, nKVHeads, headDim});
-        np::Array<float> v = np::Array<float>(np::Shape{seqLen, nKVHeads, headDim});
+        tinycoder::Array<float> q = tinycoder::Array<float>(tinycoder::Shape{seqLen, nHeads, headDim});
+        tinycoder::Array<float> k = tinycoder::Array<float>(tinycoder::Shape{seqLen, nKVHeads, headDim});
+        tinycoder::Array<float> v = tinycoder::Array<float>(tinycoder::Shape{seqLen, nKVHeads, headDim});
         float *qData = q.data();
         float *kData = k.data();
         float *vData = v.data();
 
-        np::Array<float> attnOut = np::Array<float>(np::Shape{seqLen, nHeads, headDim});
+        tinycoder::Array<float> attnOut = tinycoder::Array<float>(tinycoder::Shape{seqLen, nHeads, headDim});
         float *attnOutData = attnOut.data();
-        np::Array<float> attnProj = np::Array<float>(np::Shape{seqLen, hiddenSize});
+        tinycoder::Array<float> attnProj = tinycoder::Array<float>(tinycoder::Shape{seqLen, hiddenSize});
         float *attnProjData = attnProj.data();
 
         uint32_t intermediateSize = config_.intermediateSize;
-        np::Array<float> ffnNorm = np::Array<float>(np::Shape{seqLen, hiddenSize});
+        tinycoder::Array<float> ffnNorm = tinycoder::Array<float>(tinycoder::Shape{seqLen, hiddenSize});
         float *ffnNormData = ffnNorm.data();
-        np::Array<float> gate = np::Array<float>(np::Shape{seqLen, intermediateSize});
-        np::Array<float> up = np::Array<float>(np::Shape{seqLen, intermediateSize});
+        tinycoder::Array<float> gate = tinycoder::Array<float>(tinycoder::Shape{seqLen, intermediateSize});
+        tinycoder::Array<float> up = tinycoder::Array<float>(tinycoder::Shape{seqLen, intermediateSize});
         float *gateData = gate.data();
         float *upData = up.data();
-        np::Array<float> ffnOut = np::Array<float>(np::Shape{seqLen, hiddenSize});
+        tinycoder::Array<float> ffnOut = tinycoder::Array<float>(tinycoder::Shape{seqLen, hiddenSize});
         float *ffnOutData = ffnOut.data();
 
         // Per-layer hidden state capture
@@ -943,7 +943,7 @@ namespace tinycoder {
                     const float *hRowPtr = attnNormData + s * hiddenSize;
 
                     // Step 1: Input projection (hiddenSize → ssmInnerSize)
-                    np::Array<float> ssmIn = w.ssmOut.matMulVec(hRowPtr);
+                    tinycoder::Array<float> ssmIn = w.ssmOut.matMulVec(hRowPtr);
                     float *ssmInData = ssmIn.data();
 
                     // Step 2: Conv1d with past buffer
@@ -1002,8 +1002,8 @@ namespace tinycoder {
                     }
 
                     // Step 6: Output projection back to hiddenSize using attnO
-                    np::Array<float> projRow = deqMatMulVecF16(w.attnO_deq_f16.data(), ssmOut.data(),
-                                                               w.attnO.rows, w.attnO.cols);
+                    tinycoder::Array<float> projRow = deqMatMulVecF16(w.attnO_deq_f16.data(), ssmOut.data(),
+                                                                      w.attnO.rows, w.attnO.cols);
                     float *projPtr = attnProjData + s * hiddenSize;
                     std::memcpy(projPtr, projRow.data(), hiddenSize * sizeof(float));
                 }
@@ -1028,7 +1028,7 @@ namespace tinycoder {
                     const float *hRowPtr = attnNormData + s * hiddenSize;
 
                     // Q
-                    np::Array<float> qRow = w.attnQ.matMulVec(hRowPtr);
+                    tinycoder::Array<float> qRow = w.attnQ.matMulVec(hRowPtr);
                     float *qRowPtr = qData + s * nHeads * headDim;
                     std::memcpy(qRowPtr, qRow.data(), nHeads * headDim * sizeof(float));
                     if (config_.architecture == ARCH_QWEN2 && !w.attnQBias.empty()) {
@@ -1036,7 +1036,7 @@ namespace tinycoder {
                     }
 
                     // K
-                    np::Array<float> kRow = w.attnK.matMulVec(hRowPtr);
+                    tinycoder::Array<float> kRow = w.attnK.matMulVec(hRowPtr);
                     float *kRowPtr = kData + s * nKVHeads * headDim;
                     std::memcpy(kRowPtr, kRow.data(), nKVHeads * headDim * sizeof(float));
                     if (config_.architecture == ARCH_QWEN2 && !w.attnKBias.empty()) {
@@ -1044,7 +1044,7 @@ namespace tinycoder {
                     }
 
                     // V
-                    np::Array<float> vRow = w.attnV.matMulVec(hRowPtr);
+                    tinycoder::Array<float> vRow = w.attnV.matMulVec(hRowPtr);
                     float *vRowPtr = vData + s * nKVHeads * headDim;
                     std::memcpy(vRowPtr, vRow.data(), nKVHeads * headDim * sizeof(float));
                     if (config_.architecture == ARCH_QWEN2 && !w.attnVBias.empty()) {
@@ -1086,8 +1086,8 @@ namespace tinycoder {
                 // Output projection (using dequantized F32 weights for exact float dot product)
                 for (uint32_t s = 0; s < seqLen; ++s) {
                     const float *attnRowPtr = attnOutData + s * nHeads * headDim;
-                    np::Array<float> projRow = deqMatMulVecF16(w.attnO_deq_f16.data(), attnRowPtr,
-                                                               w.attnO.rows, w.attnO.cols);
+                    tinycoder::Array<float> projRow = deqMatMulVecF16(w.attnO_deq_f16.data(), attnRowPtr,
+                                                                      w.attnO.rows, w.attnO.cols);
                     float *projPtr = attnProjData + s * hiddenSize;
                     std::memcpy(projPtr, projRow.data(), hiddenSize * sizeof(float));
                 }
@@ -1150,12 +1150,12 @@ namespace tinycoder {
                     const float *ffnRowPtr = ffnNormData + s * hiddenSize;
 
                     // Gate projection
-                    np::Array<float> gateRow = w.ffnGate.matMulVec(ffnRowPtr);
+                    tinycoder::Array<float> gateRow = w.ffnGate.matMulVec(ffnRowPtr);
                     float *gatePtr = gateData + s * intermediateSize;
                     std::memcpy(gatePtr, gateRow.data(), intermediateSize * sizeof(float));
 
                     // Up projection
-                    np::Array<float> upRow = w.ffnUp.matMulVec(ffnRowPtr);
+                    tinycoder::Array<float> upRow = w.ffnUp.matMulVec(ffnRowPtr);
                     float *upPtr = upData + s * intermediateSize;
                     std::memcpy(upPtr, upRow.data(), intermediateSize * sizeof(float));
                 }
@@ -1181,8 +1181,8 @@ namespace tinycoder {
                 // Down projection (using dequantized F32 weights for exact float dot product)
                 for (uint32_t s = 0; s < seqLen; ++s) {
                     const float *ffnActPtr = gateData + s * intermediateSize;
-                    np::Array<float> downRow = deqMatMulVecF16(w.ffnDown_deq_f16.data(), ffnActPtr,
-                                                               w.ffnDown.rows, w.ffnDown.cols);
+                    tinycoder::Array<float> downRow = deqMatMulVecF16(w.ffnDown_deq_f16.data(), ffnActPtr,
+                                                                      w.ffnDown.rows, w.ffnDown.cols);
                     float *outPtr = ffnOutData + s * hiddenSize;
                     std::memcpy(outPtr, downRow.data(), hiddenSize * sizeof(float));
                 }
@@ -1279,21 +1279,21 @@ namespace tinycoder {
             if (pos == seqLen - 1) snapshot("attn_norm-0", attnNorm.data(), hiddenSize);
 
             // Q / K / V projections (IQ2_S attn_q/k, Q4_K attn_v for this model)
-            np::Array<float> qRow = w.attnQ.matMulVec(attnNorm.data());
+            tinycoder::Array<float> qRow = w.attnQ.matMulVec(attnNorm.data());
             std::memcpy(q.data(), qRow.data(), nHeads * headDim * sizeof(float));
             if (config_.architecture == ARCH_QWEN2 && !w.attnQBias.empty()) {
                 const float *qBias = w.attnQBias.data();
                 for (uint32_t i = 0; i < nHeads * headDim; ++i) q[i] += qBias[i];
             }
 
-            np::Array<float> kRow = w.attnK.matMulVec(attnNorm.data());
+            tinycoder::Array<float> kRow = w.attnK.matMulVec(attnNorm.data());
             std::memcpy(k.data(), kRow.data(), nKVHeads * headDim * sizeof(float));
             if (config_.architecture == ARCH_QWEN2 && !w.attnKBias.empty()) {
                 const float *kBias = w.attnKBias.data();
                 for (uint32_t i = 0; i < nKVHeads * headDim; ++i) k[i] += kBias[i];
             }
 
-            np::Array<float> vRow = w.attnV.matMulVec(attnNorm.data());
+            tinycoder::Array<float> vRow = w.attnV.matMulVec(attnNorm.data());
             std::memcpy(v.data(), vRow.data(), nKVHeads * headDim * sizeof(float));
             if (config_.architecture == ARCH_QWEN2 && !w.attnVBias.empty()) {
                 const float *vBias = w.attnVBias.data();
@@ -1332,8 +1332,8 @@ namespace tinycoder {
                                                   attnOut.data(), w.attnO.rows,
                                                   w.attnO.cols, attnProj.data());
             } else {
-                np::Array<float> projRow = deqMatMulVecF16(w.attnO_deq_f16.data(), attnOut.data(),
-                                                           w.attnO.rows, w.attnO.cols);
+                tinycoder::Array<float> projRow = deqMatMulVecF16(w.attnO_deq_f16.data(), attnOut.data(),
+                                                                  w.attnO.rows, w.attnO.cols);
                 std::memcpy(attnProj.data(), projRow.data(), hiddenSize * sizeof(float));
             }
             if (pos == seqLen - 1) snapshot("attn_proj-0", attnProj.data(), hiddenSize);
@@ -1345,9 +1345,9 @@ namespace tinycoder {
             if (pos == seqLen - 1) snapshot("ffn_norm-0", ffnNorm.data(), hiddenSize);
 
             // Gate / Up projections
-            np::Array<float> gateRow = w.ffnGate.matMulVec(ffnNorm.data());
+            tinycoder::Array<float> gateRow = w.ffnGate.matMulVec(ffnNorm.data());
             std::memcpy(gate.data(), gateRow.data(), intermediateSize * sizeof(float));
-            np::Array<float> upRow = w.ffnUp.matMulVec(ffnNorm.data());
+            tinycoder::Array<float> upRow = w.ffnUp.matMulVec(ffnNorm.data());
             std::memcpy(up.data(), upRow.data(), intermediateSize * sizeof(float));
             if (pos == seqLen - 1) snapshot("ffn_gate-0", gate.data(), intermediateSize);
             if (pos == seqLen - 1) snapshot("ffn_up-0", up.data(), intermediateSize);
@@ -1361,8 +1361,8 @@ namespace tinycoder {
                                                   gate.data(), w.ffnDown.rows,
                                                   w.ffnDown.cols, ffnOut.data());
             } else {
-                np::Array<float> downRow = deqMatMulVecF16(w.ffnDown_deq_f16.data(), gate.data(),
-                                                           w.ffnDown.rows, w.ffnDown.cols);
+                tinycoder::Array<float> downRow = deqMatMulVecF16(w.ffnDown_deq_f16.data(), gate.data(),
+                                                                  w.ffnDown.rows, w.ffnDown.cols);
                 std::memcpy(ffnOut.data(), downRow.data(), hiddenSize * sizeof(float));
             }
             if (pos == seqLen - 1) snapshot("ffn_out-0", ffnOut.data(), hiddenSize);

@@ -80,6 +80,10 @@ int main(int argc, char **argv) {
         const char *candidates[] = {
                 "/data/models/qwen/qwen2.5/qwen2.5-coder-1.5b-instruct-q2_k.gguf",
                 "/data/models/qwen/qwen2.5-coder-1.5b-instruct-q2_k.gguf",
+                // Qwen3.5-4B Q4_K_M (qwen35 dense hybrid, hidden 2560,
+                // 32 layers): the smallest GGUF that exercises the qwen35
+                // gated-delta-net path end to end.
+                "/data/models/qwen/qwen3.5/Qwen3.5-4B-Q4_K_M.gguf",
                 "/data/models/qwen/qwen2.5/qwen2.5-coder-7b-instruct-iq3_xxs-imat.gguf",
                 "/data/models/qwen/qwen3.8-27b/qwen3.8-27B-exl3-1.60bpw",
         };

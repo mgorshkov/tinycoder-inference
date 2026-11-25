@@ -734,6 +734,9 @@ namespace tinycoder::gpu {
                   uint32_t seqLen, uint32_t rows, uint32_t cols,
                   uint32_t blocksPerRow, void *stream) {
         if (!int8GemmAvailable()) return false;
+        if (std::getenv("TINYCODER_INT8_DBG") != nullptr)
+            std::fprintf(stderr, "[int8] call type=%u k=%u n=%u m=%u\n", type,
+                         cols, rows, seqLen);
         if (type != kTypeQ4K_ && type != kTypeQ5K_ && type != kTypeQ6K_ &&
             type != kTypeQ8_0_ && type != kTypeIQ2S_ && type != kTypeIQ3XXS_ &&
             type != kTypeIQ3S_ && type != kTypePQ2_0_ &&
@@ -788,7 +791,12 @@ namespace tinycoder::gpu {
                     static_cast<int64_t>(cols), 0, 0, static_cast<int64_t>(cols),
                     static_cast<int64_t>(seqLen), 1, 1, static_cast<void *>(s));
         }
-        if (cudaGetLastError() != cudaSuccess) {
+        const cudaError_t qerr = cudaGetLastError();
+        if (qerr != cudaSuccess) {
+            if (const char *dbg = std::getenv("TINYCODER_INT8_DBG"); dbg != nullptr)
+                std::fprintf(stderr,
+                             "[int8] quantize launch error: %s (type=%u k=%u n=%u m=%u)\n",
+                             cudaGetErrorString(qerr), type, cols, rows, seqLen);
             noteInt8Fallback("activation quantize launch failed", type, rows,
                              cols, seqLen);
             return false;

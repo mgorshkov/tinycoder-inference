@@ -281,7 +281,7 @@ namespace tinycoder {
                                        ? logits.data()
                                        : logits.data() +
                                                  (logits.size() - config_.vocabSize);
-        np::Array<float> lastLogits = np::Array<float>(np::Shape{config_.vocabSize});
+        tinycoder::Array<float> lastLogits = tinycoder::Array<float>(tinycoder::Shape{config_.vocabSize});
         // memcpy instead of per-element virtual get()/set() (see §4.4).
         std::memcpy(lastLogits.data(), lastRow,
                     static_cast<size_t>(config_.vocabSize) * sizeof(float));
@@ -290,7 +290,7 @@ namespace tinycoder {
         penaltyHistory.reserve(tokens.size() + params.maxTokens);
         penaltyHistory.insert(penaltyHistory.end(), tokens.begin(), tokens.end());
 
-        auto applyRepeatPenalty = [&](np::Array<float> &logitsArr) {
+        auto applyRepeatPenalty = [&](tinycoder::Array<float> &logitsArr) {
             if (params.repeatPenalty == 1.0f) {
                 return;
             }
@@ -353,7 +353,7 @@ namespace tinycoder {
                     forceInclude.push_back(penaltyHistory[p]);
                 }
             }
-            np::Array<float> newLogits;
+            tinycoder::Array<float> newLogits;
             if (params.topK > 0) {
                 newLogits = forward({nextToken}, false, params.topK, &forceInclude);
             } else {

@@ -290,10 +290,10 @@ namespace tinycoder {
     //     IEEE-exact ops; the exponential is the bit-exact AVX2 replica of
     //     glibc's __expf (see expSampling_AVX2), proven bit-identical to the
     //     scalar std::exp, so the sampled distribution is unchanged.
-    np::Array<float> Model::applySamplingParams(const np::Array<float> &logits,
-                                                const InferenceParams &params) {
+    tinycoder::Array<float> Model::applySamplingParams(const tinycoder::Array<float> &logits,
+                                                       const InferenceParams &params) {
         uint32_t vocabSize = config_.vocabSize;
-        np::Array<float> result = np::Array<float>(np::Shape{vocabSize});
+        tinycoder::Array<float> result = tinycoder::Array<float>(tinycoder::Shape{vocabSize});
         // Operate on raw pointers to avoid per-element virtual get()/set()
         // dispatch (see §4.3 / P1).
         const float *src = logits.data();
@@ -495,7 +495,7 @@ namespace tinycoder {
         return result;
     }
 
-    int32_t Model::sampleToken(const np::Array<float> &logits,
+    int32_t Model::sampleToken(const tinycoder::Array<float> &logits,
                                const InferenceParams &params) {
         // NOTE: reads only; applySamplingParams returns a fresh array.
         auto probs = applySamplingParams(logits, params);

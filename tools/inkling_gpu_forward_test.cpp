@@ -165,7 +165,7 @@ int main(int argc, char **argv) {
         setForceScalarForTest(exact);
         model.clearKVCache();
         const auto t0 = std::chrono::steady_clock::now();
-        np::Array<float> out = model.forward(tokens, false);
+        tinycoder::Array<float> out = model.forward(tokens, false);
         const auto t1 = std::chrono::steady_clock::now();
         std::vector<float> v;
         if (out.size() == vocab) v.assign(out.data(), out.data() + vocab);
@@ -334,7 +334,7 @@ int main(int argc, char **argv) {
         setenv("TINYCODER_INKLING_GPU", "1", 1);
         model.clearKVCache();
         std::vector<int32_t> longPrompt(128, 1);
-        np::Array<float> lg = model.forward(longPrompt, true);
+        tinycoder::Array<float> lg = model.forward(longPrompt, true);
         const bool longOk = lg.size() == static_cast<size_t>(longPrompt.size()) * vocab;
         std::printf("[inkling-gpu] regression: %zu-token allLogits first forward "
                     "returned %zu logits: %s\n",
@@ -409,7 +409,7 @@ int main(int argc, char **argv) {
                         chatTokens.size(), dumpGenDir.c_str());
             std::vector<int32_t> stepTokens = chatTokens;
             for (int step = 0; step < 8; ++step) {
-                np::Array<float> lg = model.forward(stepTokens, false);
+                tinycoder::Array<float> lg = model.forward(stepTokens, false);
                 if (lg.size() < vocab) {
                     std::printf("[inkling-gpu] dump-gen step %d: forward "
                                 "returned %zu logits\n", step, lg.size());

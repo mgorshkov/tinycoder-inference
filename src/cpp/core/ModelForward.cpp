@@ -46,10 +46,10 @@ namespace tinycoder {
 
     using namespace detail;
 
-    np::Array<float> Model::forward(const std::vector<int32_t> &tokens,
-                                    bool computeAllLogits) {
+    tinycoder::Array<float> Model::forward(const std::vector<int32_t> &tokens,
+                                           bool computeAllLogits) {
         if (tokens.empty()) {
-            return np::Array<float>{};
+            return tinycoder::Array<float>{};
         }
 
         // A request that would not fit the window is refused before anything
@@ -60,7 +60,7 @@ namespace tinycoder {
             std::cerr << "[TinyCoder] context full: " << kvCache_.pos << " cached + "
                       << tokens.size() << " new > " << config_.maxSeqLen
                       << "-token window" << std::endl;
-            return np::Array<float>{};
+            return tinycoder::Array<float>{};
         }
 
         // Every kernel below resolves ThreadPool::current(), so bind this model's
@@ -87,12 +87,12 @@ namespace tinycoder {
             inklingGpuEnv[0] != '0') {
             if (!inklingGpu_) inklingGpu_ = std::make_shared<gpu::InklingGPU>();
             if (inklingGpu_->available()) {
-                np::Array<float> logits(np::Shape{computeAllLogits
-                                                          ? tokens.size()
-                                                          : size_t(1),
-                                                  size_t(config_.vocabSizeUnpadded
-                                                                 ? config_.vocabSizeUnpadded
-                                                                 : config_.vocabSize)});
+                tinycoder::Array<float> logits(tinycoder::Shape{computeAllLogits
+                                                                        ? tokens.size()
+                                                                        : size_t(1),
+                                                                size_t(config_.vocabSizeUnpadded
+                                                                               ? config_.vocabSizeUnpadded
+                                                                               : config_.vocabSize)});
                 std::string gerr;
                 if (inklingGpu_->forward(*this, tokens, computeAllLogits,
                                          logits.data(), gerr)) {
@@ -121,14 +121,11 @@ namespace tinycoder {
             !tokens.empty() && (kvCache_.pos == 0 || gpuSessionActive_)) {
             std::string err;
             // Same construction idiom as the CPU logits path below (rank-2
-            // [seqLen, vocabSize]): np::Array<float>(np::Shape{...}) directly.
-            // A default-constructed rank-0 Array resized with a rank-1 shape
-            // hits a UB trap in np's NDArrayShaped machinery (compiled into an
-            // infinite loop by GCC here).
-            np::Array<float> logits = np::Array<float>(np::Shape{computeAllLogits
-                                                                         ? tokens.size()
-                                                                         : size_t(1),
-                                                                 config_.vocabSize});
+            // [seqLen, vocabSize]): allocate once with the final shape.
+            tinycoder::Array<float> logits = tinycoder::Array<float>(tinycoder::Shape{computeAllLogits
+                                                                                              ? tokens.size()
+                                                                                              : size_t(1),
+                                                                                      config_.vocabSize});
             // Chunked prefill (2026-11-10): the activation/expert scratch
             // scales with seqLen, so a long prompt used to OOM at upload
             // (measured: pp768 failed at ffnDownExpsMoe on an 11 GB card,
@@ -210,7 +207,7 @@ namespace tinycoder {
                 // request either, and falling back would recompute a session
                 // from position 0 that the caller just asked to extend.
                 if (gpuContextFull_ || contextFull_) {
-                    return np::Array<float>{};
+                    return tinycoder::Array<float>{};
                 }
                 if (std::getenv("TINYCODER_NO_CPU_FALLBACK") != nullptr) {
                     // Diagnostic: stop at the first GPU failure instead of
@@ -356,7 +353,7 @@ namespace tinycoder {
             std::cerr << "[TinyCoder] cannot allocate the host K/V cache for "
                       << (nLayers - gpuContinueLayer) << " CPU layers at "
                       << config_.maxSeqLen << " tokens" << std::endl;
-            return np::Array<float>();
+            return tinycoder::Array<float>();
         }
 
         // Inkling-2-Mini has its own token-at-a-time loop (physical blocks are
@@ -372,7 +369,7 @@ namespace tinycoder {
             // callback alone cannot interrupt a single long prefill/decode
             // forward pass, so the abort predicate must be polled here too.
             if (abortRequested()) {
-                return np::Array<float>{};
+                return tinycoder::Array<float>{};
             }
             auto &w = layers_[layer];
 
@@ -916,14 +913,25 @@ namespace tinycoder {
         // The GPU full-offload path releases the pre-dequantised embedding
         // tables (ModelGPU.cpp) because the device LM head never reads them.  A
         // CPU forward after that fallback needs them back; rebuild once.
-        if (dequantizedEmbeddings_.empty() && !quantizedEmbeddings_.empty()) {
+        //
+        // "Nothing to read" means all three tables are empty, not just the F32
+        // one.  A normal CPU load builds only the table the LM-head dispatch
+        // selects -- usually Q8_K, sometimes FP16 -- so testing `data.empty()`
+        // alone re-dequantised the whole vocabulary (2.4 GB for Qwen3.5-4B)
+        // once PER GENERATED TOKEN: 55 rebuilds in a 55-token answer, ~4 s
+        // each.  That is the CPU qwen35 generation path, so it made the model
+        // look ~100x slower than it is.
+        if (dequantizedEmbeddings_.data.empty() &&
+            dequantizedEmbeddings_.dataF16.empty() &&
+            dequantizedEmbeddings_.dataQ8K.empty() &&
+            !quantizedEmbeddings_.empty()) {
             if (!buildDequantizedEmbeddings()) {
                 std::fprintf(stderr, "[cpu] embeddings rebuild failed\n");
             }
         }
 
         // LM head (logits)
-        np::Array<float> logits = np::Array<float>(np::Shape{seqLen, vocabSize});
+        tinycoder::Array<float> logits = tinycoder::Array<float>(tinycoder::Shape{seqLen, vocabSize});
         float *logitsData = logits.data();
 
         // Prefill optimization: when computeAllLogits is false, only the last
@@ -1447,9 +1455,9 @@ namespace tinycoder {
         return candCount;
     }
 
-    np::Array<float> Model::forward(const std::vector<int32_t> &tokens,
-                                    bool computeAllLogits, int32_t pruneTopK,
-                                    const std::vector<int32_t> *forceInclude) {
+    tinycoder::Array<float> Model::forward(const std::vector<int32_t> &tokens,
+                                           bool computeAllLogits, int32_t pruneTopK,
+                                           const std::vector<int32_t> *forceInclude) {
         if (pruneTopK <= 0) {
             return forward(tokens, computeAllLogits);
         }
@@ -1457,7 +1465,7 @@ namespace tinycoder {
         pendingPruneTopK_ = pruneTopK;
         pendingForceInclude_ = forceInclude;
         pendingPruneActive_ = true;
-        np::Array<float> result = forward(tokens, computeAllLogits);
+        tinycoder::Array<float> result = forward(tokens, computeAllLogits);
         // The core forward consumes (clears) the pending flags before returning.
         return result;
     }

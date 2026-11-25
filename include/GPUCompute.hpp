@@ -34,6 +34,8 @@ SOFTWARE.
 
 #ifdef USE_CUDA
 
+#include <cuda_runtime.h>
+
 namespace tinycoder::gpu {
 
     /// @brief One quantized weight matrix uploaded to the device.
@@ -1152,10 +1154,11 @@ namespace tinycoder::gpu {
         // Capture the decode (seqLen==1) forward into a CUDA graph.
         // Falls back to the regular path on any capture error; the graph is
         // rebuilt automatically if the geometry (rows/blocks) changes (model
-        // reload).  TINYCODER_GPU_GRAPH=0 disables (default: ON when the
-        // model is a dense qwen2/gemma-style arch -- graph capture assumes
-        // the deterministic decode dependency chain; qwen35/qwen35moe paths
-        // are NOT captured).
+        // reload).  TINYCODER_GPU_GRAPH=0 disables it for the dense
+        // qwen2/gemma-style path (architecture == 0); the qwen35 dense-hybrid
+        // path records its own graph in GPUComputeMoE.cu
+        // (replayQwen35DecodeGraph), gated by TINYCODER_Q35_GRAPH.  Both are
+        // default ON and require full offload and !computeAllLogits.
         // Set while the decode forward is being RECORDED into graphExec_ (the
         // eager body runs once to record; during recording the body skips the
         // host cudaStreamSynchronize error-check points and uses the
@@ -1171,10 +1174,11 @@ namespace tinycoder::gpu {
         // Capture the decode (seqLen==1) forward into a CUDA graph.
         // Falls back to the regular path on any capture error; the graph is
         // rebuilt automatically if the geometry (rows/blocks) changes (model
-        // reload).  TINYCODER_GPU_GRAPH=0 disables (default: ON when the
-        // model is a dense qwen2/gemma-style arch -- graph capture assumes
-        // the deterministic decode dependency chain; qwen35/qwen35moe paths
-        // are NOT captured).  pos is the token's position; it is written to
+        // reload).  TINYCODER_GPU_GRAPH=0 disables it for the dense
+        // qwen2/gemma-style path (architecture == 0); the qwen35 dense-hybrid
+        // path records its own graph in GPUComputeMoE.cu
+        // (replayQwen35DecodeGraph), gated by TINYCODER_Q35_GRAPH.  Both are
+        // default ON and require full offload and !computeAllLogits.  pos is the token's position; it is written to
         // graphPos_ (blocking H2D) BEFORE cudaStreamBeginCapture so the
         // recorded kernels see the right value at first launch.
         bool captureDecodeGraph(uint32_t pos);

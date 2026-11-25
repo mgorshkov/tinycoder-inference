@@ -33,7 +33,7 @@
 #include <utility>
 #include <vector>
 
-#include <np/Array.hpp>
+#include "TinyArray.hpp"
 
 #include "AlignedVector.hpp"
 #include "ContextPlan.hpp"
@@ -80,10 +80,10 @@ namespace tinycoder {
         bool empty() const { return data.empty() && exl3 == nullptr; }
 
         /// @brief Compute y = x * W^T where W is this quantized matrix.
-        /// Dequantizes the matrix and uses np::Array::dot() for multiplication.
-        /// @param x Input vector of size rows
-        /// @return Output vector of size cols as np::Array<float>
-        np::Array<float> matMulVec(const float *x) const;
+        /// Dequantizes the matrix and multiplies against x.
+        /// @param x Input vector of size cols
+        /// @return Output vector of size rows as tinycoder::Array<float>
+        tinycoder::Array<float> matMulVec(const float *x) const;
 
         /// @brief Compute y = x * W^T where W is this quantized matrix.
         /// Out-parameter version that writes directly to a pre-allocated buffer,
@@ -99,7 +99,7 @@ namespace tinycoder {
         /// @param rowStart Starting row index
         /// @param numRows Number of rows to compute
         /// @return Output vector of size numRows
-        np::Array<float> matMulVecRows(const float *x, uint32_t rowStart, uint32_t numRows) const;
+        tinycoder::Array<float> matMulVecRows(const float *x, uint32_t rowStart, uint32_t numRows) const;
 
         /// @brief Compute y = x * W^T for a contiguous range of rows.
         /// Out-parameter version that writes directly to a pre-allocated buffer.
@@ -259,21 +259,21 @@ namespace tinycoder {
             QuantizedMatrix ctrlDown[4];
             QuantizedMatrix ctrlGain[4];
             QuantizedMatrix ctrlForget[4];
-            np::Array<float> expertProbsBias;// expertCount (selection bias)
+            tinycoder::Array<float> expertProbsBias;// expertCount (selection bias)
             // Per-expert output scales stored by the legacy/expanded layout
             // (llama.cpp applies them to each expert's gate_up and down result).
-            np::Array<float> expertGateUpScale;// expertCount
-            np::Array<float> expertDownScale;  // expertCount
+            tinycoder::Array<float> expertGateUpScale;// expertCount
+            tinycoder::Array<float> expertDownScale;  // expertCount
 
-            np::Array<float> attnQClip;   // nHeads*headDim
-            np::Array<float> attnRelClip; // nHeads*relativeLength
-            np::Array<float> attnQInpNorm;// hidden (full-attn layers)
-            np::Array<float> attnKInpNorm;// hidden
-            np::Array<float> attnVInpNorm;// hidden
+            tinycoder::Array<float> attnQClip;   // nHeads*headDim
+            tinycoder::Array<float> attnRelClip; // nHeads*relativeLength
+            tinycoder::Array<float> attnQInpNorm;// hidden (full-attn layers)
+            tinycoder::Array<float> attnKInpNorm;// hidden
+            tinycoder::Array<float> attnVInpNorm;// hidden
             // Depth-attention queries: 1 (SWA) or 3 (full) x hidden; empty on
             // block 0.  ffnResQuery: hidden.
-            np::Array<float> attnResQuery;
-            np::Array<float> ffnResQuery;
+            tinycoder::Array<float> attnResQuery;
+            tinycoder::Array<float> ffnResQuery;
         };
 
         /// @brief Per-layer weights (stored in native quantized format).
@@ -307,38 +307,38 @@ namespace tinycoder {
             std::vector<Q8KBlock> ffnDown_q8k;// rows x blocksPerRow
 
             // ---- Common RMSNorm (F32) ----
-            np::Array<float> rmsNormAttn;// hiddenSize
-            np::Array<float> rmsNormFFN; // hiddenSize
+            tinycoder::Array<float> rmsNormAttn;// hiddenSize
+            tinycoder::Array<float> rmsNormFFN; // hiddenSize
 
             // ---- Qwen2-specific: Q, K, V biases (F32) ----
-            np::Array<float> attnQBias;// nHeads * headDim
-            np::Array<float> attnKBias;// nKVHeads * headDim
-            np::Array<float> attnVBias;// nKVHeads * headDim
+            tinycoder::Array<float> attnQBias;// nHeads * headDim
+            tinycoder::Array<float> attnKBias;// nKVHeads * headDim
+            tinycoder::Array<float> attnVBias;// nKVHeads * headDim
 
             // ---- Shared Q/K per-head norms + post norms ----
             // Used by Gemma4 (attn_q_norm/attn_k_norm, post_attention_norm/
             // post_ffw_norm, layer_output_scale) and Qwen35 full-attention
             // layers (attn_q_norm/attn_k_norm per-head RMSNorm before MRoPE,
             // post_attention_norm after the attention block).
-            np::Array<float> attnQNorm;       // headDim (QK RMSNorm before RoPE)
-            np::Array<float> attnKNorm;       // headDim (QK RMSNorm before RoPE)
-            np::Array<float> postAttnNorm;    // hiddenSize (post-attention norm)
-            np::Array<float> postFFWNorm;     // hiddenSize (post-FFN norm)
-            np::Array<float> layerOutputScale;// 1 (per-layer scaling factor)
+            tinycoder::Array<float> attnQNorm;       // headDim (QK RMSNorm before RoPE)
+            tinycoder::Array<float> attnKNorm;       // headDim (QK RMSNorm before RoPE)
+            tinycoder::Array<float> postAttnNorm;    // hiddenSize (post-attention norm)
+            tinycoder::Array<float> postFFWNorm;     // hiddenSize (post-FFN norm)
+            tinycoder::Array<float> layerOutputScale;// 1 (per-layer scaling factor)
 
             // ---- Gemma4 MoE-specific: expert weights ----
             QuantizedMatrix ffnGateInp;   // hiddenSize x expertCount (router)
             QuantizedMatrix ffnGateUpExps;// expertCount x (expertFF * 2) x hiddenSize (fused gate+up)
             QuantizedMatrix ffnDownExps;  // expertCount x hiddenSize x expertFF
-            np::Array<float> preFFWNorm2; // hiddenSize (second pre-FFN norm)
-            np::Array<float> postFFWNorm1;// hiddenSize (first post-FFN norm)
-            np::Array<float> postFFWNorm2;// hiddenSize (second post-FFN norm)
+            tinycoder::Array<float> preFFWNorm2; // hiddenSize (second pre-FFN norm)
+            tinycoder::Array<float> postFFWNorm1;// hiddenSize (first post-FFN norm)
+            tinycoder::Array<float> postFFWNorm2;// hiddenSize (second post-FFN norm)
 
             // ---- Qwen35MoE-specific: attention gate, QKV fused ----
             QuantizedMatrix attnQKV;      // hiddenSize x (nHeads + 2*nKVHeads) * headDim (fused QKV)
             QuantizedMatrix attnGate;     // hiddenSize x (nHeads * headDim) (attention gate)
-            np::Array<float> attnQNormMoe;// headDim (Q norm for Qwen35MoE)
-            np::Array<float> attnKNormMoe;// headDim (K norm for Qwen35MoE)
+            tinycoder::Array<float> attnQNormMoe;// headDim (Q norm for Qwen35MoE)
+            tinycoder::Array<float> attnKNormMoe;// headDim (K norm for Qwen35MoE)
 
             // Q and K get per-head RMSNorm (attn_q_norm / attn_k_norm) before
             // MRoPE (using the shared attnQNorm/attnKNorm fields declared
@@ -350,8 +350,8 @@ namespace tinycoder {
             //   QuantizedMatrix is used as F32.
             // ssmOut projects [dInner] -> [hiddenSize]; ssm_beta/ssm_alpha are
             // [hiddenSize x nVHeads] (nVHeads = ssmTimeStepRank).
-            np::Array<float> ssmABroadcast;// nVHeads (decay per value head, a = -exp(ssmA))
-            np::Array<float> ssmDtBiasFull;// nVHeads (ssm_dt.bias, dense qwen35)
+            tinycoder::Array<float> ssmABroadcast;// nVHeads (decay per value head, a = -exp(ssmA))
+            tinycoder::Array<float> ssmDtBiasFull;// nVHeads (ssm_dt.bias, dense qwen35)
             // ssm_beta / ssm_alpha are [hiddenSize x nVHeads] matmuls (unlike
             // qwen35moe which stores them as 1D F32). nVHeads = ssmTimeStepRank.
             QuantizedMatrix ssmBetaQ; // hiddenSize x nVHeads
@@ -360,11 +360,11 @@ namespace tinycoder {
             // ---- Qwen35MoE: SSM (Mamba-style) ----
             QuantizedMatrix ssmConv1d; // ssmInnerSize x ssmConvKernel
             QuantizedMatrix ssmOut;    // ssmInnerSize x hiddenSize
-            np::Array<float> ssmA;     // ssmInnerSize x ssmStateSize (log)
-            np::Array<float> ssmDtBias;// ssmInnerSize
-            np::Array<float> ssmAlpha; // ssmInnerSize
-            np::Array<float> ssmBeta;  // ssmInnerSize
-            np::Array<float> ssmNorm;  // ssmInnerSize
+            tinycoder::Array<float> ssmA;     // ssmInnerSize x ssmStateSize (log)
+            tinycoder::Array<float> ssmDtBias;// ssmInnerSize
+            tinycoder::Array<float> ssmAlpha; // ssmInnerSize
+            tinycoder::Array<float> ssmBeta;  // ssmInnerSize
+            tinycoder::Array<float> ssmNorm;  // ssmInnerSize
 
             // ---- Qwen35MoE: MoE FFN ----
             QuantizedMatrix ffnGateInpMoe;// hiddenSize x expertCount (router)
@@ -380,9 +380,9 @@ namespace tinycoder {
 
             // ---- Qwen35MoE: MTP (Multi-Token Prediction) ----
             QuantizedMatrix nextnEhProj;         // hiddenSize x hiddenSize (embedding head projection)
-            np::Array<float> nextnEnorm;         // hiddenSize (embedding head norm)
-            np::Array<float> nextnHnorm;         // hiddenSize (hidden norm)
-            np::Array<float> nextnSharedHeadNorm;// hiddenSize (shared head norm)
+            tinycoder::Array<float> nextnEnorm;  // hiddenSize (embedding head norm)
+            tinycoder::Array<float> nextnHnorm;  // hiddenSize (hidden norm)
+            tinycoder::Array<float> nextnSharedHeadNorm;// hiddenSize (shared head norm)
 
             // ---- Inkling-2-Mini extras (empty for other architectures) ----
             InklingLayerWeights inkling;
@@ -450,8 +450,8 @@ namespace tinycoder {
         ///        embedding matrix per token, so skipping it for all but the last
         ///        token avoids re-reading that large matrix seqLen times.
         /// @return Logits tensor (batch_size x seq_len x vocab_size)
-        np::Array<float> forward(const std::vector<int32_t> &tokens,
-                                 bool computeAllLogits = true);
+        tinycoder::Array<float> forward(const std::vector<int32_t> &tokens,
+                                        bool computeAllLogits = true);
 
         /// @brief Forward pass with P0 exact two-pass top-K pruning of the LM head.
         /// Computes logits exactly only for the top-K (plus forceInclude) candidate
@@ -466,9 +466,9 @@ namespace tinycoder {
         ///                      penalty history). May be null.
         /// @return Logits tensor (1 x 1 x vocabSize) with pruned rows set to
         ///         the pruned sentinel.
-        np::Array<float> forward(const std::vector<int32_t> &tokens,
-                                 bool computeAllLogits, int32_t pruneTopK,
-                                 const std::vector<int32_t> *forceInclude = nullptr);
+        tinycoder::Array<float> forward(const std::vector<int32_t> &tokens,
+                                        bool computeAllLogits, int32_t pruneTopK,
+                                        const std::vector<int32_t> *forceInclude = nullptr);
 
         /// @brief Generate text token by token.
         /// @param prompt Input prompt text
@@ -600,12 +600,12 @@ namespace tinycoder {
         static uint64_t estimateMemory(const std::string &modelPath);
 
         /// @brief Sample next token from logits.
-        int32_t sampleToken(const np::Array<float> &logits,
+        int32_t sampleToken(const tinycoder::Array<float> &logits,
                             const InferenceParams &params);
 
         /// @brief Apply temperature and top-p (nucleus) filtering.
-        np::Array<float> applySamplingParams(const np::Array<float> &logits,
-                                             const InferenceParams &params);
+        tinycoder::Array<float> applySamplingParams(const tinycoder::Array<float> &logits,
+                                                    const InferenceParams &params);
 
         /// @brief Build prefill tokens from prompt.
         std::vector<int32_t> tokenize(const std::string &prompt);
@@ -732,16 +732,16 @@ namespace tinycoder {
         std::vector<LayerWeights> layers_;
 
         // Final norm (F32)
-        np::Array<float> finalNorm_;// hiddenSize
+        tinycoder::Array<float> finalNorm_;// hiddenSize
 
         // ---- Inkling-2-Mini (looped MoE) model-level extras ----
-        np::Array<float> inklingTokNorm_;        // token_embd_norm (hidden)
-        np::Array<float> inklingOutputResQuery_;// output_res_query (hidden)
+        tinycoder::Array<float> inklingTokNorm_;       // token_embd_norm (hidden)
+        tinycoder::Array<float> inklingOutputResQuery_;// output_res_query (hidden)
         // Expanded (Unsloth) layout only: 2 queries per core block, grouped
         // globally as [block][2][hidden].  Empty on the mainline layout, which
         // stores a 4-row loop_msg_query on each core block.
-        np::Array<float> inklingLoopResQuery_;  // [2*(loopEnd-loopStart), hidden]
-        np::Array<float> inklingLoopKvResQuery_;// [2*(loopEnd-loopStart), hidden]
+        tinycoder::Array<float> inklingLoopResQuery_;  // [2*(loopEnd-loopStart), hidden]
+        tinycoder::Array<float> inklingLoopKvResQuery_;// [2*(loopEnd-loopStart), hidden]
         // Short-convolution history per KV slot: active channels x (n_conv-1).
         std::vector<std::vector<float>> inklingConvState_;
 
@@ -872,8 +872,8 @@ namespace tinycoder {
         bool hostKvReady_ = false;
 
         struct KVCache {
-            np::Array<float> k;// numLayers x maxSeqLen x numKVHeads x headDim
-            np::Array<float> v;// numLayers x maxSeqLen x numKVHeads x headDim
+            tinycoder::Array<float> k;// numLayers x maxSeqLen x numKVHeads x headDim
+            tinycoder::Array<float> v;// numLayers x maxSeqLen x numKVHeads x headDim
             size_t pos = 0;    // Current write position
 
             // SSM state for Qwen35MoE architecture (per-layer)
@@ -1204,8 +1204,8 @@ namespace tinycoder {
         /// token-at-a-time state (one KV slot per logical layer, plus a short
         /// convolution history per slot).  Returns [seqLen, vocab] logits, or
         /// [1, vocab] when computeAllLogits is false.
-        np::Array<float> forwardInkling(const std::vector<int32_t> &tokens,
-                                        bool computeAllLogits);
+        tinycoder::Array<float> forwardInkling(const std::vector<int32_t> &tokens,
+                                               bool computeAllLogits);
 
         /// @brief Build pre-dequantized embedding matrix for fast LM head.
         /// Called after loadWeights() to avoid per-token dequantization overhead.
