@@ -3742,15 +3742,38 @@ static __device__ __forceinline__ void int8MatmulProcessTile(
 
     constexpr int sz = sizeof(block_q8_1_int8) / sizeof(int);
 
+    // Clamp the activation rows read from the Q8_1 scratch to the rows this
+    // tile actually writes back: int8_write_back_* drops j > tile_y_max_j, but
+    // int8Gemm allocates the scratch for exactly ncols_dst rows (it is not
+    // padded).  A prompt whose length is not a multiple of tile_x therefore
+    // made the last tile read whole 128-value groups past the end of the
+    // allocation: the Q6_K stream-k kernel at m=495, tile_x=128 read rows
+    // 495..511, i.e. up to 2448 B past a 1,140,480 B scratch, and
+    // compute-sanitizer reported it as an out-of-bounds read that the driver
+    // turned into cudaErrorLaunchFailure.  A full tile keeps the branch-free
+    // loop; only the final tile of a stream takes the clamped path.
+    constexpr int y_tile_ints = tile_x * INT8_TILE_Y_K;
+    const int y_ints = min(tile_x, tile_y_max_j + 1) * INT8_TILE_Y_K;
+    const bool y_full = y_ints == y_tile_ints;
+
     for (int kb0 = kb0_start; kb0 < kb0_stop; kb0 += blocks_per_iter) {
         load_tiles(x, p_tile_x, offset_x + kb0, tile_x_max_i, stride_row_x);
         {
             const int *by0 = y + ncols_y * (kb0 * qk / ne_block) * sz;
+            if (y_full) {
 #pragma unroll
-            for (int l0 = 0; l0 < tile_x * INT8_TILE_Y_K; l0 += nwarps * warp_size) {
-                int l = l0 + threadIdx.y * warp_size + threadIdx.x;
+                for (int l0 = 0; l0 < y_tile_ints; l0 += nwarps * warp_size) {
+                    int l = l0 + threadIdx.y * warp_size + threadIdx.x;
 
-                p_tile_y[l] = by0[l];
+                    p_tile_y[l] = by0[l];
+                }
+            } else {
+#pragma unroll
+                for (int l0 = 0; l0 < y_tile_ints; l0 += nwarps * warp_size) {
+                    int l = l0 + threadIdx.y * warp_size + threadIdx.x;
+
+                    p_tile_y[l] = l < y_ints ? by0[l] : 0;
+                }
             }
         }
 
@@ -3762,11 +3785,20 @@ static __device__ __forceinline__ void int8MatmulProcessTile(
 
         {
             const int *by0 = y + ncols_y * ((kb0 * qk / ne_block) * sz + sz);
+            if (y_full) {
 #pragma unroll
-            for (int l0 = 0; l0 < tile_x * INT8_TILE_Y_K; l0 += nwarps * warp_size) {
-                int l = l0 + threadIdx.y * warp_size + threadIdx.x;
+                for (int l0 = 0; l0 < y_tile_ints; l0 += nwarps * warp_size) {
+                    int l = l0 + threadIdx.y * warp_size + threadIdx.x;
 
-                p_tile_y[l] = by0[l];
+                    p_tile_y[l] = by0[l];
+                }
+            } else {
+#pragma unroll
+                for (int l0 = 0; l0 < y_tile_ints; l0 += nwarps * warp_size) {
+                    int l = l0 + threadIdx.y * warp_size + threadIdx.x;
+
+                    p_tile_y[l] = l < y_ints ? by0[l] : 0;
+                }
             }
         }
 

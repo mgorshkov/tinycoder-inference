@@ -17,21 +17,30 @@
 // path in both cases: a multi-token call is prefill.
 //
 // forward() now chunks a prompt into 128-token layer-major passes (was 16), so
-// a 512-token prompt is four passes and a 128-token one is a single pass; the
-// default batched graph is bit-exact with the token-major graph at any length
-// (max|d| == 0 at 128 and 512 tokens).  The tensor-core levers that change the
-// trajectory are opt-in and this tool reports their parity separately:
-//   TINYCODER_INKLING_GEMM=1        dense int8 tensor-core GEMM (one weight
-//                                   read per pass instead of one per 4 tokens)
-//   TINYCODER_INKLING_Q2_0_MMA=1   Q2_0 int8 MMQ for the expert down
-//   TINYCODER_INKLING_CTRL=batched  the old one-block-per-rank controller
-//                                   (faster, 0-20 ULP off, flips router ties)
-//   TINYCODER_INKLING_EXPERT_MMA=1  grouped int8 MMQ for the routed experts
-//                                   (IQ2_XXS/XS/S gate/up and Q2_0 down).
-//                                   =gate / =down selects one direction; both
-//                                   are opt-in because the Q8_1 activation
-//                                   quantisation is a different trajectory, so
-//                                   top-1/top-5 parity does not survive it.
+// a 512-token prompt is four passes and a 128-token one is a single pass.
+// The default batched graph is the fast path; with the trajectory-changing
+// levers off (TINYCODER_INKLING_GEMM, _EXPERT_MMA, _Q2_0_MMA and
+// _ATTN_FLASH all 0) it is bit-exact with the token-major graph at any length
+// (max|d| == 0 at 128 and 512 tokens).  Those levers are ON by default -- the
+// parity gate below is only meaningful with them switched off -- and the tool
+// reports their parity separately:
+//   TINYCODER_INKLING_GEMM=0        disables the dense int8 tensor-core GEMM
+//                                   (one weight read per pass instead of one
+//                                   per 4 tokens)
+//   TINYCODER_INKLING_Q2_0_MMA=0    disables the Q2_0 int8 MMQ for expert down
+//   TINYCODER_INKLING_CTRL=batched  opts into the old one-block-per-rank
+//                                   controller (faster, 0-20 ULP off, flips
+//                                   router ties; default is the exact form)
+//   TINYCODER_INKLING_EXPERT_MMA=0  disables the grouped int8 MMQ for the
+//                                   routed experts (IQ2_XXS/XS/S gate/up and
+//                                   Q2_0 down); =gate / =down selects one
+//                                   direction.  The Q8_1 activation
+//                                   quantisation changes the trajectory, so
+//                                   top-1/top-5 parity with the token path
+//                                   does not survive it.
+//   TINYCODER_INKLING_ATTN_FLASH=0  keeps the exact per-token attention form
+//                                   for m >= 128 (the flash kernel accumulates
+//                                   keys sequentially, a different trajectory)
 //   TINYCODER_INKLING_ATTN_TILE=0   revert the 8-query-token attention tiling
 //                                   (on by default; it is bit-exact)
 //

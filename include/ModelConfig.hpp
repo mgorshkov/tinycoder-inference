@@ -199,8 +199,14 @@ namespace tinycoder {
         uint32_t nThreads = 0;
 
         /// @brief Estimate total memory needed to load this model.
+        /// @param contextTokens Token window to charge the K/V cache for; 0
+        ///        means "auto", the 2048 default.  This must be the window the
+        ///        engine will grant, not `maxSeqLen`: that field is the
+        ///        checkpoint's *advertised* limit (1,048,576 tokens for
+        ///        Inkling-2-Mini), and charging the cache at that size reported
+        ///        a 197 GB estimate for a model loaded with 2048.
         /// @return Estimated memory in bytes
-        uint64_t estimatedMemoryBytes() const {
+        uint64_t estimatedMemoryBytes(uint32_t contextTokens = 2048) const {
             // Quantized weights: use a rough estimate based on hidden size and layers
             // For a typical transformer: ~2 * hiddenSize * intermediateSize * numLayers * bytes_per_weight
             // This is a rough estimate; actual size depends on quantization type
@@ -211,9 +217,10 @@ namespace tinycoder {
             uint64_t numEmbedBlocks = (numEmbedElements + 255) / 256;
             uint64_t embedBytes = numEmbedBlocks * 170;
 
-            // KV cache (F32).  maxSeqLen == 0 means "auto": estimate at the
-            // 2048 default, which is what load() resolves to when it can.
-            const uint64_t seqLen = maxSeqLen ? maxSeqLen : 2048u;
+            // KV cache (F32) for the granted window, capped by what the
+            // checkpoint can serve.
+            uint64_t seqLen = contextTokens ? contextTokens : 2048u;
+            if (maxSeqLen != 0) seqLen = std::min<uint64_t>(seqLen, maxSeqLen);
             uint64_t kvCacheBytes = static_cast<uint64_t>(numLayers) * seqLen *
                                     numKVHeads * headDim * sizeof(float) * 2;
 

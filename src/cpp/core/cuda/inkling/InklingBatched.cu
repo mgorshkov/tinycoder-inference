@@ -1861,11 +1861,15 @@ namespace tinycoder::gpu {
         /// removes the per-token weight stream from the dense projections; at
         /// m=128 it replaces 128 int8Gemv launches with one GEMM per matrix.
         ///
-        /// OFF by default: it is the fastest dense path but its Q8_1 int8
+        /// ON by default: it is the default batched prefill path and part of
+        /// why pp512 is what BENCHMARKS-2080TI.md records.  Its Q8_1 int8
         /// accumulation is a different trajectory from the token-major int8
-        /// GEMV, and the model-level gate (top-1 / top-5 set on every prompt
-        /// position) does not survive it.  TINYCODER_INKLING_GEMM=1 opts in;
-        /// the measured pp512 and parity counts are in the tool output.
+        /// GEMV, so the model-level parity gate (top-1 / top-5 set on every
+        /// prompt position) does not survive it.  TINYCODER_INKLING_GEMM=0
+        /// opts out of this GEMM; the full exact path also needs
+        /// TINYCODER_INKLING_EXPERT_MMA=0, TINYCODER_INKLING_Q2_0_MMA=0 and
+        /// TINYCODER_INKLING_ATTN_FLASH=0.  The measured pp512 and parity
+        /// counts are in tools/inkling_gpu_batched_prefill_test.cpp's output.
         bool int8GemmDenseEnabled() {
             static const bool f = [] {
                 const char *e = std::getenv("TINYCODER_INKLING_GEMM");
@@ -1901,18 +1905,18 @@ namespace tinycoder::gpu {
             return false;
         }
 
-        /// Opt-in int8 MMQ for the Q2_0 expert down projection.  OFF by default
-        /// for the same reason as the dense int8 GEMM: its Q8_1 activation
-        /// quantization is a different trajectory from the float decoder the
-        /// token path uses (q2_0_mmq_parity measures 3.6e-3 relRMS on random
-        /// activations), and the model-level gate reflects that.
-        /// TINYCODER_INKLING_Q2_0_MMA=1 opts in (moe-down 375 -> 187 ms per
-        /// 128-token chunk, 4 top-1 flips at 128 tokens).
-        /// Grouped int8 MMQ for the routed experts (both directions).
-        /// TINYCODER_INKLING_EXPERT_MMA=1 opts in.  OFF by default because the
+        /// int8 MMQ for the Q2_0 expert down projection, ON by default.  Its
         /// Q8_1 activation quantization is a different trajectory from the
-        /// token path's GEMV decoders, exactly like the Q2_0 down MMQ; the
-        /// model-level gate and tools/inkling_expert_mma_parity.cpp decide.
+        /// float decoder the token path uses (q2_0_mmq_parity measures 3.6e-3
+        /// relRMS on random activations), which is the parity cost accepted for
+        /// the speed.  TINYCODER_INKLING_Q2_0_MMA=0 opts out (moe-down
+        /// 375 -> 187 ms per 128-token chunk when on, 4 top-1 flips at 128
+        /// tokens).
+        /// Grouped int8 MMQ for the routed experts (both directions), ON by
+        /// default.  The Q8_1 activation quantization is a different trajectory
+        /// from the token path's GEMV decoders, exactly like the Q2_0 down MMQ;
+        /// TINYCODER_INKLING_EXPERT_MMA=0 opts out, and the model-level gate and
+        /// tools/inkling_expert_mma_parity.cpp decide on the parity delta.
         /// TINYCODER_INKLING_EXPERT_MMA selects the direction: 1 = both,
         /// "gate" = gate/up only, "down" = down only.  The two have different
         /// parity deltas (the gate/up activation error is amplified by SITU
@@ -2922,9 +2926,9 @@ namespace tinycoder::gpu {
                     }
                     if (moeMode != MoeMma) bp.mark(8, s);
                     // Q2_0 expert down is 18 B / 64 weights and runs through
-                    // the int8 MMQ when TINYCODER_INKLING_Q2_0_MMA=1; any
-                    // refusal (unsupported shape, launch failure) falls through
-                    // to the grouped float decoder, which is the default.
+                    // the int8 MMQ by default (TINYCODER_INKLING_Q2_0_MMA=0
+                    // disables it); any refusal (unsupported shape, launch
+                    // failure) falls through to the grouped float decoder.
                     bool downOk = false;
                     if (expertMmaDown() &&
                         inklingExpertMmaSupported(w.ffnDownExps.type))
