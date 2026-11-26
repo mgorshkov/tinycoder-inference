@@ -475,13 +475,21 @@ namespace tinycoder::gpu {
         // ---- scratch arena ----------------------------------------------------
         const uint64_t H = im->hidden;
         const uint64_t qDim = static_cast<uint64_t>(im->nHeads) * im->headDim;
+        // The block bank holds one hidden row per attention-residual block
+        // boundary.  A looped layout visits those boundaries once per pass, so
+        // the row count is bounded by the cache slots (48 for Inkling-2-Mini)
+        // plus the appended current state, with two rows of slack.  That upper
+        // bound, not phys / attnResBlockSize + 1 (which is only 5 for the
+        // 24-block loop at blockSize 6), is what the take() calls below
+        // advance by; budgeting 8 rows here while taking slots + 2 (= 50) put
+        // the logits and the embedded-row staging past the end of the arena.
+        const uint64_t bankRows = static_cast<uint64_t>(im->slots) + 2;
         uint64_t need = 0;
         need += 11 * H;                       // x prelude passOut inpSA ffnInp pre0..2 nq nk nv
         need += 5 * H;                        // normed postO convH o moeOut
         need += 3 * H;                        // mixOut (3 queries)
         need += 4 * H;                        // msgMixed (4 queries)
-        need += 8 * H;                        // blockBank
-        need += 8 * H;                        // bankSnap (bank + passOut)
+        need += 2 * bankRows * H;             // blockBank + bankSnap
         need += 2 * H;                        // ctrlIn
         need += 2 * H;                        // ctrlGv + ctrlFv
         need += 3 * qDim;                     // q gateProj attnOut
@@ -527,15 +535,6 @@ namespace tinycoder::gpu {
         im->dMoeOut = take(H);
         im->dMixOut = take(3 * H);
         im->dMsgMixed = take(4 * H);
-        // The block bank holds one hidden row per attention-residual block
-        // boundary: phys / attnResBlockSize + 1 rows, i.e. 5 for the 24-block
-        // loop at blockSize 6, plus the appended current state.  It was sized
-        // for 8, which the 24-block config overruns: the write past the end
-        // lands in the neighbouring scratch allocation and corrupts a token's
-        // state, which is exactly the token-1 divergence a 1-token parity probe
-        // cannot see.  Size it from the model, with headroom for the looped
-        // layout's extra snapshots.
-        const uint64_t bankRows = static_cast<uint64_t>(im->slots) + 2;
         im->dBlockBank = take(bankRows * H);
         im->dBankSnap = take(bankRows * H);
         im->dCtrlIn = take(2 * H);
@@ -566,6 +565,16 @@ namespace tinycoder::gpu {
         im->embAll = take(static_cast<uint64_t>(im->maxSeq) * H);
         im->dIdx = reinterpret_cast<int32_t *>(take(im->nUsed));
         im->dPos = reinterpret_cast<int32_t *>(take(1));
+        // The take() calls above must never exceed the budget in `need`: the
+        // 64 floats reserved for ctrlG stay unused because dCtrlG aliases the
+        // g block inside dCtrlIn.  An overrun silently places the tail of the
+        // arena outside its allocation, which is what the 8-row bank budget
+        // did (by 193,472 floats on Inkling-2-Mini).
+        const uint64_t taken = static_cast<uint64_t>(cur - im->arena);
+        if (taken > need) {
+            return bad("scratch arena overrun: " + std::to_string(taken) +
+                       " floats taken, " + std::to_string(need) + " budgeted");
+        }
 
         // Pinned staging for the per-token embedding row the graph reads.
         im->pinnedEmb.resize(4);

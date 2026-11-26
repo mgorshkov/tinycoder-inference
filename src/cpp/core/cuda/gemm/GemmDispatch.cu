@@ -759,6 +759,9 @@ namespace tinycoder::gpu {
         // of 128, not of 512: Inkling's 2304 = 18*128 and 1152 = 9*128 dense
         // projections are aligned, and their quantized rows are exactly
         // (cols/128)*144 bytes, which is what yBytes below allocates.
+        // M (seqLen) is not padded either: the stream-k tile loader clamps its
+        // Q8_1 row reads to ncols_dst (int8MatmulProcessTile), so the last
+        // partial tile stays inside this exact allocation.
         if ((cols & 127u) != 0u) {
             noteInt8Fallback("cols is not a multiple of 128", type, rows, cols,
                              seqLen);

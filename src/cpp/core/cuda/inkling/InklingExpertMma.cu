@@ -53,8 +53,9 @@
 // The one numeric difference from the token path is the Q8_1 activation
 // quantization, i.e. the int8 format's own floor (~2e-3 relRMS on continuous
 // activations), exactly as for the dense int8 GEMM and the Q2_0 down MMQ.
-// TINYCODER_INKLING_EXPERT_MMA=1 opts in; the model-level gate is in
-// tools/inkling_expert_mma_parity.cpp and the batched-prefill test.
+// TINYCODER_INKLING_EXPERT_MMA is on by default (=0 opts out); the
+// model-level gate is in tools/inkling_expert_mma_parity.cpp and the
+// batched-prefill test.
 //
 // IQ scale granularity: IQ2_XS/IQ2_S carry a scale per 16 weights (the low/high
 // nibble of scales[ib32] for l<2 / l>=2), so the k loop steps 16 weights per

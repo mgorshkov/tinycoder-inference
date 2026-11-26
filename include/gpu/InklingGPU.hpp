@@ -126,16 +126,20 @@ namespace tinycoder::gpu {
         bool forward(const Model &model, const std::vector<int32_t> &tokens,
                      bool allLogits, float *logits, std::string &err);
 
-        /// Batched prefill: run 1..128 tokens as one [H, m] graph.  Same
-        /// arithmetic as forward()'s token loop at every stage, with the
-        /// projections reused across the whole m: a 128-token prompt pass reads
-        /// each dense weight once per 4 tokens (the largest int8Gemv slice whose
-        /// reduction tree matches the token path) and each routed expert's
-        /// weights once per ~8-token group instead of once per token.
-        /// Bit-exact with forward() at 128 and 512 tokens (every position's
-        /// top-1 and top-5 set, max|d| == 0).  The tensor-core levers that give
-        /// up that exactness are opt-in: TINYCODER_INKLING_GEMM=1 (dense int8
-        /// GEMM) and TINYCODER_INKLING_Q2_0_MMA=1 (Q2_0 expert-down MMQ).
+        /// Batched prefill: run 1..128 tokens as one [H, m] graph.  The
+        /// projections are reused across the whole m: a 128-token prompt pass
+        /// reads each dense weight once (int8Gemm over the batch) and each
+        /// routed expert's weights once per ~8-token group instead of once per
+        /// token.
+        /// The default graph is the fast path, so it is NOT bit-exact with
+        /// forward()'s token loop: TINYCODER_INKLING_GEMM (dense int8 GEMM),
+        /// TINYCODER_INKLING_EXPERT_MMA (expert int8 MMQ),
+        /// TINYCODER_INKLING_Q2_0_MMA (Q2_0 expert-down MMQ) and
+        /// TINYCODER_INKLING_ATTN_FLASH (the >=128-token flash attention) are
+        /// on by default.  Setting all four to 0 restores the exact arithmetic,
+        /// bit-identical to forward() at 128 and 512 tokens (every position's
+        /// top-1 and top-5 set, max|d| == 0; verified by
+        /// tools/inkling_gpu_batched_prefill_test.cpp).
         /// Fall back to forward() when this returns false.
         bool forwardBatch(const Model &model, const std::vector<int32_t> &tokens,
                           bool allLogits, float *logits, std::string &err);

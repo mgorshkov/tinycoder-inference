@@ -365,8 +365,12 @@ namespace tinycoder {
         }
         config_ = metaLoader->config();
 
-        // Estimate total memory needed
-        uint64_t estimatedMem = config_.estimatedMemoryBytes();
+        // Estimate total memory needed at the window that will actually be
+        // granted: the caller's request, or the 2048 auto default.  Charging
+        // the KV cache at config_.maxSeqLen (the checkpoint's *advertised*
+        // limit, 1,048,576 tokens on Inkling-2-Mini) reported a 197 GB
+        // estimate for a load that runs with a 2048-token window.
+        uint64_t estimatedMem = config_.estimatedMemoryBytes(requestedSeqLen);
         uint64_t fileMem = fileSize;
 
         // Get available system memory
@@ -720,6 +724,8 @@ namespace tinycoder {
         if (!loader->loadMetadata(modelPath)) {
             return 0;
         }
+        // No window request is available here: charge the 2048 auto default,
+        // not the checkpoint's advertised maximum.
         return loader->config().estimatedMemoryBytes();
     }
 

@@ -278,8 +278,10 @@ processes generate 40 tokens and answer Paris**. The earlier Paris 1/3 run was
 the test's unseeded sampler (`seed = 0` → random_device), not the engine. The
 racecheck audit did find and fix a real batched `rmsInvShared` barrier race and
 the four mix softmax warp-wide shared RMWs; after that, 20 fresh fast-path
-prefill processes are bit-identical. The exact path remains available via
-`TINYCODER_INKLING_GEMM=0`, `_EXPERT_MMA=0`, `_Q2_0_MMA=0` (224.9 pp512).
+prefill processes are bit-identical. `TINYCODER_INKLING_GEMM=0`,
+`_EXPERT_MMA=0`, `_Q2_0_MMA=0` turn the three MMQ levers off (224.9 pp512);
+the fully exact batched path also needs `TINYCODER_INKLING_ATTN_FLASH=0`,
+which keeps the per-token attention form at m >= 128.
 
 `expert_down` went 4.23 → 4.30 ms, which is neutral: it is Q2_0 on 18 blocks
 and NVFP4 on 6, and Q2_0's int8 form only works if the *bytes* were the cost.
