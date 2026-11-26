@@ -1,5 +1,12 @@
 # Generated from CLion C/C++ Code Style settings
 BasedOnStyle: LLVM
+# NEVER sort includes.  This tree is built from text fragments that are
+# #included in dependency order into one anonymous namespace
+# (include/GPUComputeInternal.hpp and friends), so alphabetical sorting
+# breaks the build: GpuCommon.hpp must come first, and GpuGemvIQInt8.hpp
+# must precede GpuGemmDispatch.hpp.  A clang-format run with sorting on
+# silently reordered them and cost a broken build.
+SortIncludes: Never
 AccessModifierOffset: -4
 AlignAfterOpenBracket: Align
 AlignConsecutiveAssignments: None

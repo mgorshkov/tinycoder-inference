@@ -1,0 +1,19 @@
+#!/bin/bash
+#
+# Format only the C++/CUDA files staged for this commit, then re-stage them.
+# Self-contained: no helper script.  Enable per clone with
+#     cp .githooks/pre-commit .git/hooks/pre-commit   (or install this file)
+# Skip once with:  git commit --no-verify
+# NOTE: .clang-format sets SortIncludes: Never on purpose -- the tree is built
+# from order-dependent text fragments, and sorting them breaks the build.
+set -euo pipefail
+cd "$(git rev-parse --show-toplevel)"
+
+command -v clang-format >/dev/null 2>&1 || exit 0  # no formatter: do not block
+
+mapfile -t files < <(git diff --cached --name-only --diff-filter=ACMR \
+    | grep -E '\.(cpp|hpp|cu|cuh)$' || true)
+[ ${#files[@]} -eq 0 ] && exit 0
+
+clang-format -i "${files[@]}"
+git add -- "${files[@]}"

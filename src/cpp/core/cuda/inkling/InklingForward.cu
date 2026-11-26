@@ -292,16 +292,26 @@ namespace tinycoder::gpu {
 
     namespace {
         enum ProfSec {
-            P_EMBED = 0, P_ATTN_MIX, P_ATTN_PROJ, P_ATTN_GLUE, P_ATTN_CORE,
-            P_ATTN_OUT, P_FFN_MIX, P_ROUTER, P_EXP_GU, P_EXP_DOWN, P_FFN_POST,
-            P_OUT_MIX, P_LMHEAD
+            P_EMBED = 0,
+            P_ATTN_MIX,
+            P_ATTN_PROJ,
+            P_ATTN_GLUE,
+            P_ATTN_CORE,
+            P_ATTN_OUT,
+            P_FFN_MIX,
+            P_ROUTER,
+            P_EXP_GU,
+            P_EXP_DOWN,
+            P_FFN_POST,
+            P_OUT_MIX,
+            P_LMHEAD
         };
         constexpr int kProfSectionCount = 13;
         constexpr const char *kProfNames[kProfSectionCount] = {
                 "embed", "attn_mix", "attn_proj", "attn_glue", "attn_core",
                 "attn_out", "ffn_mix", "router", "expert_gate_up",
                 "expert_down", "ffn_post", "output_mix", "lm_head"};
-    }
+    }// namespace
 
     void InklingGPU::Impl::profReset() {
         for (int i = 0; i < kProfSectionCount; ++i) {
@@ -470,28 +480,28 @@ namespace tinycoder::gpu {
         // the logits and the embedded-row staging past the end of the arena.
         const uint64_t bankRows = static_cast<uint64_t>(im->slots) + 2;
         uint64_t need = 0;
-        need += 11 * H;                       // x prelude passOut inpSA ffnInp pre0..2 nq nk nv
-        need += 5 * H;                        // normed postO convH o moeOut
-        need += 3 * H;                        // mixOut (3 queries)
-        need += 4 * H;                        // msgMixed (4 queries)
-        need += 2 * bankRows * H;             // blockBank + bankSnap
-        need += 2 * H;                        // ctrlIn
-        need += 2 * H;                        // ctrlGv + ctrlFv
-        need += 3 * qDim;                     // q gateProj attnOut
+        need += 11 * H;                              // x prelude passOut inpSA ffnInp pre0..2 nq nk nv
+        need += 5 * H;                               // normed postO convH o moeOut
+        need += 3 * H;                               // mixOut (3 queries)
+        need += 4 * H;                               // msgMixed (4 queries)
+        need += 2 * bankRows * H;                    // blockBank + bankSnap
+        need += 2 * H;                               // ctrlIn
+        need += 2 * H;                               // ctrlGv + ctrlFv
+        need += 3 * qDim;                            // q gateProj attnOut
         need += 4 * static_cast<uint64_t>(im->kvDim);// k v kProj vProj
         need += static_cast<uint64_t>(im->nHeads) * im->nRel;
-        need += im->nHeads;                   // sink
+        need += im->nHeads;                                          // sink
         need += static_cast<uint64_t>(im->nHeads) * (im->extent + 1);// table
-        need += im->nExperts;                 // router
-        need += 3 * static_cast<uint64_t>(im->nUsed);// wgt + gateUpRank + downRank
-        need += static_cast<uint64_t>(im->nUsed) * 2 * im->expertFf;// gateUp
-        need += static_cast<uint64_t>(im->nUsed) * H;// expertOut
-        need += static_cast<uint64_t>(im->nConv) * im->nKvHeads;// dynamic taps
-        need += 64;                           // ctrlG
-        need += im->vocab;                    // logits
-        need += im->nUsed;                    // router index buffer (int32)
-        need += 1;                            // device token position (int32)
-        need += static_cast<uint64_t>(im->maxSeq) * H;// embedded rows
+        need += im->nExperts;                                        // router
+        need += 3 * static_cast<uint64_t>(im->nUsed);                // wgt + gateUpRank + downRank
+        need += static_cast<uint64_t>(im->nUsed) * 2 * im->expertFf; // gateUp
+        need += static_cast<uint64_t>(im->nUsed) * H;                // expertOut
+        need += static_cast<uint64_t>(im->nConv) * im->nKvHeads;     // dynamic taps
+        need += 64;                                                  // ctrlG
+        need += im->vocab;                                           // logits
+        need += im->nUsed;                                           // router index buffer (int32)
+        need += 1;                                                   // device token position (int32)
+        need += static_cast<uint64_t>(im->maxSeq) * H;               // embedded rows
         im->arenaBytes = need * sizeof(float);
         if (!alloc(reinterpret_cast<void **>(&im->arena), im->arenaBytes,
                    "forward_scratch_arena"))
@@ -1156,7 +1166,7 @@ namespace tinycoder::gpu {
                                   static_cast<const float *>(dev.attnPostConvW),
                                   nullptr,
                                   hist + static_cast<size_t>(im->histLen) *
-                                                 (2 * im->kvDim),
+                                                  (2 * im->kvDim),
                                   im->dPostO, H, im->nConv, 1, true, postScale, s);
                 dumpDev(dumpDir, "attn_out", im->dPostO, H, slot, s);
 
@@ -1264,7 +1274,7 @@ namespace tinycoder::gpu {
                                   static_cast<const float *>(dev.ffnPostConvW),
                                   nullptr,
                                   hist + static_cast<size_t>(im->histLen) *
-                                                 (2 * im->kvDim + H),
+                                                  (2 * im->kvDim + H),
                                   im->dConvH, H, im->nConv, 1, true, postScale, s);
                 dumpDev(dumpDir, "ffn_out", im->dConvH, H, slot, s);
                 combine(im->dX, im->dFfnInp, im->dConvH, H, 1.0f, 1.0f, s);

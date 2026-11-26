@@ -46,7 +46,9 @@
 
 namespace tinycoder {
 
-    namespace gpu { class InklingGPU; }
+    namespace gpu {
+        class InklingGPU;
+    }
 
     class ThreadPool;
 
@@ -255,7 +257,7 @@ namespace tinycoder {
             QuantizedMatrix attnVConvProj;// hidden x (shortconvLCache*nKVHeads)
             // Loop controllers (core blocks only); rank x 2*hidden down,
             // hidden x rank gain/forget.
-            QuantizedMatrix msgQuery;    // hidden x 4 (q,k,v,ffn)
+            QuantizedMatrix msgQuery;// hidden x 4 (q,k,v,ffn)
             QuantizedMatrix ctrlDown[4];
             QuantizedMatrix ctrlGain[4];
             QuantizedMatrix ctrlForget[4];
@@ -327,16 +329,16 @@ namespace tinycoder {
             tinycoder::Array<float> layerOutputScale;// 1 (per-layer scaling factor)
 
             // ---- Gemma4 MoE-specific: expert weights ----
-            QuantizedMatrix ffnGateInp;   // hiddenSize x expertCount (router)
-            QuantizedMatrix ffnGateUpExps;// expertCount x (expertFF * 2) x hiddenSize (fused gate+up)
-            QuantizedMatrix ffnDownExps;  // expertCount x hiddenSize x expertFF
+            QuantizedMatrix ffnGateInp;          // hiddenSize x expertCount (router)
+            QuantizedMatrix ffnGateUpExps;       // expertCount x (expertFF * 2) x hiddenSize (fused gate+up)
+            QuantizedMatrix ffnDownExps;         // expertCount x hiddenSize x expertFF
             tinycoder::Array<float> preFFWNorm2; // hiddenSize (second pre-FFN norm)
             tinycoder::Array<float> postFFWNorm1;// hiddenSize (first post-FFN norm)
             tinycoder::Array<float> postFFWNorm2;// hiddenSize (second post-FFN norm)
 
             // ---- Qwen35MoE-specific: attention gate, QKV fused ----
-            QuantizedMatrix attnQKV;      // hiddenSize x (nHeads + 2*nKVHeads) * headDim (fused QKV)
-            QuantizedMatrix attnGate;     // hiddenSize x (nHeads * headDim) (attention gate)
+            QuantizedMatrix attnQKV;             // hiddenSize x (nHeads + 2*nKVHeads) * headDim (fused QKV)
+            QuantizedMatrix attnGate;            // hiddenSize x (nHeads * headDim) (attention gate)
             tinycoder::Array<float> attnQNormMoe;// headDim (Q norm for Qwen35MoE)
             tinycoder::Array<float> attnKNormMoe;// headDim (K norm for Qwen35MoE)
 
@@ -358,8 +360,8 @@ namespace tinycoder {
             QuantizedMatrix ssmAlphaQ;// hiddenSize x nVHeads
 
             // ---- Qwen35MoE: SSM (Mamba-style) ----
-            QuantizedMatrix ssmConv1d; // ssmInnerSize x ssmConvKernel
-            QuantizedMatrix ssmOut;    // ssmInnerSize x hiddenSize
+            QuantizedMatrix ssmConv1d;        // ssmInnerSize x ssmConvKernel
+            QuantizedMatrix ssmOut;           // ssmInnerSize x hiddenSize
             tinycoder::Array<float> ssmA;     // ssmInnerSize x ssmStateSize (log)
             tinycoder::Array<float> ssmDtBias;// ssmInnerSize
             tinycoder::Array<float> ssmAlpha; // ssmInnerSize
@@ -379,9 +381,9 @@ namespace tinycoder {
             QuantizedMatrix ffnGateInpShexp;// hiddenSize x 1 (shared expert router)
 
             // ---- Qwen35MoE: MTP (Multi-Token Prediction) ----
-            QuantizedMatrix nextnEhProj;         // hiddenSize x hiddenSize (embedding head projection)
-            tinycoder::Array<float> nextnEnorm;  // hiddenSize (embedding head norm)
-            tinycoder::Array<float> nextnHnorm;  // hiddenSize (hidden norm)
+            QuantizedMatrix nextnEhProj;                // hiddenSize x hiddenSize (embedding head projection)
+            tinycoder::Array<float> nextnEnorm;         // hiddenSize (embedding head norm)
+            tinycoder::Array<float> nextnHnorm;         // hiddenSize (hidden norm)
             tinycoder::Array<float> nextnSharedHeadNorm;// hiddenSize (shared head norm)
 
             // ---- Inkling-2-Mini extras (empty for other architectures) ----
@@ -874,7 +876,7 @@ namespace tinycoder {
         struct KVCache {
             tinycoder::Array<float> k;// numLayers x maxSeqLen x numKVHeads x headDim
             tinycoder::Array<float> v;// numLayers x maxSeqLen x numKVHeads x headDim
-            size_t pos = 0;    // Current write position
+            size_t pos = 0;           // Current write position
 
             // SSM state for Qwen35MoE architecture (per-layer)
             // convBuf: [numLayers][ssmConvKernel - 1] (past conv1d inputs)

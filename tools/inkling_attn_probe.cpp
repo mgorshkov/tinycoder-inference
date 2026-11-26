@@ -33,11 +33,12 @@
 // Usage:
 //   ./build-inkling/unit_tests/inkling_attn_probe [--heads 24] [--kv 8]
 //       [--tokens 128] [--keys 512] [--extent 1024] [--window 1024]
-//       [--swa 1] [--reps 20] [--tile 1]
+//       [--swa 1] [--reps 20]
 //
 // --keys is the position of the last query (nKeys = keys for a full-attention
-// block).  --tile 1 runs the 8-query-token tiled kernel, 0 the per-token kernel
-// (TINYCODER_INKLING_ATTN_TILE).  --parity compares the two outputs.
+// block).  The probe always times BOTH the 8-query-token tiled kernel and the
+// per-token kernel (TINYCODER_INKLING_ATTN_TILE) and prints their speedup, so
+// there is no flag to select one.  --parity compares the two outputs.
 #include "gpu/InklingKernels.hpp"
 
 #include <cuda_runtime.h>
@@ -53,23 +54,31 @@ int main(int argc, char **argv) {
     uint32_t nHeads = 24, nKv = 8, tokens = 128, keys = 512, extent = 1024,
              window = 1024, swa = 1;
     int reps = 20;
-    bool tile = true, parity = false, flash = false;
+    bool parity = false, flash = false;
     for (int i = 1; i < argc; ++i) {
         const char *a = argv[i];
         auto next = [&]() -> uint32_t {
             return i + 1 < argc ? static_cast<uint32_t>(std::atoi(argv[++i])) : 0u;
         };
         if (!std::strcmp(a, "--heads")) nHeads = next();
-        else if (!std::strcmp(a, "--kv")) nKv = next();
-        else if (!std::strcmp(a, "--tokens")) tokens = next();
-        else if (!std::strcmp(a, "--keys")) keys = next();
-        else if (!std::strcmp(a, "--extent")) extent = next();
-        else if (!std::strcmp(a, "--window")) window = next();
-        else if (!std::strcmp(a, "--swa")) swa = next();
-        else if (!std::strcmp(a, "--reps")) reps = static_cast<int>(next());
-        else if (!std::strcmp(a, "--tile")) tile = next() != 0u;
-        else if (!std::strcmp(a, "--parity")) parity = true;
-        else if (!std::strcmp(a, "--flash")) flash = true;
+        else if (!std::strcmp(a, "--kv"))
+            nKv = next();
+        else if (!std::strcmp(a, "--tokens"))
+            tokens = next();
+        else if (!std::strcmp(a, "--keys"))
+            keys = next();
+        else if (!std::strcmp(a, "--extent"))
+            extent = next();
+        else if (!std::strcmp(a, "--window"))
+            window = next();
+        else if (!std::strcmp(a, "--swa"))
+            swa = next();
+        else if (!std::strcmp(a, "--reps"))
+            reps = static_cast<int>(next());
+        else if (!std::strcmp(a, "--parity"))
+            parity = true;
+        else if (!std::strcmp(a, "--flash"))
+            flash = true;
         else {
             std::fprintf(stderr, "[attn] unknown argument %s\n", a);
             return 2;

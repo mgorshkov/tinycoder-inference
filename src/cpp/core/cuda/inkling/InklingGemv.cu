@@ -12,10 +12,10 @@
 // would be a synchronisation inside the token loop.
 #include "gpu/InklingGPU.hpp"
 
-#include <cuda_fp16.h>
-#include <cuda_runtime.h>
 #include <cstdint>
 #include <cstring>
+#include <cuda_fp16.h>
+#include <cuda_runtime.h>
 
 #include "../gemm/QuantBlocks.cuh"
 
@@ -26,18 +26,138 @@ namespace tinycoder::gpu {
                 0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12};
 
         static const __device__ uint8_t ksigns[128] = {
-                0, 129, 130, 3, 132, 5, 6, 135, 136, 9, 10, 139, 12, 141, 142, 15,
-                144, 17, 18, 147, 20, 149, 150, 23, 24, 153, 154, 27, 156, 29, 30, 159,
-                160, 33, 34, 163, 36, 165, 166, 39, 40, 169, 170, 43, 172, 45, 46, 175,
-                48, 177, 178, 51, 180, 53, 54, 183, 184, 57, 58, 187, 60, 189, 190, 63,
-                192, 65, 66, 195, 68, 197, 198, 71, 72, 201, 202, 75, 204, 77, 78, 207,
-                80, 209, 210, 83, 212, 85, 86, 215, 216, 89, 90, 219, 92, 221, 222, 95,
-                96, 225, 226, 99, 228, 101, 102, 231, 232, 105, 106, 235, 108, 237, 238, 111,
-                240, 113, 114, 243, 116, 245, 246, 119, 120, 249, 250, 123, 252, 125, 126, 255,
+                0,
+                129,
+                130,
+                3,
+                132,
+                5,
+                6,
+                135,
+                136,
+                9,
+                10,
+                139,
+                12,
+                141,
+                142,
+                15,
+                144,
+                17,
+                18,
+                147,
+                20,
+                149,
+                150,
+                23,
+                24,
+                153,
+                154,
+                27,
+                156,
+                29,
+                30,
+                159,
+                160,
+                33,
+                34,
+                163,
+                36,
+                165,
+                166,
+                39,
+                40,
+                169,
+                170,
+                43,
+                172,
+                45,
+                46,
+                175,
+                48,
+                177,
+                178,
+                51,
+                180,
+                53,
+                54,
+                183,
+                184,
+                57,
+                58,
+                187,
+                60,
+                189,
+                190,
+                63,
+                192,
+                65,
+                66,
+                195,
+                68,
+                197,
+                198,
+                71,
+                72,
+                201,
+                202,
+                75,
+                204,
+                77,
+                78,
+                207,
+                80,
+                209,
+                210,
+                83,
+                212,
+                85,
+                86,
+                215,
+                216,
+                89,
+                90,
+                219,
+                92,
+                221,
+                222,
+                95,
+                96,
+                225,
+                226,
+                99,
+                228,
+                101,
+                102,
+                231,
+                232,
+                105,
+                106,
+                235,
+                108,
+                237,
+                238,
+                111,
+                240,
+                113,
+                114,
+                243,
+                116,
+                245,
+                246,
+                119,
+                120,
+                249,
+                250,
+                123,
+                252,
+                125,
+                126,
+                255,
         };
 
         /// Elements per quant block, resolved at compile time.
-        template <uint32_t Type>
+        template<uint32_t Type>
         __host__ __device__ constexpr uint32_t tqk() {
             if (Type == 40 || Type == 42) return 64u;
             if (Type == 0 || Type == 30 || Type == 8) return 32u;
@@ -45,23 +165,37 @@ namespace tinycoder::gpu {
         }
 
         /// Bytes per quant block (per tqk<Type>() weights).
-        template <uint32_t Type>
+        template<uint32_t Type>
         __host__ __device__ constexpr uint32_t tbb() {
             if constexpr (Type == 40) return 36;// NVFP4
-            else if constexpr (Type == 42) return 18;// Q2_0
-            else if constexpr (Type == 19) return 50;// IQ1_S
-            else if constexpr (Type == 16) return 66;// IQ2_XXS
-            else if constexpr (Type == 17) return 74;// IQ2_XS
-            else if constexpr (Type == 22) return 82;// IQ2_S
-            else if constexpr (Type == 23) return 136;// IQ4_XS
-            else if constexpr (Type == 0) return 32u * 4u;// F32, 32 weights
-            else if constexpr (Type == 30) return 32u * 2u;// BF16, 32 weights
-            else if constexpr (Type == 8) return 34;// Q8_0
-            else if constexpr (Type == 12) return 144;// Q4_K
-            else if constexpr (Type == 13) return 176;// Q5_K
-            else if constexpr (Type == 14) return 210;// Q6_K
-            else if constexpr (Type == 18) return 98;// IQ3_XXS
-            else return 0;
+            else if constexpr (Type == 42)
+                return 18;// Q2_0
+            else if constexpr (Type == 19)
+                return 50;// IQ1_S
+            else if constexpr (Type == 16)
+                return 66;// IQ2_XXS
+            else if constexpr (Type == 17)
+                return 74;// IQ2_XS
+            else if constexpr (Type == 22)
+                return 82;// IQ2_S
+            else if constexpr (Type == 23)
+                return 136;// IQ4_XS
+            else if constexpr (Type == 0)
+                return 32u * 4u;// F32, 32 weights
+            else if constexpr (Type == 30)
+                return 32u * 2u;// BF16, 32 weights
+            else if constexpr (Type == 8)
+                return 34;// Q8_0
+            else if constexpr (Type == 12)
+                return 144;// Q4_K
+            else if constexpr (Type == 13)
+                return 176;// Q5_K
+            else if constexpr (Type == 14)
+                return 210;// Q6_K
+            else if constexpr (Type == 18)
+                return 98;// IQ3_XXS
+            else
+                return 0;
         }
 
         __device__ __forceinline__ float bf16ToF32(uint16_t v) {
@@ -71,7 +205,7 @@ namespace tinycoder::gpu {
             return f;
         }
 
-        template <uint32_t Type>
+        template<uint32_t Type>
         __device__ __forceinline__ float decodeWeightT(const uint8_t *block,
                                                        uint32_t i) {
             if constexpr (Type == 40) {// NVFP4: d[4] UE4M3, qs[32], 64 weights
@@ -282,7 +416,7 @@ namespace tinycoder::gpu {
         /// per-row reduction is five warp shuffles instead of a 256-thread
         /// shared-memory tree.  The type is a template argument, so the decode
         /// is branch-free inside the loop.
-        template <uint32_t Type>
+        template<uint32_t Type>
         __global__ void inklingGemvWarpKernel(const uint8_t *w, const float *x,
                                               float *out, uint32_t totalRows,
                                               uint32_t cols,
@@ -331,11 +465,12 @@ namespace tinycoder::gpu {
         /// body, two instantiations, so the two paths decode with the same
         /// instructions and cannot drift apart -- and the decode path keeps the
         /// codegen it had before the batched kernel existed.
-        template <bool KeepW>
+        template<bool KeepW>
         __device__ __forceinline__ void decodeEmit(float v, float *wv, float &acc,
                                                    const float *xb, uint32_t k) {
             if constexpr (KeepW) wv[k] = v;
-            else acc = fmaf(v, xb[k], acc);
+            else
+                acc = fmaf(v, xb[k], acc);
         }
 
         /// NVFP4's per-16-weight scale, without `ldexpf`.
@@ -374,7 +509,7 @@ namespace tinycoder::gpu {
         /// it uses the shared-memory grid tables the decode kernel stages for
         /// every IQ type and the arithmetic NVFP4 scale.  Fast == false is the
         /// batched/prefill path, whose instructions and results are unchanged.
-        template <uint32_t Type, bool KeepW, bool Fast = false>
+        template<uint32_t Type, bool KeepW, bool Fast = false>
         __device__ __forceinline__ float decodeLaneImpl(const uint8_t *blk,
                                                         uint32_t lane,
                                                         const float *xb, float *wv,
@@ -416,7 +551,7 @@ namespace tinycoder::gpu {
             }
             const uint32_t ib = lane >> 2;// 32-weight sub-block, 0..7
             const uint32_t g = lane & 3;  // grid slot inside the sub-block
-            if constexpr (Type == 16) {// IQ2_XXS
+            if constexpr (Type == 16) {   // IQ2_XXS
                 // block_iq2_xxs::qs is uint16_t[32], so one 32-weight
                 // sub-block spans 8 bytes at qs + 8*ib: the low u32 holds the
                 // four grid indices, the high u32 the sign/scale bits.
@@ -431,7 +566,8 @@ namespace tinycoder::gpu {
                 const uint8_t gidx = static_cast<uint8_t>((aux64 >> (8 * g)) & 0xFFu);
                 uint64_t grid;
                 if constexpr (Fast) grid = gridTab[gidx];
-                else grid = iq2xxs_grid[gidx];
+                else
+                    grid = iq2xxs_grid[gidx];
                 const uint8_t signs = signsTab[(aux1 >> (7 * g)) & 127];
                 const float db = __half2float(
                                          *reinterpret_cast<const __half *>(blk)) *
@@ -564,7 +700,7 @@ namespace tinycoder::gpu {
         }
 
         /// Per-lane contribution for one quant block: the decode-time consumer.
-        template <uint32_t Type>
+        template<uint32_t Type>
         __device__ __forceinline__ float dotLane(const uint8_t *blk, uint32_t lane,
                                                  const float *xb,
                                                  const float *iq4Tab,
@@ -579,7 +715,7 @@ namespace tinycoder::gpu {
         /// UE4M3 scale.  Only inklingGemvWarp4Kernel calls this; the batched
         /// prefill kernels keep `dotLane`, so their instructions and results
         /// are unchanged.
-        template <uint32_t Type>
+        template<uint32_t Type>
         __device__ __forceinline__ float dotLaneFast(const uint8_t *blk,
                                                      uint32_t lane,
                                                      const float *xb,
@@ -591,7 +727,7 @@ namespace tinycoder::gpu {
         }
 
         /// Per-lane weights for one quant block: the batched-GEMV consumer.
-        template <uint32_t Type>
+        template<uint32_t Type>
         __device__ __forceinline__ void decodeLaneVals(const uint8_t *blk,
                                                        uint32_t lane, float *wv,
                                                        const float *iq4Tab,
@@ -614,7 +750,7 @@ namespace tinycoder::gpu {
         /// 16 blocks and keeps the arithmetic identical -- same lane->weight
         /// map, same per-block FMA chain, same butterfly -- so the result is
         /// bit-identical, not merely within a band.
-        template <uint32_t Type, uint32_t kRowsT = 4>
+        template<uint32_t Type, uint32_t kRowsT = 4>
         __global__ void inklingGemvWarp4Kernel(
                 const uint8_t *__restrict__ w, const float *__restrict__ x,
                 float *__restrict__ out, uint32_t totalRows, uint32_t cols,
@@ -698,8 +834,14 @@ namespace tinycoder::gpu {
                     // base*4 is 32-byte aligned when cols is a multiple of qk.
                     const float4 a = *reinterpret_cast<const float4 *>(xv + base);
                     const float4 c = *reinterpret_cast<const float4 *>(xv + base + 4);
-                    xb[0] = a.x; xb[1] = a.y; xb[2] = a.z; xb[3] = a.w;
-                    xb[4] = c.x; xb[5] = c.y; xb[6] = c.z; xb[7] = c.w;
+                    xb[0] = a.x;
+                    xb[1] = a.y;
+                    xb[2] = a.z;
+                    xb[3] = a.w;
+                    xb[4] = c.x;
+                    xb[5] = c.y;
+                    xb[6] = c.z;
+                    xb[7] = c.w;
                 } else {
 #pragma unroll
                     for (uint32_t k = 0; k < perLane; ++k)
@@ -736,7 +878,7 @@ namespace tinycoder::gpu {
         /// prefill graph.  Here the token is a grid dimension instead, so the
         /// same arithmetic (same lane partial order, same shuffle tree) runs
         /// across m*rows warps.
-        template <uint32_t Type>
+        template<uint32_t Type>
         __global__ void inklingGemvSmallKernel(const uint8_t *__restrict__ w,
                                                const float *__restrict__ x,
                                                float *__restrict__ out,
@@ -780,8 +922,14 @@ namespace tinycoder::gpu {
                 } else if (perLane == 8 && alignedX) {
                     const float4 a = *reinterpret_cast<const float4 *>(xv + base);
                     const float4 c = *reinterpret_cast<const float4 *>(xv + base + 4);
-                    xb[0] = a.x; xb[1] = a.y; xb[2] = a.z; xb[3] = a.w;
-                    xb[4] = c.x; xb[5] = c.y; xb[6] = c.z; xb[7] = c.w;
+                    xb[0] = a.x;
+                    xb[1] = a.y;
+                    xb[2] = a.z;
+                    xb[3] = a.w;
+                    xb[4] = c.x;
+                    xb[5] = c.y;
+                    xb[6] = c.z;
+                    xb[7] = c.w;
                 } else {
 #pragma unroll
                     for (uint32_t k = 0; k < perLane; ++k)
@@ -797,7 +945,7 @@ namespace tinycoder::gpu {
             if (lane == 0) out[static_cast<size_t>(t) * rows + r] = acc;
         }
 
-        template <uint32_t Type>
+        template<uint32_t Type>
         bool launchSmall(const void *w, const float *x, float *out, uint32_t rows,
                          uint32_t cols, uint32_t m, cudaStream_t stream) {
             constexpr uint32_t blockBytes = tbb<Type>();
@@ -814,7 +962,7 @@ namespace tinycoder::gpu {
             return true;
         }
 
-        template <uint32_t Type>
+        template<uint32_t Type>
         bool launchT(const void *w, const float *x, float *out, uint32_t rows,
                      uint32_t cols, const int32_t *rowIdx, uint32_t rowsPer,
                      uint32_t xStride, cudaStream_t stream) {
@@ -859,7 +1007,7 @@ namespace tinycoder::gpu {
         /// 4-row decode kernel stages: the IQ4 nibble table, the IQ2 sign table
         /// and (only for the two grid-indexed types) the grid table, whose
         /// per-lane lookup is random and would be up to 32 global sectors.
-        template <uint32_t Type>
+        template<uint32_t Type>
         __device__ __forceinline__ void stageDecodeTables(float *sIQ4,
                                                           uint8_t *sSigns,
                                                           uint64_t *sGrid) {
@@ -888,7 +1036,7 @@ namespace tinycoder::gpu {
         /// why M is capped at 16.  The per-block contribution of (row, token)
         /// is summed over the lane's weights in the same order dotLane uses, so
         /// a batched call is bit-identical to M single-token calls.
-        template <uint32_t Type, uint32_t M>
+        template<uint32_t Type, uint32_t M>
         __global__ void inklingGemvBatchedKernel(
                 const uint8_t *__restrict__ w, const float *__restrict__ x,
                 float *__restrict__ out, uint32_t rows, uint32_t cols,
@@ -911,7 +1059,7 @@ namespace tinycoder::gpu {
 #pragma unroll
             for (uint32_t r = 0; r < kRows; ++r)
                 rp[r] = w + static_cast<uint64_t>(o0 + (r < nr ? r : 0)) *
-                                   blocksPerRow * blockBytes;
+                                    blocksPerRow * blockBytes;
             float acc[kRows][M];
 #pragma unroll
             for (uint32_t r = 0; r < kRows; ++r)
@@ -944,8 +1092,14 @@ namespace tinycoder::gpu {
                     } else if (perLane == 8 && alignedX) {
                         const float4 a = *reinterpret_cast<const float4 *>(xp);
                         const float4 c = *reinterpret_cast<const float4 *>(xp + 4);
-                        xb[0] = a.x; xb[1] = a.y; xb[2] = a.z; xb[3] = a.w;
-                        xb[4] = c.x; xb[5] = c.y; xb[6] = c.z; xb[7] = c.w;
+                        xb[0] = a.x;
+                        xb[1] = a.y;
+                        xb[2] = a.z;
+                        xb[3] = a.w;
+                        xb[4] = c.x;
+                        xb[5] = c.y;
+                        xb[6] = c.z;
+                        xb[7] = c.w;
                     } else {
 #pragma unroll
                         for (uint32_t k = 0; k < perLane; ++k)
@@ -984,7 +1138,7 @@ namespace tinycoder::gpu {
         }
 
 
-        template <uint32_t Type, uint32_t M>
+        template<uint32_t Type, uint32_t M>
         __global__ void inklingGemvTokParallelKernel(
                 const uint8_t *__restrict__ w, const float *__restrict__ x,
                 float *__restrict__ out, uint32_t rows, uint32_t cols,
@@ -1015,7 +1169,7 @@ namespace tinycoder::gpu {
 #pragma unroll
             for (uint32_t r = 0; r < kRows; ++r)
                 rp[r] = w + static_cast<uint64_t>(o0 + (r < nr ? r : 0)) *
-                                   blocksPerRow * blockBytes;
+                                    blocksPerRow * blockBytes;
             float acc[kRows][M];
 #pragma unroll
             for (uint32_t r = 0; r < kRows; ++r)
@@ -1048,8 +1202,14 @@ namespace tinycoder::gpu {
                     } else if (perLane == 8 && alignedX) {
                         const float4 a = *reinterpret_cast<const float4 *>(xp);
                         const float4 c = *reinterpret_cast<const float4 *>(xp + 4);
-                        xb[0] = a.x; xb[1] = a.y; xb[2] = a.z; xb[3] = a.w;
-                        xb[4] = c.x; xb[5] = c.y; xb[6] = c.z; xb[7] = c.w;
+                        xb[0] = a.x;
+                        xb[1] = a.y;
+                        xb[2] = a.z;
+                        xb[3] = a.w;
+                        xb[4] = c.x;
+                        xb[5] = c.y;
+                        xb[6] = c.z;
+                        xb[7] = c.w;
                     } else {
 #pragma unroll
                         for (uint32_t k = 0; k < perLane; ++k)
@@ -1091,7 +1251,7 @@ namespace tinycoder::gpu {
         /// Token-parallel float-decoder launch: M=8 tokens per block (the
         /// register-light bucket) and the token groups in grid.y, so a narrow
         /// matrix still fills the device.
-        template <uint32_t Type>
+        template<uint32_t Type>
         bool launchTokParallel(const void *w, const float *x, float *out,
                                uint32_t rows, uint32_t cols, uint32_t m,
                                cudaStream_t stream) {
@@ -1115,21 +1275,36 @@ namespace tinycoder::gpu {
                                   float *out, uint32_t rows, uint32_t cols,
                                   uint32_t m, cudaStream_t stream) {
             switch (type) {
-                case 40: return launchTokParallel<40>(w, x, out, rows, cols, m, stream);
-                case 42: return launchTokParallel<42>(w, x, out, rows, cols, m, stream);
-                case 19: return launchTokParallel<19>(w, x, out, rows, cols, m, stream);
-                case 16: return launchTokParallel<16>(w, x, out, rows, cols, m, stream);
-                case 17: return launchTokParallel<17>(w, x, out, rows, cols, m, stream);
-                case 22: return launchTokParallel<22>(w, x, out, rows, cols, m, stream);
-                case 23: return launchTokParallel<23>(w, x, out, rows, cols, m, stream);
-                case 0: return launchTokParallel<0>(w, x, out, rows, cols, m, stream);
-                case 30: return launchTokParallel<30>(w, x, out, rows, cols, m, stream);
-                case 8: return launchTokParallel<8>(w, x, out, rows, cols, m, stream);
-                case 12: return launchTokParallel<12>(w, x, out, rows, cols, m, stream);
-                case 13: return launchTokParallel<13>(w, x, out, rows, cols, m, stream);
-                case 14: return launchTokParallel<14>(w, x, out, rows, cols, m, stream);
-                case 18: return launchTokParallel<18>(w, x, out, rows, cols, m, stream);
-                default: return false;
+                case 40:
+                    return launchTokParallel<40>(w, x, out, rows, cols, m, stream);
+                case 42:
+                    return launchTokParallel<42>(w, x, out, rows, cols, m, stream);
+                case 19:
+                    return launchTokParallel<19>(w, x, out, rows, cols, m, stream);
+                case 16:
+                    return launchTokParallel<16>(w, x, out, rows, cols, m, stream);
+                case 17:
+                    return launchTokParallel<17>(w, x, out, rows, cols, m, stream);
+                case 22:
+                    return launchTokParallel<22>(w, x, out, rows, cols, m, stream);
+                case 23:
+                    return launchTokParallel<23>(w, x, out, rows, cols, m, stream);
+                case 0:
+                    return launchTokParallel<0>(w, x, out, rows, cols, m, stream);
+                case 30:
+                    return launchTokParallel<30>(w, x, out, rows, cols, m, stream);
+                case 8:
+                    return launchTokParallel<8>(w, x, out, rows, cols, m, stream);
+                case 12:
+                    return launchTokParallel<12>(w, x, out, rows, cols, m, stream);
+                case 13:
+                    return launchTokParallel<13>(w, x, out, rows, cols, m, stream);
+                case 14:
+                    return launchTokParallel<14>(w, x, out, rows, cols, m, stream);
+                case 18:
+                    return launchTokParallel<18>(w, x, out, rows, cols, m, stream);
+                default:
+                    return false;
             }
         }
 
@@ -1137,7 +1312,7 @@ namespace tinycoder::gpu {
         /// unrolled per M, so the buckets are the only instantiations: rounding
         /// m up wastes the idle `s >= m` iterations of the arm, it does not
         /// change the result.
-        template <uint32_t Type, uint32_t M>
+        template<uint32_t Type, uint32_t M>
         bool launchBatchedT(const void *w, const float *x, float *out,
                             uint32_t rows, uint32_t cols, uint32_t m,
                             cudaStream_t stream) {
@@ -1155,7 +1330,7 @@ namespace tinycoder::gpu {
             return true;
         }
 
-        template <uint32_t Type>
+        template<uint32_t Type>
         bool launchBatchedM(const void *w, const float *x, float *out,
                             uint32_t rows, uint32_t cols, uint32_t m,
                             cudaStream_t stream) {
@@ -1173,21 +1348,36 @@ namespace tinycoder::gpu {
                 x == nullptr || out == nullptr)
                 return false;
             switch (type) {
-                case 40: return launchBatchedM<40>(w, x, out, rows, cols, m, stream);
-                case 42: return launchBatchedM<42>(w, x, out, rows, cols, m, stream);
-                case 19: return launchBatchedM<19>(w, x, out, rows, cols, m, stream);
-                case 16: return launchBatchedM<16>(w, x, out, rows, cols, m, stream);
-                case 17: return launchBatchedM<17>(w, x, out, rows, cols, m, stream);
-                case 22: return launchBatchedM<22>(w, x, out, rows, cols, m, stream);
-                case 23: return launchBatchedM<23>(w, x, out, rows, cols, m, stream);
-                case 0: return launchBatchedM<0>(w, x, out, rows, cols, m, stream);
-                case 30: return launchBatchedM<30>(w, x, out, rows, cols, m, stream);
-                case 8: return launchBatchedM<8>(w, x, out, rows, cols, m, stream);
-                case 12: return launchBatchedM<12>(w, x, out, rows, cols, m, stream);
-                case 13: return launchBatchedM<13>(w, x, out, rows, cols, m, stream);
-                case 14: return launchBatchedM<14>(w, x, out, rows, cols, m, stream);
-                case 18: return launchBatchedM<18>(w, x, out, rows, cols, m, stream);
-                default: return false;
+                case 40:
+                    return launchBatchedM<40>(w, x, out, rows, cols, m, stream);
+                case 42:
+                    return launchBatchedM<42>(w, x, out, rows, cols, m, stream);
+                case 19:
+                    return launchBatchedM<19>(w, x, out, rows, cols, m, stream);
+                case 16:
+                    return launchBatchedM<16>(w, x, out, rows, cols, m, stream);
+                case 17:
+                    return launchBatchedM<17>(w, x, out, rows, cols, m, stream);
+                case 22:
+                    return launchBatchedM<22>(w, x, out, rows, cols, m, stream);
+                case 23:
+                    return launchBatchedM<23>(w, x, out, rows, cols, m, stream);
+                case 0:
+                    return launchBatchedM<0>(w, x, out, rows, cols, m, stream);
+                case 30:
+                    return launchBatchedM<30>(w, x, out, rows, cols, m, stream);
+                case 8:
+                    return launchBatchedM<8>(w, x, out, rows, cols, m, stream);
+                case 12:
+                    return launchBatchedM<12>(w, x, out, rows, cols, m, stream);
+                case 13:
+                    return launchBatchedM<13>(w, x, out, rows, cols, m, stream);
+                case 14:
+                    return launchBatchedM<14>(w, x, out, rows, cols, m, stream);
+                case 18:
+                    return launchBatchedM<18>(w, x, out, rows, cols, m, stream);
+                default:
+                    return false;
             }
         }
 
@@ -1203,7 +1393,7 @@ namespace tinycoder::gpu {
         /// token, m tokens pick ~m*nUsed distinct experts in total, and the
         /// weight decode is paid once per *distinct* expert instead of once per
         /// (token, expert) pair.
-        template <uint32_t Type, uint32_t M>
+        template<uint32_t Type, uint32_t M>
         __global__ void inklingGemvBatchedGroupedKernel(
                 const uint8_t *__restrict__ w, const float *__restrict__ x,
                 float *__restrict__ out, uint32_t rows, uint32_t cols,
@@ -1236,7 +1426,7 @@ namespace tinycoder::gpu {
 #pragma unroll
             for (uint32_t r = 0; r < kRows; ++r)
                 rp[r] = wg + static_cast<uint64_t>(o0 + (r < nr ? r : 0)) *
-                                    blocksPerRow * blockBytes;
+                                     blocksPerRow * blockBytes;
             const uint32_t first = lane * perLane;
             // The activation tile for one k block, shared by all 8 warps of the
             // block.  Without it every warp re-reads the same group rows for
@@ -1296,8 +1486,14 @@ namespace tinycoder::gpu {
                         } else if (perLane == 8 && (cols % qk) == 0) {
                             const float4 a = *reinterpret_cast<const float4 *>(xp);
                             const float4 c = *reinterpret_cast<const float4 *>(xp + 4);
-                            xb[0] = a.x; xb[1] = a.y; xb[2] = a.z; xb[3] = a.w;
-                            xb[4] = c.x; xb[5] = c.y; xb[6] = c.z; xb[7] = c.w;
+                            xb[0] = a.x;
+                            xb[1] = a.y;
+                            xb[2] = a.z;
+                            xb[3] = a.w;
+                            xb[4] = c.x;
+                            xb[5] = c.y;
+                            xb[6] = c.z;
+                            xb[7] = c.w;
                         } else {
 #pragma unroll
                             for (uint32_t k = 0; k < perLane; ++k)
@@ -1337,7 +1533,7 @@ namespace tinycoder::gpu {
             }
         }
 
-        template <uint32_t Type, uint32_t M>
+        template<uint32_t Type, uint32_t M>
         bool launchGroupedT(const void *w, const float *x, float *out,
                             uint32_t rows, uint32_t cols, uint32_t capacity,
                             const int32_t *counts, const int32_t *off,
@@ -1356,7 +1552,7 @@ namespace tinycoder::gpu {
             return true;
         }
 
-        template <uint32_t Type>
+        template<uint32_t Type>
         bool launchGroupedM(const void *w, const float *x, float *out,
                             uint32_t rows, uint32_t cols, uint32_t capacity,
                             const int32_t *counts, const int32_t *off,
@@ -1393,21 +1589,36 @@ namespace tinycoder::gpu {
                 counts == nullptr)
                 return false;
             switch (type) {
-                case 40: return launchGroupedM<40>(w, x, out, rows, cols, capacity, counts, off, nGroups, stream);
-                case 42: return launchGroupedM<42>(w, x, out, rows, cols, capacity, counts, off, nGroups, stream);
-                case 19: return launchGroupedM<19>(w, x, out, rows, cols, capacity, counts, off, nGroups, stream);
-                case 16: return launchGroupedM<16>(w, x, out, rows, cols, capacity, counts, off, nGroups, stream);
-                case 17: return launchGroupedM<17>(w, x, out, rows, cols, capacity, counts, off, nGroups, stream);
-                case 22: return launchGroupedM<22>(w, x, out, rows, cols, capacity, counts, off, nGroups, stream);
-                case 23: return launchGroupedM<23>(w, x, out, rows, cols, capacity, counts, off, nGroups, stream);
-                case 0: return launchGroupedM<0>(w, x, out, rows, cols, capacity, counts, off, nGroups, stream);
-                case 30: return launchGroupedM<30>(w, x, out, rows, cols, capacity, counts, off, nGroups, stream);
-                case 8: return launchGroupedM<8>(w, x, out, rows, cols, capacity, counts, off, nGroups, stream);
-                case 12: return launchGroupedM<12>(w, x, out, rows, cols, capacity, counts, off, nGroups, stream);
-                case 13: return launchGroupedM<13>(w, x, out, rows, cols, capacity, counts, off, nGroups, stream);
-                case 14: return launchGroupedM<14>(w, x, out, rows, cols, capacity, counts, off, nGroups, stream);
-                case 18: return launchGroupedM<18>(w, x, out, rows, cols, capacity, counts, off, nGroups, stream);
-                default: return false;
+                case 40:
+                    return launchGroupedM<40>(w, x, out, rows, cols, capacity, counts, off, nGroups, stream);
+                case 42:
+                    return launchGroupedM<42>(w, x, out, rows, cols, capacity, counts, off, nGroups, stream);
+                case 19:
+                    return launchGroupedM<19>(w, x, out, rows, cols, capacity, counts, off, nGroups, stream);
+                case 16:
+                    return launchGroupedM<16>(w, x, out, rows, cols, capacity, counts, off, nGroups, stream);
+                case 17:
+                    return launchGroupedM<17>(w, x, out, rows, cols, capacity, counts, off, nGroups, stream);
+                case 22:
+                    return launchGroupedM<22>(w, x, out, rows, cols, capacity, counts, off, nGroups, stream);
+                case 23:
+                    return launchGroupedM<23>(w, x, out, rows, cols, capacity, counts, off, nGroups, stream);
+                case 0:
+                    return launchGroupedM<0>(w, x, out, rows, cols, capacity, counts, off, nGroups, stream);
+                case 30:
+                    return launchGroupedM<30>(w, x, out, rows, cols, capacity, counts, off, nGroups, stream);
+                case 8:
+                    return launchGroupedM<8>(w, x, out, rows, cols, capacity, counts, off, nGroups, stream);
+                case 12:
+                    return launchGroupedM<12>(w, x, out, rows, cols, capacity, counts, off, nGroups, stream);
+                case 13:
+                    return launchGroupedM<13>(w, x, out, rows, cols, capacity, counts, off, nGroups, stream);
+                case 14:
+                    return launchGroupedM<14>(w, x, out, rows, cols, capacity, counts, off, nGroups, stream);
+                case 18:
+                    return launchGroupedM<18>(w, x, out, rows, cols, capacity, counts, off, nGroups, stream);
+                default:
+                    return false;
             }
         }
 
@@ -1418,21 +1629,36 @@ namespace tinycoder::gpu {
                 out == nullptr)
                 return false;
             switch (type) {
-                case 40: return launchT<40>(w, x, out, rows, cols, rowIdx, rowsPer, xStride, stream);
-                case 42: return launchT<42>(w, x, out, rows, cols, rowIdx, rowsPer, xStride, stream);
-                case 19: return launchT<19>(w, x, out, rows, cols, rowIdx, rowsPer, xStride, stream);
-                case 16: return launchT<16>(w, x, out, rows, cols, rowIdx, rowsPer, xStride, stream);
-                case 17: return launchT<17>(w, x, out, rows, cols, rowIdx, rowsPer, xStride, stream);
-                case 22: return launchT<22>(w, x, out, rows, cols, rowIdx, rowsPer, xStride, stream);
-                case 23: return launchT<23>(w, x, out, rows, cols, rowIdx, rowsPer, xStride, stream);
-                case 0: return launchT<0>(w, x, out, rows, cols, rowIdx, rowsPer, xStride, stream);
-                case 30: return launchT<30>(w, x, out, rows, cols, rowIdx, rowsPer, xStride, stream);
-                case 8: return launchT<8>(w, x, out, rows, cols, rowIdx, rowsPer, xStride, stream);
-                case 12: return launchT<12>(w, x, out, rows, cols, rowIdx, rowsPer, xStride, stream);
-                case 13: return launchT<13>(w, x, out, rows, cols, rowIdx, rowsPer, xStride, stream);
-                case 14: return launchT<14>(w, x, out, rows, cols, rowIdx, rowsPer, xStride, stream);
-                case 18: return launchT<18>(w, x, out, rows, cols, rowIdx, rowsPer, xStride, stream);
-                default: return false;
+                case 40:
+                    return launchT<40>(w, x, out, rows, cols, rowIdx, rowsPer, xStride, stream);
+                case 42:
+                    return launchT<42>(w, x, out, rows, cols, rowIdx, rowsPer, xStride, stream);
+                case 19:
+                    return launchT<19>(w, x, out, rows, cols, rowIdx, rowsPer, xStride, stream);
+                case 16:
+                    return launchT<16>(w, x, out, rows, cols, rowIdx, rowsPer, xStride, stream);
+                case 17:
+                    return launchT<17>(w, x, out, rows, cols, rowIdx, rowsPer, xStride, stream);
+                case 22:
+                    return launchT<22>(w, x, out, rows, cols, rowIdx, rowsPer, xStride, stream);
+                case 23:
+                    return launchT<23>(w, x, out, rows, cols, rowIdx, rowsPer, xStride, stream);
+                case 0:
+                    return launchT<0>(w, x, out, rows, cols, rowIdx, rowsPer, xStride, stream);
+                case 30:
+                    return launchT<30>(w, x, out, rows, cols, rowIdx, rowsPer, xStride, stream);
+                case 8:
+                    return launchT<8>(w, x, out, rows, cols, rowIdx, rowsPer, xStride, stream);
+                case 12:
+                    return launchT<12>(w, x, out, rows, cols, rowIdx, rowsPer, xStride, stream);
+                case 13:
+                    return launchT<13>(w, x, out, rows, cols, rowIdx, rowsPer, xStride, stream);
+                case 14:
+                    return launchT<14>(w, x, out, rows, cols, rowIdx, rowsPer, xStride, stream);
+                case 18:
+                    return launchT<18>(w, x, out, rows, cols, rowIdx, rowsPer, xStride, stream);
+                default:
+                    return false;
             }
         }
 
@@ -1490,19 +1716,32 @@ namespace tinycoder::gpu {
         if (m == 0 || rows == 0) return false;
         cudaStream_t s = reinterpret_cast<cudaStream_t>(stream);
         switch (type) {
-            case 0: return launchSmall<0>(w, x, out, rows, cols, m, s);
-            case 8: return launchSmall<8>(w, x, out, rows, cols, m, s);
-            case 30: return launchSmall<30>(w, x, out, rows, cols, m, s);
-            case 12: return launchSmall<12>(w, x, out, rows, cols, m, s);
-            case 13: return launchSmall<13>(w, x, out, rows, cols, m, s);
-            case 14: return launchSmall<14>(w, x, out, rows, cols, m, s);
-            case 16: return launchSmall<16>(w, x, out, rows, cols, m, s);
-            case 17: return launchSmall<17>(w, x, out, rows, cols, m, s);
-            case 18: return launchSmall<18>(w, x, out, rows, cols, m, s);
-            case 19: return launchSmall<19>(w, x, out, rows, cols, m, s);
-            case 22: return launchSmall<22>(w, x, out, rows, cols, m, s);
-            case 23: return launchSmall<23>(w, x, out, rows, cols, m, s);
-            default: return false;
+            case 0:
+                return launchSmall<0>(w, x, out, rows, cols, m, s);
+            case 8:
+                return launchSmall<8>(w, x, out, rows, cols, m, s);
+            case 30:
+                return launchSmall<30>(w, x, out, rows, cols, m, s);
+            case 12:
+                return launchSmall<12>(w, x, out, rows, cols, m, s);
+            case 13:
+                return launchSmall<13>(w, x, out, rows, cols, m, s);
+            case 14:
+                return launchSmall<14>(w, x, out, rows, cols, m, s);
+            case 16:
+                return launchSmall<16>(w, x, out, rows, cols, m, s);
+            case 17:
+                return launchSmall<17>(w, x, out, rows, cols, m, s);
+            case 18:
+                return launchSmall<18>(w, x, out, rows, cols, m, s);
+            case 19:
+                return launchSmall<19>(w, x, out, rows, cols, m, s);
+            case 22:
+                return launchSmall<22>(w, x, out, rows, cols, m, s);
+            case 23:
+                return launchSmall<23>(w, x, out, rows, cols, m, s);
+            default:
+                return false;
         }
     }
 

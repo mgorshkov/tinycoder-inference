@@ -54,7 +54,7 @@ namespace tinycoder {
         // Inkling-2-Mini block constants (mirroring ggml-common.h exactly).
         // -------------------------------------------------------------------
         static constexpr uint32_t QK_NVFP4 = 64;
-        static constexpr uint32_t QK_NVFP4_SUB = 16;// per-group scale width
+        static constexpr uint32_t QK_NVFP4_SUB = 16;     // per-group scale width
         static constexpr uint32_t NVFP4_BLOCK_BYTES = 36;// d[4] + qs[32]
         static constexpr uint32_t QK_MXFP4 = 32;
         static constexpr uint32_t MXFP4_BLOCK_BYTES = 17;// e + qs[16]
@@ -602,8 +602,7 @@ namespace tinycoder {
                 0x01010101ff01ffffULL, 0x01010101ff01ff01ULL, 0x01010101ff0101ffULL, 0x01010101ff010101ULL,
                 0x010101010000ff00ULL, 0x01010101000000ffULL, 0x0101010100000001ULL, 0x0101010101ffffffULL,
                 0x0101010101ffff01ULL, 0x0101010101ff01ffULL, 0x0101010101ff0101ULL, 0x0101010101000000ULL,
-                0x010101010101ffffULL, 0x010101010101ff01ULL, 0x01010101010101ffULL, 0x0101010101010101ULL
-        };
+                0x010101010101ffffULL, 0x010101010101ff01ULL, 0x01010101010101ffULL, 0x0101010101010101ULL};
 
         /// Offset added to every 1-bit grid value before scaling: upstream
         /// IQ1S_DELTA / IQ1M_DELTA are both 0.125f. The sign of the offset is

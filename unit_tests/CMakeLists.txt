@@ -191,6 +191,25 @@ if(ENABLE_CUDA)
         CXX_STANDARD_REQUIRED ON
     )
 
+    # ---- MoE token-block throughput probe (diagnostic; not a gtest) ----
+    # Measures the int8 GEMM rate at m = 8/16/32/64, n=512, k=2048, i.e. one
+    # routed expert's gate matrix at prefill.  Decides whether a grouped
+    # (grid.z = expert) MoE kernel could keep up with a PCIe weight stream.
+    add_executable(int8_m16_probe
+        ../tools/int8_m16_probe.cu
+    )
+
+    target_link_libraries(int8_m16_probe
+        PRIVATE
+        tinycoder_core
+        CUDA::cudart
+    )
+
+    set_target_properties(int8_m16_probe PROPERTIES
+        CUDA_STANDARD 20
+        CUDA_STANDARD_REQUIRED ON
+    )
+
     # ---- GGUF decode GEMV numeric gate (diagnostic; not a gtest) ----
     # Per (type, rows, cols) against an fp64 reference on real weights.  The
     # decode path had no tool coverage at all before this.

@@ -31,7 +31,7 @@ Columns follow the same benchmark defaults as the 2080 Ti file:
 | [Ternary-Bonsai-2-27B `pq2_0` (Prism)](https://huggingface.co/prism-ml/Ternary-Bonsai-2-27B-gguf/resolve/main/Ternary-Bonsai-2-27B-PQ2_0.gguf) | 6.7 GB | full offload | — | — | PrismML llama.cpp (fork) | — | — | — | — |
 | [Ternary-Bonsai-2-27B `ptq1_0` (Prism)](https://huggingface.co/prism-ml/Ternary-Bonsai-2-27B-gguf/resolve/main/Ternary-Bonsai-2-27B-PTQ1_0.gguf) | 5.5 GB | full offload | — | — | PrismML llama.cpp (fork) | — | — | — | — |
 | [Ornith-1.5-9B `q4_k_m`](https://huggingface.co/bartowski/Ornith-1.5-9B-GGUF/resolve/main/Ornith-1.5-9B-Q4_K_M.gguf) | 5.9 GB | full offload | — | — | llama.cpp | — | — | — | — |
-| [Ornith-1.5-35B-A3B `q8_0` → `q4_k` experts](https://huggingface.co/AtomicChat/Ornith-1.5-35B-A3B-GGUF/resolve/main/Ornith-1.5-35B-A3B-Q8_0.gguf) | 34.4 GB | **hybrid only** | — | — | llama.cpp `-ncmoe 99` | — | — | — | — |
+| [Ornith-1.5-35B-A3B `q8_0` (native, CPU FFNs)](https://huggingface.co/AtomicChat/Ornith-1.5-35B-A3B-GGUF/resolve/main/Ornith-1.5-35B-A3B-Q8_0.gguf) | 34.4 GB | **hybrid only** | — | — | llama.cpp `-ncmoe 99` | — | — | — | — |
 | [Inkling-2-Mini `iq2_xxs`](https://huggingface.co/unsloth/Inkling-2-Mini-GGUF/resolve/main/Inkling-2-Mini-UD-IQ2_XXS.gguf) | 8.5 GB | full offload | — | — | llama.cpp CUDA (`-ngl 99`, ctx 2048) | — | — | — | — |
 | [Qwen3.8-27B EXL3 `1.60bpw`](https://huggingface.co/turboderp/Qwen3.8-27B-exl3/tree/SC_1.60bpw_H3) | 8.6 GB | full offload | — | — | exllamav3 1.6.6 | — | — | — | — |
 
@@ -73,8 +73,10 @@ different artefacts of the same model and their speeds are not comparable cell-f
 
 † expected to move once the two engine fixes in
 `docs/superpowers/plans/2026-11-22-engine-defects-from-3090-report.md` land: the Q6_K
-int8 branch already exists in the current tree, and the fp16 subnormal fix changes what
-the 35B's Q4_K expert requant computes.
+int8 branch already exists in the current tree, and the fp16 subnormal fix changes the
+dense conversions that were already in the path.  The 35B rows above are fully
+device-resident (`Q4_K_M`/`IQ1_M` fit 24 GB), not hybrid, so they are unaffected by the
+hybrid-CPU-expert default.
 
 **Server vs `tinycoder_bench`:** the gateway loses 3–44 % of decode, monotonically with
 model speed (1.5B 415.8 → 234.5, −44 %; 7B 165.4 → 123.2, −26 %; Bonsai 69.0 → 57.2,
@@ -95,10 +97,10 @@ Long-context prefill is the other limit: 60k tokens run at 167 tok/s where 512 t
 at 1206 (report §4.1, §5.3), and 182k takes 51 minutes to first token.
 
 The Ornith-1.5-35B-A3B row is **hybrid only**, exactly as in the 2080 Ti file: the
-expert FFNs live in system RAM and both columns run the same expert-offload mode
-(`-ncmoe 99` on the llama.cpp side). It is not a statement about a fully GPU-resident
-path; at 34.4 GB the model does not fit on this card, so no fully resident number can
-exist here.
+expert FFNs run on the CPU from the checkpoint's native **Q8_0** weights in system RAM —
+no requantisation — and the llama.cpp column uses the same expert-offload mode
+(`-ncmoe 99`). It is not a statement about a fully GPU-resident path; at 34.4 GB the
+model does not fit on this card, so no fully resident number can exist here.
 
 ## 2. What a row must satisfy before it is published
 

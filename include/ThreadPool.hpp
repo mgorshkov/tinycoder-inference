@@ -239,7 +239,12 @@ namespace tinycoder {
         /// became true during the spin.
         template<typename Pred>
         bool spinWait(Pred pred) {
-            constexpr int kSpinIterations = 4096;
+            // Spin long enough to cover the gap between back-to-back MoE
+            // kernel calls (the CPU-expert path issues 768 matmul calls per
+            // layer with <1 ms gaps); the old 4096 (~40 us) put workers to
+            // sleep between calls and the wake latency showed up as a 2x
+            // mean-vs-best spread at 36 threads.
+            constexpr int kSpinIterations = 131072;
             for (int i = 0; i < kSpinIterations; ++i) {
                 if (pred()) {
                     return true;

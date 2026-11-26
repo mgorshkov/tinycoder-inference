@@ -84,7 +84,7 @@ namespace tinycoder {
                     "0.9<|end_message|>";
             for (const auto &msg: messages) {
                 const std::string tok =
-                        msg.first == "system"   ? "<|message_system|>"
+                        msg.first == "system"      ? "<|message_system|>"
                         : msg.first == "assistant" ? "<|message_model|>"
                         : msg.first == "tool"      ? "<|message_tool|>"
                                                    : "<|message_user|>";

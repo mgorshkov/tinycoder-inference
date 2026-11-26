@@ -55,7 +55,8 @@ __global__ void kQGemvQ8_0xQ8K_BatchGU(const uint8_t *const *__restrict__ wq,
                                        uint32_t expertFF,
                                        uint32_t blocksPerRow,
                                        uint32_t rowBytes,
-                                       uint32_t combinedRows) {
+                                       uint32_t combinedRows,
+                                       const uint8_t *const *__restrict__ xTab) {
     const uint32_t r = blockIdx.y;
     const uint32_t row = blockIdx.x * blockDim.y + threadIdx.y;
     if (row >= combinedRows) return;
@@ -67,10 +68,13 @@ __global__ void kQGemvQ8_0xQ8K_BatchGU(const uint8_t *const *__restrict__ wq,
     const uint8_t *rp = wq[r * 3u + isUp] +
                         static_cast<uint64_t>(wrow) * rowBytes;
     const uint32_t lane = threadIdx.x;
+    // Prefill: every job is a distinct (token, rank) pair and carries its own
+    // quantised activation row; decode passes xTab == nullptr (one token).
+    const uint8_t *xr = (xTab != nullptr) ? xTab[r] : x;
     float sumf = 0.0f;
     for (uint32_t b = 0; b < blocksPerRow; ++b) {
         const uint8_t *blkW = rp + static_cast<uint64_t>(b) * 34u;
-        const uint8_t *blkA = x + static_cast<uint64_t>(b) * kQ8_0x32_STRIDE;
+        const uint8_t *blkA = xr + static_cast<uint64_t>(b) * kQ8_0x32_STRIDE;
         const float d = __half2float(*reinterpret_cast<const __half *>(blkW));
         const float d8 = *reinterpret_cast<const float *>(blkA);
         if (d8 == 0.0f) continue;
@@ -249,7 +253,8 @@ __global__ void kQGemvQ8_0xQ8K_BatchDownR(const uint8_t *const *__restrict__ wq,
                                           uint32_t blocksPerRow,
                                           uint32_t rowBytes,
                                           uint32_t xStrideBytes,
-                                          uint32_t outStride) {
+                                          uint32_t outStride,
+                                          const uint32_t *__restrict__ tokOf) {
     const uint32_t j = blockIdx.y;// compact resident slot
     const uint32_t row = blockIdx.x * blockDim.y + threadIdx.y;
     if (row >= hidden) return;
@@ -297,7 +302,12 @@ __global__ void kQGemvQ8_0xQ8K_BatchDownR(const uint8_t *const *__restrict__ wq,
         }
     }
     if (lane == 0) {
-        out[static_cast<uint64_t>(r0) * outStride + row] = sumf;
+        // Combined table is rank-major [eu][seqLen][hidden]; for prefill each
+        // job carries the token whose row it writes (tokOf == nullptr for
+        // decode, where the caller already offset the base by s*hidden).
+        const uint64_t tokOff =
+                (tokOf != nullptr) ? static_cast<uint64_t>(tokOf[j]) * hidden : 0;
+        out[static_cast<uint64_t>(r0) * outStride + tokOff + row] = sumf;
     }
 }
 

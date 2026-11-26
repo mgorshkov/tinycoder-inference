@@ -1,5 +1,7 @@
-build/
-build-*/
+# Every build directory (build/, build2/, build-cpu/, build-asan/, ...).
+# Trailing slash: directories only, so the tracked scripts/build.sh is not
+# caught by the pattern.
+build*/
 cmake-build-*/
 *.o
 *.a

@@ -1386,6 +1386,13 @@ namespace tinycoder {
             level = static_cast<int>(tinycoder::cpu::maxSimdLevel());
             s_level.store(level, std::memory_order_release);
         }
+#if defined(__AVX512F__) && defined(__FMA__)
+        if (level >= static_cast<int>(cpu::SimdLevel::AVX512)) {
+            simd::matMulVecBatchQ8_0_Q8K_AVX512(W_q8_0, X, seqLen, rows, cols,
+                                                out);
+            return true;
+        }
+#endif
 #if defined(__AVX2__) && defined(__FMA__)
         if (level >= static_cast<int>(tinycoder::cpu::SimdLevel::AVX2)) {
             simd::matMulVecBatchQ8_0_Q8K_AVX2(W_q8_0, X, seqLen, rows, cols, out);
@@ -1396,6 +1403,51 @@ namespace tinycoder {
         (void) X;
         (void) seqLen;
         (void) rows;
+        (void) cols;
+        (void) out;
+        return false;
+    }
+
+    // ---- Fused Q8_0 expert groups (one dispatch per layer) ----
+    bool matMulVecBatchQ8_0Groups_SIMD(
+            const uint8_t *W_q8_0, uint32_t rowsPerExpert, uint64_t rowBytes,
+            const uint32_t *groupExpert, const uint32_t *groupFirst,
+            const uint32_t *groupCount, uint32_t nGroups,
+            const uint32_t *memberPair, const uint32_t *memberXRow,
+            uint32_t xRows, const float *X, uint32_t cols, float *out) {
+        static std::atomic<int> s_level{-1};
+        int level = s_level.load(std::memory_order_acquire);
+        if (level < 0) {
+            level = static_cast<int>(cpu::maxSimdLevel());
+            s_level.store(level, std::memory_order_release);
+        }
+#if defined(__AVX512F__) && defined(__FMA__)
+        if (level >= static_cast<int>(cpu::SimdLevel::AVX512)) {
+            return simd::matMulVecBatchQ8_0Groups_AVX512(
+                    W_q8_0, rowsPerExpert, rowBytes, groupExpert, groupFirst,
+                    groupCount, nGroups, memberPair, memberXRow, xRows, X,
+                    cols, out);
+        }
+#endif
+#if defined(__AVX2__) && defined(__FMA__)
+        if (level >= static_cast<int>(cpu::SimdLevel::AVX2)) {
+            return simd::matMulVecBatchQ8_0Groups_AVX2(
+                    W_q8_0, rowsPerExpert, rowBytes, groupExpert, groupFirst,
+                    groupCount, nGroups, memberPair, memberXRow, xRows, X,
+                    cols, out);
+        }
+#endif
+        (void) W_q8_0;
+        (void) rowsPerExpert;
+        (void) rowBytes;
+        (void) groupExpert;
+        (void) groupFirst;
+        (void) groupCount;
+        (void) nGroups;
+        (void) memberPair;
+        (void) memberXRow;
+        (void) xRows;
+        (void) X;
         (void) cols;
         (void) out;
         return false;

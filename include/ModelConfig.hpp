@@ -141,27 +141,27 @@ namespace tinycoder {
         // re-runs blocks [loopStart, loopEnd) loopCount times; every pass owns
         // its own KV cache and short-convolution state, so the cache has
         // numKvSlots rows = physical + (loopCount-1)*(loopEnd-loopStart).
-        uint32_t numPhysicalLayers = 0;  // 0 = same as numLayers
-        uint32_t numKvSlots = 0;         // 0 = same as numLayers
+        uint32_t numPhysicalLayers = 0;// 0 = same as numLayers
+        uint32_t numKvSlots = 0;       // 0 = same as numLayers
         uint32_t loopStart = 0;
         uint32_t loopEnd = 0;
         uint32_t loopCount = 0;
         uint32_t loopGateRank = 0;
-        uint32_t attnResBlockSize = 0;   // depth-attention block size (6)
-        uint32_t relativeLength = 0;     // learned relative-bias features (16)
-        uint32_t relativeExtent = 0;     // max relative distance (1024)
-        uint32_t shortconvLCache = 0;    // causal depthwise conv taps (4)
-        uint32_t slidingWindow = 0;      // SWA window (1024)
-        uint32_t vocabSizeUnpadded = 0;  // LM head rows actually used (200058)
+        uint32_t attnResBlockSize = 0;            // depth-attention block size (6)
+        uint32_t relativeLength = 0;              // learned relative-bias features (16)
+        uint32_t relativeExtent = 0;              // max relative distance (1024)
+        uint32_t shortconvLCache = 0;             // causal depthwise conv taps (4)
+        uint32_t slidingWindow = 0;               // SWA window (1024)
+        uint32_t vocabSizeUnpadded = 0;           // LM head rows actually used (200058)
         std::vector<uint8_t> slidingWindowPattern;// per physical layer; empty = all full
-        float qkClip = 0.0f;             // per-head L2 clip threshold (22.627)
-        float relativeClip = 0.0f;       // relative-bias feature clip (8.0)
-        float logScaleFloor = 0.0f;      // log-scaled positions floor (8192)
-        float logScaleAlpha = 0.0f;      // log-scaled positions alpha (0.1)
-        float situBeta = 0.0f;           // SITU gate beta (4.0)
-        float situLinearBeta = 0.0f;     // SITU up beta (25.0)
-        float expertWeightsScale = 0.0f; // router weight scale after norm (8.0)
-        bool inklingExpandedLayout = false;// Unsloth 48-slot layout
+        float qkClip = 0.0f;                      // per-head L2 clip threshold (22.627)
+        float relativeClip = 0.0f;                // relative-bias feature clip (8.0)
+        float logScaleFloor = 0.0f;               // log-scaled positions floor (8192)
+        float logScaleAlpha = 0.0f;               // log-scaled positions alpha (0.1)
+        float situBeta = 0.0f;                    // SITU gate beta (4.0)
+        float situLinearBeta = 0.0f;              // SITU up beta (25.0)
+        float expertWeightsScale = 0.0f;          // router weight scale after norm (8.0)
+        bool inklingExpandedLayout = false;       // Unsloth 48-slot layout
 
 
         // ---- Gated-delta-net q/k -> value-head pairing order ----

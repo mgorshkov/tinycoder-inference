@@ -577,6 +577,23 @@ namespace tinycoder {
     // MoE expert path was missing (its parallelFor2D(1,8) hit the serial
     // shortcut in parallelFor). Returns true if a vector kernel was used, false
     // if the caller must fall back to the generic scalar path.
+    /// @brief Fused Q8_0 expert GEMM: ONE dispatch for every selected expert
+    /// group of a layer (llama.cpp's mul_mat_id shape).
+    ///
+    /// Groups are contiguous slices of `memberPair`/`memberXRow`.  For a group
+    /// g, the members are (pair index, activation row); the kernel writes
+    /// out[pair * rowsPerExpert + row] for each member.  Expert weights for g
+    /// start at W + groupExpert[g] * rowsPerExpert * rowBytes.  The activation
+    /// rows 0..xRows-1 are quantised once (phase 1), and the (group, row-tile)
+    /// pairs are the flat task axis of phase 2, so the whole layer is one
+    /// parallel dispatch instead of one per expert.
+    bool matMulVecBatchQ8_0Groups_SIMD(
+            const uint8_t *W_q8_0, uint32_t rowsPerExpert, uint64_t rowBytes,
+            const uint32_t *groupExpert, const uint32_t *groupFirst,
+            const uint32_t *groupCount, uint32_t nGroups,
+            const uint32_t *memberPair, const uint32_t *memberXRow,
+            uint32_t xRows, const float *X, uint32_t cols, float *out);
+
     bool matMulVecBatchQ8_0_SIMD(const uint8_t *W_q8_0, const float *X,
                                  uint32_t seqLen, uint32_t rows, uint32_t cols,
                                  float *out);

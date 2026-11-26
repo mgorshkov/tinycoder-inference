@@ -1582,18 +1582,18 @@ namespace tinycoder::exl3gpu {
             const uint32_t tilesN = lin.n / 16u;
             const uint32_t tileU16 = lin.tileU16;
             const uint32_t gridTiles = lin.n / 16u;// tiles total
-#define LAUNCH_SPLIT(SP)                                                         \
-    do {                                                                         \
-        const uint32_t grid = gridTiles / (8u / (SP));                           \
-        if (generic) {                                                           \
-            exl3FusedMatVec<CB, SP, true><<<grid, 256, 0, stream>>>(             \
-                    reinterpret_cast<const uint16_t *>(lin.trellis), lin.suh,   \
-                    lin.k, lin.K, tilesN, tileU16, xDev, yDev);                  \
-        } else {                                                                 \
-            exl3FusedMatVec<CB, SP, false><<<grid, 256, 0, stream>>>(            \
-                    reinterpret_cast<const uint16_t *>(lin.trellis), lin.suh,   \
-                    lin.k, lin.K, tilesN, tileU16, xDev, yDev);                  \
-        }                                                                        \
+#define LAUNCH_SPLIT(SP)                                                      \
+    do {                                                                      \
+        const uint32_t grid = gridTiles / (8u / (SP));                        \
+        if (generic) {                                                        \
+            exl3FusedMatVec<CB, SP, true><<<grid, 256, 0, stream>>>(          \
+                    reinterpret_cast<const uint16_t *>(lin.trellis), lin.suh, \
+                    lin.k, lin.K, tilesN, tileU16, xDev, yDev);               \
+        } else {                                                              \
+            exl3FusedMatVec<CB, SP, false><<<grid, 256, 0, stream>>>(         \
+                    reinterpret_cast<const uint16_t *>(lin.trellis), lin.suh, \
+                    lin.k, lin.K, tilesN, tileU16, xDev, yDev);               \
+        }                                                                     \
     } while (0)
             switch (split) {
                 case 8:
@@ -1870,11 +1870,11 @@ namespace tinycoder::exl3gpu {
         // 24 of 48 warps) -- three registers away from a whole residency slot --
         // and the K=1 kernel next to it has carried (256,4) since it was written.
         __global__ __launch_bounds__(256, 4) void exl3GemvV3(const uint16_t *__restrict__ trellis,
-                                   const float *__restrict__ suh,
-                                   uint32_t k, uint32_t K,
-                                   uint32_t tilesN, uint32_t tileU16,
-                                   const float *__restrict__ x,
-                                   float *__restrict__ z) {
+                                                             const float *__restrict__ suh,
+                                                             uint32_t k, uint32_t K,
+                                                             uint32_t tilesN, uint32_t tileU16,
+                                                             const float *__restrict__ x,
+                                                             float *__restrict__ z) {
             constexpr int GROUPS = 8 / SPLIT;
             constexpr int KT = 8 / SPLIT;// k-tiles per warp per chunk
             const int warp = threadIdx.x >> 5;
@@ -2442,7 +2442,8 @@ namespace tinycoder::exl3gpu {
                 int dev = 0;
                 if (cudaGetDevice(&dev) != cudaSuccess ||
                     cudaDeviceGetAttribute(&n, cudaDevAttrMultiProcessorCount, dev) !=
-                            cudaSuccess || n <= 0)
+                            cudaSuccess ||
+                    n <= 0)
                     n = 68;
                 return static_cast<uint32_t>(n);
             }();

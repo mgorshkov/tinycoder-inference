@@ -597,19 +597,19 @@ __global__ void kEmbedDequantQ6K(const uint8_t *__restrict__ embed,
     const uint8_t *row = embed + static_cast<uint64_t>(t) * rowBytes;
     float *h = hidden + static_cast<size_t>(s) * hiddenSize;
     const uint32_t lane = threadIdx.x;
-    const uint32_t e0 = lane * 8u;          // 0..248 inside the 256-value block
-    const uint32_t half = e0 / 128u;        // the block holds two 128-value halves
-    const uint32_t r = e0 % 128u;           // position inside the half
-    const uint32_t g = r / 32u;             // which qh shift / ql pair
-    const uint32_t sub = (r % 32u) / 16u;   // 16-value sub-block inside the group
+    const uint32_t e0 = lane * 8u;       // 0..248 inside the 256-value block
+    const uint32_t half = e0 / 128u;     // the block holds two 128-value halves
+    const uint32_t r = e0 % 128u;        // position inside the half
+    const uint32_t g = r / 32u;          // which qh shift / ql pair
+    const uint32_t sub = (r % 32u) / 16u;// 16-value sub-block inside the group
     for (uint32_t b = 0; b < blocksPerRow; ++b) {
         // Per-block pointers: every 210-byte block carries its own ql/qh/scales/d.
         // Hoisting them out of the loop made blocks 1..n-1 decode block 0's bytes
         // (caught by Q6KEmbeddingGatherMatchesDequant at ~0.11 absolute error on
         // 15/16 of a 4096-wide row).
         const int8_t *sc = reinterpret_cast<const int8_t *>(row + 192);
-        const uint8_t *ql = row;            // 128 bytes
-        const uint8_t *qh = row + 128u;     // 64 bytes
+        const uint8_t *ql = row;       // 128 bytes
+        const uint8_t *qh = row + 128u;// 64 bytes
         const float d = __half2float(*reinterpret_cast<const __half *>(row + 208));
         const float scale = d * static_cast<float>(sc[half * 8u + 2u * g + sub]);
         const uint8_t *qlp = ql + half * 64u + (g & 1u) * 32u + (r % 32u);

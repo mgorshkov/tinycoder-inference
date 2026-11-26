@@ -3910,7 +3910,7 @@ GEMV_LAUNCHER_PLAIN(IQ3XXS, F32, float)
         dim3 grid((unsigned int) nrows_x, 1, 1);                                \
         dim3 block(WARP_SIZE, 4, 1);                                            \
         gemvExpert##tag##F32<<<grid, block, 0,                                  \
-                              static_cast<cudaStream_t>(stream)>>>(             \
+                               static_cast<cudaStream_t>(stream)>>>(            \
                 vx, vy, (float *) dst, ncols_x, nrows_x, stride_col_y, rowIdx,  \
                 rowsPer);                                                       \
     }

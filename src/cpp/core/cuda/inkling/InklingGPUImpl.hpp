@@ -28,35 +28,53 @@ namespace tinycoder::gpu {
 
     /// Elements per quant block, mirrored in InklingGemv.cu.
     inline uint32_t inklingTypeQk(uint32_t type) {
-        if (type == 40 || type == 42) return 64u;// NVFP4 / Q2_0
+        if (type == 40 || type == 42) return 64u;            // NVFP4 / Q2_0
         if (type == 0 || type == 30 || type == 8) return 32u;// F32 / BF16 / Q8_0
-        return 256u;// K-quants and IQ types
+        return 256u;                                         // K-quants and IQ types
     }
 
     /// Bytes per quant block, mirrored in InklingGemv.cu.
     inline uint32_t inklingTypeBlockBytes(uint32_t type) {
         switch (type) {
-            case 40: return 36;// NVFP4
-            case 42: return 18;// Q2_0
-            case 19: return 50;// IQ1_S
-            case 16: return 66;// IQ2_XXS
-            case 17: return 74;// IQ2_XS
-            case 22: return 82;// IQ2_S
-            case 23: return 136;// IQ4_XS
-            case 0: return 128;// F32, 32 weights per block
-            case 30: return 64;// BF16, 32 weights per block
+            case 40:
+                return 36;// NVFP4
+            case 42:
+                return 18;// Q2_0
+            case 19:
+                return 50;// IQ1_S
+            case 16:
+                return 66;// IQ2_XXS
+            case 17:
+                return 74;// IQ2_XS
+            case 22:
+                return 82;// IQ2_S
+            case 23:
+                return 136;// IQ4_XS
+            case 0:
+                return 128;// F32, 32 weights per block
+            case 30:
+                return 64;// BF16, 32 weights per block
             // The engine's int8Gemv types: only their row stride is needed here
             // (the GEMV itself is Q4_K/Q5_K/Q6_K/Q8_0/IQ2_XS/IQ2_S/IQ3_XXS/
             // IQ3_S via int8Gemv; IQ2_XS/IQ2_S can also reach inklingGemv).
-            case 8: return 34;// Q8_0
-            case 10: return 84;// Q2_K
-            case 11: return 110;// Q3_K
-            case 12: return 144;// Q4_K
-            case 13: return 176;// Q5_K
-            case 14: return 210;// Q6_K
-            case 18: return 98;// IQ3_XXS
-            case 21: return 110;// IQ3_S
-            default: return 0;
+            case 8:
+                return 34;// Q8_0
+            case 10:
+                return 84;// Q2_K
+            case 11:
+                return 110;// Q3_K
+            case 12:
+                return 144;// Q4_K
+            case 13:
+                return 176;// Q5_K
+            case 14:
+                return 210;// Q6_K
+            case 18:
+                return 98;// IQ3_XXS
+            case 21:
+                return 110;// IQ3_S
+            default:
+                return 0;
         }
     }
 
@@ -279,8 +297,8 @@ namespace tinycoder::gpu {
             float *passOut = nullptr;
             float *inpSA = nullptr;
             float *ffnInp = nullptr;
-            float *mixAttn = nullptr;// [m][3H] attention depth mix
-            float *mixH = nullptr;   // [m][H]  ffn / output depth mix
+            float *mixAttn = nullptr; // [m][3H] attention depth mix
+            float *mixH = nullptr;    // [m][H]  ffn / output depth mix
             float *msgMixed = nullptr;// [m][4H]
             float *pre0 = nullptr;
             float *pre1 = nullptr;
@@ -294,7 +312,7 @@ namespace tinycoder::gpu {
             float *o = nullptr;
             float *moeOut = nullptr;
             float *blockBank = nullptr;// [bankRows][m][H]
-            float *bankSnap = nullptr;// [bankRows][m][H]
+            float *bankSnap = nullptr; // [bankRows][m][H]
             float *q = nullptr;
             float *k = nullptr;
             float *v = nullptr;

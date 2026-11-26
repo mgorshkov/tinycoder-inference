@@ -14,7 +14,7 @@ cmake_minimum_required(VERSION 3.18.0)
 #   cmake --build build --config Release
 #   ctest --test-dir build            # when BUILD_TESTS=ON
 # ---------------------------------------------------------------------------
-project(tinycoder_inference VERSION 0.5.0 DESCRIPTION "High-Performant local inference engine" LANGUAGES CXX)
+project(tinycoder_inference VERSION 1.0.7 DESCRIPTION "High-Performant local inference engine" LANGUAGES CXX)
 enable_testing()
 
 # ---- Target architecture ----
@@ -335,7 +335,7 @@ endif()
 # / -mavx512vbmi2 flags for this TU.
 set(SIMD_MATMUL_AVX512_FLAGS "")
 if(ENABLE_AVX512)
-    set(SIMD_MATMUL_AVX512_FLAGS "${SIMD_MATMUL_AVX512_FLAGS} -mavx512f -mavx512bw -mfma")
+    set(SIMD_MATMUL_AVX512_FLAGS "${SIMD_MATMUL_AVX512_FLAGS} -mavx512f -mavx512bw -mf16c -mfma")
 endif()
 if(ENABLE_AVX512 AND ENABLE_AVX512_VBMI)
     set(SIMD_MATMUL_AVX512_FLAGS "${SIMD_MATMUL_AVX512_FLAGS} -mavx512vbmi")

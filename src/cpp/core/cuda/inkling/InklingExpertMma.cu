@@ -84,30 +84,36 @@
 namespace tinycoder::gpu {
     namespace {
 
-        constexpr int kMTile = 16;   // token rows in one MMA tile
-        constexpr int kNRow = 64;    // output rows (weight rows) per block
-        constexpr int kN8 = 8;       // one m8n8 tile per warp
-        constexpr int kWarps = 8;    // 8 x n8 = 64 output columns
+        constexpr int kMTile = 16;// token rows in one MMA tile
+        constexpr int kNRow = 64; // output rows (weight rows) per block
+        constexpr int kN8 = 8;    // one m8n8 tile per warp
+        constexpr int kWarps = 8; // 8 x n8 = 64 output columns
         constexpr int kThreads = kWarps * 32;
-        constexpr int kKChunk = 64;  // weights per k iteration (16 ints)
-        constexpr int kAInts = 16;   // int8 payload ints per 64-k row
-        constexpr int kAStride = 20; // 16 payload ints + 2 activation scales
-        constexpr int kBStride = 20; // 16 payload ints + 4 weight scales
-        constexpr int kSteps = 4;    // 16-weight MMA steps per 64-k chunk
+        constexpr int kKChunk = 64; // weights per k iteration (16 ints)
+        constexpr int kAInts = 16;  // int8 payload ints per 64-k row
+        constexpr int kAStride = 20;// 16 payload ints + 2 activation scales
+        constexpr int kBStride = 20;// 16 payload ints + 4 weight scales
+        constexpr int kSteps = 4;   // 16-weight MMA steps per 64-k chunk
 
         /// Bytes per quant block and how many 64-weight k chunks one block
         /// holds, per supported type.
-        template <uint32_t Type>
+        template<uint32_t Type>
         __host__ __device__ constexpr uint32_t blockBytes() {
             if constexpr (Type == 16) return 66;
-            else if constexpr (Type == 17) return 74;
-            else if constexpr (Type == 19) return 50;
-            else if constexpr (Type == 22) return 82;
-            else if constexpr (Type == 40) return 36;
-            else if constexpr (Type == 42) return 18;
-            else return 0;
+            else if constexpr (Type == 17)
+                return 74;
+            else if constexpr (Type == 19)
+                return 50;
+            else if constexpr (Type == 22)
+                return 82;
+            else if constexpr (Type == 40)
+                return 36;
+            else if constexpr (Type == 42)
+                return 18;
+            else
+                return 0;
         }
-        template <uint32_t Type>
+        template<uint32_t Type>
         __host__ __device__ constexpr uint32_t kChunksPerBlock() {
             // Q2_0 and NVFP4 are 64 weights per block; the IQ family is 256.
             return (Type == 40 || Type == 42) ? 1u : 4u;
@@ -144,7 +150,7 @@ namespace tinycoder::gpu {
         /// the sign bits, then (grid ^ mask) - mask negates exactly the masked
         /// bytes.  A per-byte loop costs ~3x more and is the difference
         /// between this kernel beating the 4-row slice path and losing to it.
-        template <uint32_t Type>
+        template<uint32_t Type>
         __device__ __forceinline__ void decodeStep(const uint8_t *blk,
                                                    uint32_t s32, uint32_t half,
                                                    int *dst, float *sc) {
@@ -303,7 +309,7 @@ namespace tinycoder::gpu {
         /// start at e*capacity (the padded [nExperts][capacity] layout); the
         /// layer-major graph passes a compact prefix-offset array instead, so a
         /// group of any size costs one weight decode and no padded storage.
-        template <uint32_t Type>
+        template<uint32_t Type>
         __global__ void __launch_bounds__(kThreads) expertMmaKernel(
                 const char *__restrict__ w, const int8_t *__restrict__ aq,
                 const float *__restrict__ ad, float *__restrict__ out,
@@ -319,7 +325,7 @@ namespace tinycoder::gpu {
 
             constexpr uint32_t kBlocksPerChunk = kChunksPerBlock<Type>();
             const uint32_t kBlocks = cols / (kKChunk * kBlocksPerChunk);
-            const uint32_t kbCount = cols / kKChunk;   // 64-k chunks per row
+            const uint32_t kbCount = cols / kKChunk;// 64-k chunks per row
             const uint32_t rowStride = kBlocks * kBB;
             const uint32_t n0 = blockIdx.x * kNRow;
             const uint32_t nRows = n0 + kNRow <= rows ? kNRow : rows - n0;
@@ -480,13 +486,13 @@ namespace tinycoder::gpu {
         // issued with the same operands as the 16-token tile's half, and the
         // Q8_1 quantizer and the epilogue are identical -- the output is
         // bit-identical to the kernel above, not merely inside the band.
-        constexpr int kWsNRow = 16;                 // output rows per block
-        constexpr int kWsNT = kWsNRow / kN8;        // n8 tiles per warp
-        constexpr int kWsWarps = 12;                // 12 x 16 tokens = M tile
-        constexpr int kWsMTile = kWsWarps * kMTile; // 192-token M tile
+        constexpr int kWsNRow = 16;                // output rows per block
+        constexpr int kWsNT = kWsNRow / kN8;       // n8 tiles per warp
+        constexpr int kWsWarps = 12;               // 12 x 16 tokens = M tile
+        constexpr int kWsMTile = kWsWarps * kMTile;// 192-token M tile
         constexpr int kWsThreads = kWsWarps * 32;
 
-        template <uint32_t Type>
+        template<uint32_t Type>
         __global__ void __launch_bounds__(kWsThreads) expertMmaStationary(
                 const char *__restrict__ w, const int8_t *__restrict__ aq,
                 const float *__restrict__ ad, float *__restrict__ out,
@@ -586,7 +592,7 @@ namespace tinycoder::gpu {
             // 64 B payload land in the same 32 B sector, so one 16 B request
             // per row instead of two (the fetch is sector-throughput bound, not
             // bandwidth bound -- see the kernel comment).
-            const uint32_t aRow = lane >> 1;// 16 token rows across the warp
+            const uint32_t aRow = lane >> 1; // 16 token rows across the warp
             const uint32_t aHalf = lane & 1u;// payload ints [8*aHalf, 8*aHalf+8)
             auto loadAct = [&](const uint32_t kb, const uint32_t tok, int4 &v0,
                                int4 &v1, float &d0, float &d1) {
@@ -720,12 +726,12 @@ namespace tinycoder::gpu {
         // operands from the same decodeStep and the same Q8_1 scales, and the
         // fp32 epilogue is the same multiply-accumulate expression.  The output
         // is bit-identical to both kernels above, not merely inside a band.
-        constexpr int kKtNRow = 128;  // output (weight) rows per block
-        constexpr int kKtWarps = 8;   // 8 warps x two m8n8 tiles = 128 columns
+        constexpr int kKtNRow = 128;// output (weight) rows per block
+        constexpr int kKtWarps = 8; // 8 warps x two m8n8 tiles = 128 columns
         constexpr int kKtThreads = kKtWarps * 32;
-        constexpr int kKtMTile = 32;  // token rows per M tile
+        constexpr int kKtMTile = 32;// token rows per M tile
 
-        template <uint32_t Type>
+        template<uint32_t Type>
         __host__ __device__ constexpr int ktileChunks() {
             // One staged k-tile is two 64-k chunks of the IQ family's 256-weight
             // block (one for Q2_0/NVFP4, whose block is 64 weights).  With 128
@@ -734,7 +740,7 @@ namespace tinycoder::gpu {
             return kChunksPerBlock<Type>() == 1u ? 1 : 2;
         }
 
-        template <uint32_t Type>
+        template<uint32_t Type>
         __global__ void __launch_bounds__(kKtThreads, 2) expertMmaKtile(
                 const char *__restrict__ w, const int8_t *__restrict__ aq,
                 const float *__restrict__ ad, float *__restrict__ out,
@@ -872,8 +878,7 @@ namespace tinycoder::gpu {
                                 sB + static_cast<int>(dChunk * kKtNRow) * kBStride +
                                 static_cast<int>(dKs) * 4;
                         float *dstSc = reinterpret_cast<float *>(
-                                               sB + static_cast<int>(dChunk * kKtNRow) *
-                                                            kBStride +
+                                               sB + static_cast<int>(dChunk * kKtNRow) * kBStride +
                                                kAInts) +
                                        dKs;
 #pragma unroll
@@ -1077,7 +1082,7 @@ namespace tinycoder::gpu {
             return true;
         }
 
-        template <uint32_t Type>
+        template<uint32_t Type>
         bool launchExpertMma(const void *w, const float *x, float *out,
                              uint32_t rows, uint32_t cols, uint32_t capacity,
                              const int32_t *counts, const int32_t *off,

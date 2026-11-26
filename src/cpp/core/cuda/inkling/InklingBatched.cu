@@ -752,7 +752,7 @@ namespace tinycoder::gpu {
         /// each lane accumulates four distances with the same ascending-k FMA
         /// chain and the same trailing `- sink` as the token path, so the table
         /// is bit-identical.
-        template <uint32_t DT, uint32_t TT>
+        template<uint32_t DT, uint32_t TT>
         __global__ void relBiasTableKernel(const float *__restrict__ r,
                                            const float *__restrict__ bias,
                                            const float *__restrict__ sink,
@@ -841,7 +841,7 @@ namespace tinycoder::gpu {
         /// the key range itself -- query t attends [firstKey, pos0+t], and the
         /// store kernel above has already written every key up to pos0+m-1, so
         /// no explicit mask is needed and no future key is in range.
-        template <uint32_t W>
+        template<uint32_t W>
         __global__ void attentionBatchKernel(
                 const float *__restrict__ q, const float *__restrict__ kCache,
                 const float *__restrict__ vCache,
@@ -873,8 +873,8 @@ namespace tinycoder::gpu {
                     table + (static_cast<size_t>(t) * nHeads + hq) * (extent + 1u);
 
             extern __shared__ float smem[];
-            float *sOut = smem;                     // [W][128]
-            float *trowS = smem + W * 128u;         // [extent + 1]
+            float *sOut = smem;            // [W][128]
+            float *trowS = smem + W * 128u;// [extent + 1]
             __shared__ float sMax[W];
             __shared__ float sSum[W];
 
@@ -970,7 +970,7 @@ namespace tinycoder::gpu {
         /// The union key range is walked once and each token's own slice bounds
         /// filter it; those bounds are warp-uniform, so the predication never
         /// splits a warp.
-        template <uint32_t W>
+        template<uint32_t W>
         __global__ void attentionTileKernel(
                 const float *__restrict__ q, const float *__restrict__ kCache,
                 const float *__restrict__ vCache,
@@ -1140,7 +1140,7 @@ namespace tinycoder::gpu {
         /// kernel rather than bit equality (the isolated kernel agrees to
         /// 3.6e-7 absolute, cosine 1.0).  It is used for batches of at least
         /// 128 tokens; smaller batches keep the exact tiled kernel.
-        template <uint32_t TT, uint32_t KT, uint32_t NT>
+        template<uint32_t TT, uint32_t KT, uint32_t NT>
         __global__ void attentionFlashKernel(const float *__restrict__ q,
                                              const float *__restrict__ kCache,
                                              const float *__restrict__ vCache,
@@ -1380,7 +1380,7 @@ namespace tinycoder::gpu {
         /// only.  The per-token tap order is the serial kernel's exactly
         /// (`residual`, static taps k ascending, then dynamic lags ascending),
         /// so this is bit-identical.
-        template <uint32_t NC>
+        template<uint32_t NC>
         __global__ void shortConvTileKernel(const float *__restrict__ cur,
                                             const float *__restrict__ w,
                                             const float *__restrict__ dyn,
@@ -1576,7 +1576,7 @@ namespace tinycoder::gpu {
             // in pair order inside a slab) is bit-identical to the serial one
             // and needs no atomics for the slot assignment.
             __shared__ int cursor[256];// nExperts <= 256 (ensureGraph)
-            __shared__ int plane[256];// this tile's expert ids, -1 = dead lane
+            __shared__ int plane[256]; // this tile's expert ids, -1 = dead lane
             __shared__ int hist[256];
             const uint32_t n = m * nUsed;
             const uint32_t tid = threadIdx.x;
@@ -1611,7 +1611,8 @@ namespace tinycoder::gpu {
                     const int pe = plane[j];
                     if (pe == e) {
                         if (j < tid) ++before;
-                        else if (j > tid) ++after;
+                        else if (j > tid)
+                            ++after;
                     }
                 }
                 if (live) {
@@ -2076,33 +2077,33 @@ namespace tinycoder::gpu {
         const uint64_t nPairs = m * nUsed;
 
         uint64_t need = 0;
-        need += 12 * m * H;                    // x prelude passOut inpSA ffnInp mixH
-                                               // normed postO convH o moeOut emb
-        need += 3 * m * H;                     // mixAttn: 3 query planes
-        need += 4 * m * H;                     // msgMixed: 4 planes
-        need += 3 * m * H;                     // pre0..2 (control outputs)
-        need += 3 * m * H;                     // nq nk nv (attention-input norms)
-        need += 2 * bankRows * m * H;          // block bank + snapshot
-        need += 3 * m * qDim;                  // q gateProj attnOut
-        need += 4 * m * kvDim;                 // k v kProj vProj
-        need += m * nHeads * nRel;             // rel
-        need += m * nHeads;                    // sink
-        need += m * nHeads * (extent + 1);     // rel-bias table
-        need += m * nExp;                      // router
-        need += 2 * m * nUsed;                 // gateUpRank + downRank
-        need += m * nUsed * 2 * expertFf;      // gateUp
-        need += m * nUsed * H;                 // expertOut
-        need += m * nConv * nKvHeads;          // dynamic conv taps
-        need += m * 64;                        // control rank activation
-        need += 2 * m;                         // control per-token RMS inverses
-        need += m * vocab;                     // logits
-        need += 2 * nPairs * H;                // gx + grouped down output
-        need += nPairs * 2 * expertFf;         // grouped gate/up
-        need += nPairs * expertFf;             // grouped activation
-        need += nPairs;                        // gwgt
-        need += m * nUsed;                     // wgt
-        need += 2 * m * nUsed;                 // idx + gpos (int32)
-        need += 2 * nPairs + 2 * (nExp + 1);   // gtok+gexp, gcount+goff (int32)
+        need += 12 * m * H;                 // x prelude passOut inpSA ffnInp mixH
+                                            // normed postO convH o moeOut emb
+        need += 3 * m * H;                  // mixAttn: 3 query planes
+        need += 4 * m * H;                  // msgMixed: 4 planes
+        need += 3 * m * H;                  // pre0..2 (control outputs)
+        need += 3 * m * H;                  // nq nk nv (attention-input norms)
+        need += 2 * bankRows * m * H;       // block bank + snapshot
+        need += 3 * m * qDim;               // q gateProj attnOut
+        need += 4 * m * kvDim;              // k v kProj vProj
+        need += m * nHeads * nRel;          // rel
+        need += m * nHeads;                 // sink
+        need += m * nHeads * (extent + 1);  // rel-bias table
+        need += m * nExp;                   // router
+        need += 2 * m * nUsed;              // gateUpRank + downRank
+        need += m * nUsed * 2 * expertFf;   // gateUp
+        need += m * nUsed * H;              // expertOut
+        need += m * nConv * nKvHeads;       // dynamic conv taps
+        need += m * 64;                     // control rank activation
+        need += 2 * m;                      // control per-token RMS inverses
+        need += m * vocab;                  // logits
+        need += 2 * nPairs * H;             // gx + grouped down output
+        need += nPairs * 2 * expertFf;      // grouped gate/up
+        need += nPairs * expertFf;          // grouped activation
+        need += nPairs;                     // gwgt
+        need += m * nUsed;                  // wgt
+        need += 2 * m * nUsed;              // idx + gpos (int32)
+        need += 2 * nPairs + 2 * (nExp + 1);// gtok+gexp, gcount+goff (int32)
         b.bytes = need * sizeof(float);
         size_t freeBefore = 0, totalBytes = 0;
         cudaMemGetInfo(&freeBefore, &totalBytes);
@@ -2270,8 +2271,7 @@ namespace tinycoder::gpu {
         // Refused *before* any state changes, so the caller can fall back to the
         // token-major path safely.
         if (model.config().headDim != 128u || cfg.numAttentionHeads > 32u ||
-            cfg.relativeExtent > 4096u || cfg.numAttentionHeads %
-                                                            cfg.numKVHeads != 0) {
+            cfg.relativeExtent > 4096u || cfg.numAttentionHeads % cfg.numKVHeads != 0) {
             err = "batched prefill needs headDim 128, <=32 heads, extent<=4096";
             return false;
         }
@@ -2390,8 +2390,8 @@ namespace tinycoder::gpu {
                         std::getenv("TINYCODER_INKLING_CTRL_DOWN_OLD") != nullptr;
                 if (H == 2304u && !downOld) {
                     controlDownWarpKernel<<<dim3((dev.ctrlRank + 7u) / 8u,
-                                                     (m + 31u) / 32u),
-                                                256, 0, s>>>(
+                                                 (m + 31u) / 32u),
+                                            256, 0, s>>>(
                             cur, H, msg, H,
                             static_cast<const float *>(dev.ctrlDown[c]), b.ctrlG,
                             dev.ctrlRank, H, b.ctrlInv, m);
@@ -2465,7 +2465,7 @@ namespace tinycoder::gpu {
                                        ? cfg.slidingWindowPattern[physIdx] != 0
                                        : true;
             float *hist = im->convState + static_cast<size_t>(slot) *
-                                                 im->histLen * im->sconvChannels;
+                                                  im->histLen * im->sconvChannels;
 
             // inpSA = x (before attention)
             if (!bcopyD2D(b.inpSA, b.x, static_cast<uint64_t>(m) * H * 4, s))
@@ -2691,7 +2691,7 @@ namespace tinycoder::gpu {
             // Diagnostic: run the whole routed MoE exactly as the decode graph
             // does (per token, per slot), to isolate the grouped path.
             static const bool moeToken = std::getenv("TINYCODER_INKLING_MOE") !=
-                                         nullptr &&
+                                                 nullptr &&
                                          std::strcmp(std::getenv("TINYCODER_INKLING_MOE"),
                                                      "token") == 0;
             if (moeToken) {
@@ -2728,7 +2728,10 @@ namespace tinycoder::gpu {
             }
             // Which grouped path this tensor takes.  Decided once, because it
             // is a property of the (type, env) pair and not of the chunk.
-            enum MoeMode { MoeMma, MoeSliced, MoeProbe, MoeGrouped };
+            enum MoeMode { MoeMma,
+                           MoeSliced,
+                           MoeProbe,
+                           MoeGrouped };
             MoeMode moeMode = MoeGrouped;
             if (!moeToken) {
                 if (fastMode()) {
@@ -2819,7 +2822,7 @@ namespace tinycoder::gpu {
                                             static_cast<size_t>(im->nExperts) *
                                                     sizeof(int32_t),
                                             cudaMemcpyDeviceToHost, s) !=
-                                            cudaSuccess ||
+                                    cudaSuccess ||
                             cudaStreamSynchronize(s) != cudaSuccess) {
                             cudaGetLastError();
                             err = "expert group-count readback failed";
@@ -2843,7 +2846,7 @@ namespace tinycoder::gpu {
                                             static_cast<size_t>(im->nExperts + 1) *
                                                     sizeof(int32_t),
                                             cudaMemcpyDeviceToHost, s) !=
-                                cudaSuccess ||
+                                    cudaSuccess ||
                             cudaStreamSynchronize(s) != cudaSuccess) {
                             cudaGetLastError();
                             err = "expert group-offset readback failed";
@@ -2935,9 +2938,9 @@ namespace tinycoder::gpu {
                                 dev.down, b.gact, b.gx, b.gcount, b.goff, nPairs,
                                 H, im->expertFf, im->nExperts, s);
                     if (!downOk && !inklingGemvBatchedGroupedOffsetsAsync(
-                                            w.ffnDownExps.type, dev.down, b.gact,
-                                            b.gx, H, im->expertFf, b.gcount,
-                                            b.goff, im->nExperts, s)) {
+                                           w.ffnDownExps.type, dev.down, b.gact,
+                                           b.gx, H, im->expertFf, b.gcount,
+                                           b.goff, im->nExperts, s)) {
                         err = "grouped expert down GEMV failed (type " +
                               std::to_string(w.ffnDownExps.type) + ")";
                         return false;
@@ -2963,7 +2966,7 @@ namespace tinycoder::gpu {
                     b.moeOut, static_cast<const float *>(dev.ffnPostConvW),
                     nullptr,
                     hist + static_cast<size_t>(im->histLen) *
-                                   (2 * im->kvDim + H),
+                                    (2 * im->kvDim + H),
                     b.convH, H, im->nConv, 1, true, postScale, m, s);
             bCombine(b.x, b.ffnInp, b.convH, m * H, 1.0f, 1.0f, s);
 

@@ -1,7 +1,7 @@
 #include "gpu/InklingKernels.hpp"
-#include <cuda_runtime.h>
 #include <cmath>
 #include <cstdint>
+#include <cuda_runtime.h>
 
 namespace tinycoder::gpu {
     namespace {
@@ -22,7 +22,10 @@ namespace tinycoder::gpu {
                     uint32_t best = 0;
                     float bv = -INFINITY;
                     for (uint32_t k = 0; k < nExperts; ++k) {
-                        if (sel[k] > bv) { bv = sel[k]; best = k; }
+                        if (sel[k] > bv) {
+                            bv = sel[k];
+                            best = k;
+                        }
                     }
                     idx[u] = static_cast<int32_t>(best);
                     sum += probs[best];
@@ -48,7 +51,7 @@ namespace tinycoder::gpu {
         }
 
         __global__ void situAllKernel(float *gateUp, uint32_t nUsed, uint32_t n,
-                                     const float *scale, float beta, float lb) {
+                                      const float *scale, float beta, float lb) {
             const uint32_t u = blockIdx.x;
             if (u >= nUsed) return;
             const float s = scale[u];

@@ -1529,7 +1529,7 @@ TEST(DequantizeTest, MXFP4BlockMatchesReferenceLayout) {
     // block_mxfp4: E8M0 byte e then qs[16]; element j = kvalues[low nibble of
     // qs[j]] * 2^(e-128), element j+16 = kvalues[high nibble].
     uint8_t blk[17] = {};
-    blk[0] = 127;// 2^(127-128) = 0.5 (halved E8M0 form)
+    blk[0] = 127;                  // 2^(127-128) = 0.5 (halved E8M0 form)
     std::memset(blk + 1, 0xE4, 16);// low nibble 4, high nibble 14
 
     float out[32];
@@ -1540,7 +1540,7 @@ TEST(DequantizeTest, MXFP4BlockMatchesReferenceLayout) {
         EXPECT_FLOAT_EQ(out[j + 16], static_cast<float>(kE2M1Doubled[14]) * 0.5f)
                 << "high nibble element " << j + 16;
     }
-    EXPECT_FLOAT_EQ(out[0], 2.0f);// 4 * 0.5
+    EXPECT_FLOAT_EQ(out[0], 2.0f);  // 4 * 0.5
     EXPECT_FLOAT_EQ(out[16], -4.0f);// -8 * 0.5
 
     float viaSwitch[32];
