@@ -1,7 +1,7 @@
 #include "gpu/InklingKernels.hpp"
-#include <cuda_runtime.h>
 #include <cmath>
 #include <cstdint>
+#include <cuda_runtime.h>
 
 namespace tinycoder::gpu {
     namespace {
@@ -45,8 +45,8 @@ namespace tinycoder::gpu {
         // shifts codegen).  The bound caps the allocation at 64, so the launch
         // is valid whatever the surrounding translation unit does.
         __global__ void __launch_bounds__(1024, 1)
-        mixKernel(const float *states, uint32_t nStates,
-                  const float *query, uint32_t hidden, float *out) {
+                mixKernel(const float *states, uint32_t nStates,
+                          const float *query, uint32_t hidden, float *out) {
             __shared__ float inv[kMaxMixStates];
             __shared__ float score[kMaxMixStates];
             const uint32_t lane = threadIdx.x & 31u;
@@ -132,7 +132,7 @@ namespace tinycoder::gpu {
         /// per key with an online softmax (the earlier version made three full
         /// passes over the cache), and the relative-bias row is staged in shared
         /// memory so the inner loop does not issue a global load per key.
-        template <uint32_t W>
+        template<uint32_t W>
         __global__ void attentionWarpKernel(
                 const float *__restrict__ q, const float *__restrict__ kCache,
                 const float *__restrict__ vCache, const float *__restrict__ table,
@@ -163,8 +163,8 @@ namespace tinycoder::gpu {
             const float *trow = table + static_cast<size_t>(hq) * (extent + 1u);
 
             extern __shared__ float smem[];
-            float *sOut = smem;                 // [W][128]
-            float *trowS = smem + W * 128u;     // [extent + 1]
+            float *sOut = smem;            // [W][128]
+            float *trowS = smem + W * 128u;// [extent + 1]
             __shared__ float sMax[W];
             __shared__ float sSum[W];
 
@@ -254,7 +254,7 @@ namespace tinycoder::gpu {
             return 8u;
         }
 
-        template <uint32_t W>
+        template<uint32_t W>
         inline void launchAttentionWarp(
                 const float *q, const float *kCache, const float *vCache,
                 const float *table, uint32_t pos, uint32_t firstKey,
@@ -290,9 +290,9 @@ namespace tinycoder::gpu {
 
         /// mixKernel with the current hidden state appended as one more state.
         __global__ void __launch_bounds__(1024, 1)
-        mixCurKernel(const float *states, uint32_t nStates,
-                     const float *cur, const float *query, uint32_t hidden,
-                     float *out) {
+                mixCurKernel(const float *states, uint32_t nStates,
+                             const float *cur, const float *query, uint32_t hidden,
+                             float *out) {
             __shared__ float inv[kMaxMixStates];
             __shared__ float score[kMaxMixStates];
             const uint32_t lane = threadIdx.x & 31u;
@@ -386,7 +386,7 @@ namespace tinycoder::gpu {
                 for (uint32_t d = 0; d < headDim; ++d) dot += qh[d] * kh[d];
                 const uint32_t dist = umin(pos - kp, extent);
                 mx = fmaxf(mx, dot * qkScale +
-                                   table[static_cast<size_t>(hq) * (extent + 1) + dist]);
+                                       table[static_cast<size_t>(hq) * (extent + 1) + dist]);
             }
             float sum = expf(-mx);
             for (uint32_t ki = 0; ki < nKeys; ++ki) {
@@ -411,7 +411,8 @@ namespace tinycoder::gpu {
                 const uint32_t dist = umin(pos - kp, extent);
                 const float w = expf(dot * qkScale +
                                      table[static_cast<size_t>(hq) * (extent + 1) + dist] -
-                                     mx) * inv;
+                                     mx) *
+                                inv;
                 const float *vh = vCache + static_cast<size_t>(kp) * nKvHeads * headDim +
                                   static_cast<size_t>(hkv) * headDim;
                 for (uint32_t d = 0; d < headDim; ++d) oh[d] += w * vh[d];

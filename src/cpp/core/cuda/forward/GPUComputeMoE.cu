@@ -49,6 +49,38 @@
 #include <vector>
 
 namespace tinycoder::gpu {
+    namespace {
+        // Prefill resident split through the TILED int8 GEMM: gather one
+        // resident expert's token rows into a compact activation matrix, run
+        // int8Gemm (tensor cores - the same kernel the trunk uses) and scatter
+        // the result into the rank-major combined table.  The warp-GEMV
+        // resident kernels are ~10x slower and serve the decode path only.
+        __global__ void kQ35GatherRows(const float *__restrict__ src,
+                                       const int32_t *__restrict__ rows,
+                                       float *__restrict__ dst,
+                                       uint32_t cols) {
+            const uint32_t i = blockIdx.x;
+            const uint32_t r = static_cast<uint32_t>(rows[i]);
+            for (uint32_t j = threadIdx.x; j < cols; j += blockDim.x) {
+                dst[static_cast<uint64_t>(i) * cols + j] =
+                        src[static_cast<uint64_t>(r) * cols + j];
+            }
+        }
+
+        __global__ void kQ35ScatterExpertRows(
+                const float *__restrict__ src, float *__restrict__ dst,
+                const int32_t *__restrict__ rankOf,
+                const int32_t *__restrict__ tokOf, uint32_t seqH,
+                uint32_t hidden) {
+            const uint32_t i = blockIdx.x;
+            const uint64_t base = static_cast<uint64_t>(rankOf[i]) * seqH +
+                                  static_cast<uint64_t>(tokOf[i]) * hidden;
+            for (uint32_t j = threadIdx.x; j < hidden; j += blockDim.x) {
+                dst[base + j] = src[static_cast<uint64_t>(i) * hidden + j];
+            }
+        }
+    }// namespace
+
 
     // ===== Expert cache build, resident arenas, qwen35 prefix driver =====
     bool GPUModel::buildExpertCache(std::string &errMsg) {
@@ -100,6 +132,17 @@ namespace tinycoder::gpu {
                      "upload did not record it)";
             return false;
         }
+        // Q8_0 slots (3.34 MB on the 35B-A3B) are not supported by the device
+        // cache: every fill faults inside cuMemcpyHtoDAsync on this driver,
+        // with the stage ring registered Portable or Mapped and with the host
+        // blobs pinned or staged (reproduced 2026-11-26).  Refuse the cache
+        // instead of crashing; the adapter then runs CPU experts, which is the
+        // hybrid default anyway.
+        if (expertType_ == kTypeQ8_0) {
+            errMsg = "buildExpertCache: Q8_0 expert slots are not supported "
+                     "by the device cache (CPU experts instead)";
+            return false;
+        }
         // Per-layer geometry: gateSlice/downSlice vary per layer when the
         // down-expert quant type differs between layers (Ornith Q4_K_M layers
         // 5-6 down=Q4_K 144 B/block vs the rest down=Q6_K 210 B/block), so
@@ -140,10 +183,21 @@ namespace tinycoder::gpu {
                         &arena, static_cast<size_t>(slotBytes * sets *
                                                     kExpertCacheWays));
                 if (e != cudaSuccess) {
+                    // Keep the HOST geometry (hostGate/Up/Down, row strides,
+                    // per-layer quant types, pinned flag) across the retry:
+                    // upload() recorded it per layer and it does not depend on
+                    // the arena size.  Only the device anchors are released.
+                    // Wiping the whole ExpertSlot here used to make every
+                    // already-processed layer fall back to the LAST layer's
+                    // host blob (wrong weights) on the smaller cache.
                     for (uint32_t l2 = 0; l2 <= L; ++l2) {
                         if (l2 < kExpertCacheLayers && expertCache_[l2].gateQ)
                             cudaFree(expertCache_[l2].gateQ);
-                        if (l2 < kExpertCacheLayers) expertCache_[l2] = ExpertSlot();
+                        if (l2 < kExpertCacheLayers) {
+                            expertCache_[l2].gateQ = nullptr;
+                            expertCache_[l2].upQ = nullptr;
+                            expertCache_[l2].downQ = nullptr;
+                        }
                     }
                     cudaGetLastError();
                     // Default ON: a smaller GPU expert cache is always better
@@ -347,7 +401,7 @@ namespace tinycoder::gpu {
                 }
                 cudaError_t eP = cudaHostRegister(
                         pp, static_cast<size_t>(slotBytes),
-                        cudaHostRegisterMapped | cudaHostRegisterPortable);
+                        cudaHostRegisterPortable);
                 if (eP != cudaSuccess) {
                     std::free(pp);
                     errMsg = std::string("cudaHostRegister(expertStage): ") +
@@ -363,6 +417,19 @@ namespace tinycoder::gpu {
         const uint8_t *srcGate = s.hostGate ? s.hostGate : expertHostGate_;
         const uint8_t *srcUp = s.hostUp ? s.hostUp : expertHostUp_;
         const uint8_t *srcDown = s.hostDown ? s.hostDown : expertHostDown_;
+        if (srcGate == nullptr || srcUp == nullptr || srcDown == nullptr) {
+            std::fprintf(stderr,
+                         "[arena] L=%u e=%u null expert source "
+                         "gate=%p up=%p down=%p slot=%p/%p/%p\n",
+                         L, e, static_cast<const void *>(srcGate),
+                         static_cast<const void *>(srcUp),
+                         static_cast<const void *>(srcDown),
+                         static_cast<const void *>(s.hostGate),
+                         static_cast<const void *>(s.hostUp),
+                         static_cast<const void *>(s.hostDown));
+            errMsg = "expert arena: null host expert source";
+            return nullptr;
+        }
         // ---- Page-lock this layer's expert blobs ONCE (2026-11-09) --------
         // The generic path stages every miss through a small pinned ring: a
         // host memcpy of the 1.8 MB slot (~0.4 ms at DRAM speed) plus a DMA.
@@ -373,12 +440,33 @@ namespace tinycoder::gpu {
         if (!s.hostPinned) {
             auto pinRange = [&](const uint8_t *p, uint64_t bytes) -> bool {
                 if (p == nullptr || bytes == 0) return false;
-                const uintptr_t a =
+                uintptr_t a =
                         reinterpret_cast<uintptr_t>(p) &
                         ~static_cast<uintptr_t>(4095);
-                const uint64_t off = reinterpret_cast<uintptr_t>(p) - a;
-                const uint64_t len =
-                        ((bytes + off + 4095) / 4096) * static_cast<uint64_t>(4096);
+                uintptr_t end = (reinterpret_cast<uintptr_t>(p) + bytes +
+                                 static_cast<uintptr_t>(4095)) &
+                                ~static_cast<uintptr_t>(4095);
+                // The layer blobs are contiguous inside one GGUF mmap, so the
+                // page-rounded ranges of adjacent layers OVERLAP by one page.
+                // Registering the overlap fails with
+                // "part or all of the requested memory range is already mapped"
+                // (seen on every second layer of the 35B Q8_0), which used to
+                // mark those layers unpinned and send their cache fills through
+                // the staged ring.  Trim the new range against the regions this
+                // layer's predecessors already registered, then register only
+                // the genuinely new pages; a range fully inside a recorded
+                // region needs no work.
+                for (const auto &r: expertPinnedRegions_) {
+                    const uintptr_t rs = reinterpret_cast<uintptr_t>(r.first);
+                    const uintptr_t re = rs + r.second;
+                    if (end <= rs || a >= re) continue;
+                    if (a >= rs && end <= re) return true;
+                    if (a >= rs) a = re;
+                    else if (end <= re)
+                        end = rs;
+                }
+                if (a >= end) return true;
+                const uint64_t len = end - a;
                 cudaError_t eR = cudaHostRegister(
                         reinterpret_cast<void *>(a), static_cast<size_t>(len),
                         cudaHostRegisterPortable);
@@ -541,6 +629,19 @@ namespace tinycoder::gpu {
         const uint8_t *srcGate = s.hostGate ? s.hostGate : expertHostGate_;
         const uint8_t *srcUp = s.hostUp ? s.hostUp : expertHostUp_;
         const uint8_t *srcDown = s.hostDown ? s.hostDown : expertHostDown_;
+        if (srcGate == nullptr || srcUp == nullptr || srcDown == nullptr) {
+            std::fprintf(stderr,
+                         "[cache] L=%u e=%u null expert source "
+                         "gate=%p up=%p down=%p slot=%p/%p/%p sets=%u\n",
+                         L, e, static_cast<const void *>(srcGate),
+                         static_cast<const void *>(srcUp),
+                         static_cast<const void *>(srcDown),
+                         static_cast<const void *>(s.hostGate),
+                         static_cast<const void *>(s.hostUp),
+                         static_cast<const void *>(s.hostDown), sets);
+            errMsg = "expert cache: null host expert source";
+            return nullptr;
+        }
         // Allocate (grow-on-demand) the pinned stage ring.  MEASURED
         // 2026-09-14 (TINYCODER_BW_SELFTEST): cudaHostAlloc (write-combined
         // mapped pages) drops the HOST-SIDE fill to 0.8 GB/s — the memcpy into
@@ -548,6 +649,9 @@ namespace tinycoder::gpu {
         // malloc + cudaHostRegister keeps the pages CACHEABLE so the host fill
         // runs at DRAM speed, and the bits then DMA over at the same wire
         // speed.  Registered pages must be page-aligned (posix_memalign).
+        // The ring is only ever a HOST source for H2D, so register it Portable
+        // (not Mapped): the large Q8_0 slot hit a driver fault inside
+        // cuMemcpyHtoDAsync when the ring was mapped into the device space.
         if (expertStageBytes_ < slotBytes) {
             for (uint32_t b = 0; b < kExpertStageBufs; ++b) {
                 if (expertStage_[b]) {
@@ -569,7 +673,7 @@ namespace tinycoder::gpu {
                 }
                 cudaError_t eP = cudaHostRegister(
                         pp, static_cast<size_t>(slotBytes),
-                        cudaHostRegisterMapped | cudaHostRegisterPortable);
+                        cudaHostRegisterPortable);
                 if (eP != cudaSuccess) {
                     std::free(pp);
                     errMsg = std::string("cudaHostRegister(expertStage): ") +
@@ -581,6 +685,13 @@ namespace tinycoder::gpu {
                                          cudaEventDisableTiming);
             }
             expertStageBytes_ = slotBytes;
+            if (std::getenv("TINYCODER_TRACE_MISS") != nullptr)
+                std::fprintf(stderr,
+                             "[stage grow] L=%u slotBytes=%llu ptrs=%p/%p/%p\n",
+                             L, static_cast<unsigned long long>(slotBytes),
+                             static_cast<void *>(expertStage_[0]),
+                             static_cast<void *>(expertStage_[1]),
+                             static_cast<void *>(expertStage_[kExpertStageBufs - 1]));
         }
         const uint32_t st = (expertStageFlag_++) % kExpertStageBufs;
         // TINYCODER_TRACE_MISS=1: per-miss wall time split (host fill + memcpy
@@ -605,6 +716,32 @@ namespace tinycoder::gpu {
         // copy already completed — the common case when fills run ahead).
         if (cudaEventQuery(expertStageEv_[st]) != cudaSuccess) {
             cudaEventSynchronize(expertStageEv_[st]);
+        }
+        if (trMiss) {
+            std::fprintf(stderr,
+                         "[cache fill] L=%u e=%u src=%p/%p/%p stage=%p "
+                         "slotBytes=%llu hostPinned=%d\n",
+                         L, e, static_cast<const void *>(srcGate),
+                         static_cast<const void *>(srcUp),
+                         static_cast<const void *>(srcDown),
+                         static_cast<void *>(expertStage_[st]),
+                         static_cast<unsigned long long>(slotBytes),
+                         static_cast<int>(s.hostPinned));
+        }
+        if (srcGate == nullptr || srcUp == nullptr || srcDown == nullptr ||
+            expertStage_[st] == nullptr) {
+            std::fprintf(stderr,
+                         "[cache] L=%u e=%u null expert source "
+                         "gate=%p up=%p down=%p stage=%p globals=%p/%p/%p\n",
+                         L, e, static_cast<const void *>(srcGate),
+                         static_cast<const void *>(srcUp),
+                         static_cast<const void *>(srcDown),
+                         static_cast<void *>(expertStage_[st]),
+                         static_cast<const void *>(expertHostGate_),
+                         static_cast<const void *>(expertHostUp_),
+                         static_cast<const void *>(expertHostDown_));
+            errMsg = "expert cache: null host expert source";
+            return nullptr;
         }
         std::memcpy(expertStage_[st],
                     srcGate + static_cast<uint64_t>(e) * gateSlice,
@@ -683,6 +820,228 @@ namespace tinycoder::gpu {
     // into moeDownTableHost_ rank-major, H2D'd once per layer), and the
     // combined table accumulates in the exact reference rank order.
     // ==========================================================================
+
+    // ---- Staged resident split (route 2) ------------------------------
+    // Measure, 2026-11-27: at the MoE shape (m~16, n=512, k=2048) the int8
+    // tensor-core GEMM runs at 479 GFLOP/s (tools/int8_m16_probe), 1.8x the
+    // 264 GFLOP/s needed to consume an 8.8 GB/s PCIe stream.  So the GPU can
+    // compute a share f of the experts from VRAM *while the CPU streams the
+    // rest from DRAM*, and the two channels add: balanced at
+    // f/8.8 = (1-f)/9.5 -> f ~ 0.48 -> ~1.9 s prefill (~270 pp512).
+    // The arena is ONE buffer reused by every layer, filled with contiguous
+    // per-matrix copies at the start of each layer, so it costs
+    // S*(2*gateSlice+downSlice) of VRAM instead of that per layer.
+    bool GPUModel::buildStagedArena(uint32_t expertsPerLayer,
+                                    std::string &errMsg) {
+        if (expertType_ != kTypeQ8_0) {
+            errMsg = "buildStagedArena: Q8_0 experts only (type " +
+                     std::to_string(expertType_) + ")";
+            return false;
+        }
+        if (expertFF_ == 0 || expertHM_ == 0 || expertCount_ == 0 ||
+            expertHostGate_ == nullptr || expertHostDown_ == nullptr) {
+            errMsg = "buildStagedArena: missing host expert geometry";
+            return false;
+        }
+        const uint64_t gateSlice =
+                static_cast<uint64_t>(expertFF_) * expertRowBytesGate_;
+        const uint64_t downSlice =
+                static_cast<uint64_t>(expertHM_) * expertRowBytesDown_;
+        if (gateSlice == 0 || downSlice == 0) {
+            errMsg = "buildStagedArena: zero row geometry";
+            return false;
+        }
+        const uint32_t S = std::min<uint32_t>(
+                std::min<uint32_t>(expertsPerLayer, expertCount_),
+                kResidentMaxExperts);
+        if (S == 0) {
+            errMsg = "buildStagedArena: zero experts staged";
+            return false;
+        }
+        const uint64_t bytes =
+                static_cast<uint64_t>(S) * (2 * gateSlice + downSlice);
+        for (uint32_t b = 0; b < kStageBufs; ++b) {
+            cudaError_t eb = cudaMalloc(&stageArena_[b],
+                                        static_cast<size_t>(bytes));
+            if (eb != cudaSuccess) {
+                errMsg = std::string("cudaMalloc(stageArena): ") +
+                         cudaGetErrorString(eb);
+                for (uint32_t b2 = 0; b2 < b; ++b2) {
+                    cudaFree(stageArena_[b2]);
+                    stageArena_[b2] = nullptr;
+                }
+                return false;
+            }
+        }
+        stageArenaBytes_ = bytes;
+        stageExperts_ = S;
+        if (cudaStreamCreateWithFlags(&stageCopyStream_,
+                                      cudaStreamNonBlocking) != cudaSuccess) {
+            stageCopyStream_ = nullptr;
+        }
+        for (uint32_t b = 0; b < kStageBufs; ++b) {
+            cudaEventCreateWithFlags(&stageCopyDone_[b],
+                                     cudaEventDisableTiming);
+            cudaEventCreateWithFlags(&stageCompDone_[b],
+                                     cudaEventDisableTiming);
+            // Buffers start free.
+            cudaEventRecord(stageCompDone_[b], g_stream);
+        }
+        residentRowBytesGate_ = expertRowBytesGate_;
+        residentRowBytesDown_ = expertRowBytesDown_;
+        if (moeResidentCount_.size() < kResidentLayers)
+            moeResidentCount_.assign(kResidentLayers, 0);
+        if (moeResidentIds_.size() < kResidentLayers)
+            moeResidentIds_.resize(kResidentLayers);
+        for (uint32_t L = 0; L < kResidentLayers; ++L) {
+            for (uint32_t i = 0; i < 256; ++i) residentIdxMap_[L][i] = -1;
+        }
+        const uint32_t nGpu = geom_.numGpuLayers ? geom_.numGpuLayers
+                                                 : geom_.numLayers;
+        // Matrix-major arena: [gates][ups][downs], so each matrix is ONE
+        // contiguous run of S slices and the per-layer fill is 3 copies.
+        for (uint32_t L = 0; L < nGpu && L < kResidentLayers; ++L) {
+            uint8_t *arena = stageArena_[L % kStageBufs];
+            const uint8_t *upBase =
+                    arena + static_cast<uint64_t>(S) * gateSlice;
+            const uint8_t *downBase =
+                    arena + 2 * static_cast<uint64_t>(S) * gateSlice;
+            moeResidentCount_[L] = S;
+            moeResidentIds_[L].clear();
+            moeResidentIds_[L].reserve(S);
+            for (uint32_t i = 0; i < S; ++i) {
+                residentGateBase_[L][i] =
+                        arena + static_cast<uint64_t>(i) * gateSlice;
+                residentUpBase_[L][i] =
+                        upBase + static_cast<uint64_t>(i) * gateSlice;
+                residentDownBase_[L][i] =
+                        downBase + static_cast<uint64_t>(i) * downSlice;
+                residentIdxMap_[L][i] = static_cast<int32_t>(i);
+                moeResidentIds_[L].push_back(i);
+            }
+        }
+        const uint32_t maskWords = (expertCount_ + 63u) / 64u;
+        residentMaskHost_.assign(kResidentLayers,
+                                 std::vector<uint64_t>(maskWords, 0));
+        for (uint32_t L = 0; L < kResidentLayers; ++L) {
+            for (uint32_t e = 0; e < S && e < expertCount_; ++e) {
+                residentMaskHost_[L][e / 64u] |= (uint64_t(1) << (e % 64u));
+            }
+        }
+        // Pinned host mirror: [layer][gates][ups][downs], filled once here so
+        // the per-layer H2D is a real async copy.  Falls back to the pageable
+        // page-cache pointers if the allocation is refused.
+        const uint64_t slotBytes = 2 * gateSlice + downSlice;
+        const uint64_t totalPinned =
+                static_cast<uint64_t>(nGpu) * S * slotBytes;
+        void *pin = nullptr;
+        if (cudaHostAlloc(&pin, static_cast<size_t>(totalPinned),
+                          cudaHostAllocPortable) == cudaSuccess) {
+            stagePinned_ = static_cast<uint8_t *>(pin);
+            stagePinnedBytes_ = totalPinned;
+            for (uint32_t L = 0; L < nGpu; ++L) {
+                const uint8_t *srcGate = expertCache_[L].hostGate
+                                                 ? expertCache_[L].hostGate
+                                                 : expertHostGate_;
+                const uint8_t *srcUp = expertCache_[L].hostUp
+                                               ? expertCache_[L].hostUp
+                                               : expertHostUp_;
+                const uint8_t *srcDown = expertCache_[L].hostDown
+                                                 ? expertCache_[L].hostDown
+                                                 : expertHostDown_;
+                if (srcGate == nullptr || srcUp == nullptr ||
+                    srcDown == nullptr) {
+                    break;
+                }
+                uint8_t *dst = stagePinned_ +
+                               static_cast<uint64_t>(L) * S * slotBytes;
+                std::memcpy(dst, srcGate,
+                            static_cast<size_t>(S * gateSlice));
+                std::memcpy(dst + static_cast<uint64_t>(S) * gateSlice, srcUp,
+                            static_cast<size_t>(S * gateSlice));
+                std::memcpy(dst + 2 * static_cast<uint64_t>(S) * gateSlice,
+                            srcDown, static_cast<size_t>(S * downSlice));
+            }
+        }
+        residentActive_ = true;
+        return true;
+    }
+
+    // Copy this layer's staged experts into the shared arena.  The copy is
+    // enqueued on g_stream BEFORE the CPU callback runs, so the PCIe transfer
+    // overlaps the CPU computing the non-staged experts from DRAM.
+    void GPUModel::stageResidentExperts(uint32_t L) {
+        if (stageExperts_ == 0 || stageArena_[0] == nullptr) return;
+        if (L >= kResidentLayers || moeResidentCount_[L] == 0) return;
+        const uint64_t gateSlice =
+                static_cast<uint64_t>(expertFF_) * expertRowBytesGate_;
+        const uint64_t downSlice =
+                static_cast<uint64_t>(expertHM_) * expertRowBytesDown_;
+        const uint8_t *srcGate = expertCache_[L].hostGate
+                                         ? expertCache_[L].hostGate
+                                         : expertHostGate_;
+        const uint8_t *srcUp = expertCache_[L].hostUp
+                                       ? expertCache_[L].hostUp
+                                       : expertHostUp_;
+        const uint8_t *srcDown = expertCache_[L].hostDown
+                                         ? expertCache_[L].hostDown
+                                         : expertHostDown_;
+        if (srcGate == nullptr || srcUp == nullptr || srcDown == nullptr) return;
+        const uint32_t S = stageExperts_;
+        if (stagePinned_ != nullptr) {
+            // Pinned source: a genuinely asynchronous copy that overlaps the
+            // CPU callback instead of serialising on it.
+            const uint64_t slotBytes = 2 * gateSlice + downSlice;
+            const uint64_t base =
+                    static_cast<uint64_t>(L) * S * slotBytes;
+            if (base + static_cast<uint64_t>(S) * slotBytes <=
+                stagePinnedBytes_) {
+                const uint8_t *src = stagePinned_ + base;
+                srcGate = src;
+                srcUp = src + static_cast<uint64_t>(S) * gateSlice;
+                srcDown = src + 2 * static_cast<uint64_t>(S) * gateSlice;
+            }
+        }
+        const uint32_t buf = L % kStageBufs;
+        uint8_t *const arena = stageArena_[buf];
+        uint8_t *dstGate = arena;
+        uint8_t *dstUp = arena + static_cast<uint64_t>(S) * gateSlice;
+        uint8_t *dstDown = arena + 2 * static_cast<uint64_t>(S) * gateSlice;
+        if (stageCopyStream_ != nullptr) {
+            // Do not overwrite a buffer whose compute has not finished.
+            cudaStreamWaitEvent(stageCopyStream_, stageCompDone_[buf], 0);
+            cudaMemcpyAsync(dstGate, srcGate,
+                            static_cast<size_t>(S * gateSlice),
+                            cudaMemcpyHostToDevice, stageCopyStream_);
+            cudaMemcpyAsync(dstUp, srcUp, static_cast<size_t>(S * gateSlice),
+                            cudaMemcpyHostToDevice, stageCopyStream_);
+            cudaMemcpyAsync(dstDown, srcDown,
+                            static_cast<size_t>(S * downSlice),
+                            cudaMemcpyHostToDevice, stageCopyStream_);
+            cudaEventRecord(stageCopyDone_[buf], stageCopyStream_);
+        } else {
+            cudaMemcpyAsync(dstGate, srcGate,
+                            static_cast<size_t>(S * gateSlice),
+                            cudaMemcpyHostToDevice, g_stream);
+            cudaMemcpyAsync(dstUp, srcUp, static_cast<size_t>(S * gateSlice),
+                            cudaMemcpyHostToDevice, g_stream);
+            cudaMemcpyAsync(dstDown, srcDown,
+                            static_cast<size_t>(S * downSlice),
+                            cudaMemcpyHostToDevice, g_stream);
+        }
+    }
+
+    // Wait for a layer's staged copy before its compute reads the buffer, and
+    // release the buffer once the compute has consumed it.
+    void GPUModel::stageWait(uint32_t L) {
+        if (stageCopyStream_ == nullptr) return;
+        cudaStreamWaitEvent(g_stream, stageCopyDone_[L % kStageBufs], 0);
+    }
+
+    void GPUModel::stageRelease(uint32_t L) {
+        if (stageCopyStream_ == nullptr) return;
+        cudaEventRecord(stageCompDone_[L % kStageBufs], g_stream);
+    }
 
     bool GPUModel::buildResidentArenas(std::string &errMsg) {
         // Geometry is recorded by the hybrid upload (same fields as the expert
@@ -1040,7 +1399,7 @@ namespace tinycoder::gpu {
             kQGemvQ8_0xQ8K_BatchGU<<<dim3((combinedRows + 7) / 8, jn),
                                      dim3(32, 8), 0, g_stream>>>(
                     wqTable, q8kN_, s.moeGateUpP, s.moeGateUp2P, expertFF_,
-                    gBlocks, expertRowBytesGate_, combinedRows);
+                    gBlocks, expertRowBytesGate_, combinedRows, nullptr);
             kSiluMulBatch<<<dim3((expertFF_ + 255) / 256, jn), 256, 0,
                             g_stream>>>(s.moeGateUpP, s.moeGateUp2P, expertFF_,
                                         jn);
@@ -1050,7 +1409,7 @@ namespace tinycoder::gpu {
                                         g_stream>>>(
                     wqTable, moeQ8kDownP_, downOut,
                     reinterpret_cast<const int32_t *>(residentRankOf_), H,
-                    dBlocks, expertRowBytesDown_, downStrideB, H);
+                    dBlocks, expertRowBytesDown_, downStrideB, H, nullptr);
         }
     }
 
@@ -1062,151 +1421,106 @@ namespace tinycoder::gpu {
     // the full rank order).  We gather the resident ranks only and reuse the
     // SAME compact 4-kernel pipeline per (rank, token-group); the Q8_0 fast
     // path matches the CPU reference bit-for-bit by construction.
+    // Tiled-GEMM prefill resident split (2026-11-27).  Per resident expert:
+    // gather its token rows -> int8Gemm(gate) -> int8Gemm(up) -> silu ->
+    // int8Gemm(down) -> scatter into the rank-major combined table.  int8Gemm
+    // needs m >= 8, so a short token group is padded with duplicates of its
+    // first row (the padding rows are simply not scattered).
     void GPUModel::scheduleResidentExpertsBatch(uint32_t L, float *downOut,
                                                 uint32_t seqLen) {
         if (!residentActive_) return;
         if (L >= kResidentLayers) return;
-        const uint32_t cnt = moeResidentCount_[L];
-        if (cnt == 0) return;
+        if (moeResidentCount_[L] == 0) return;
         const uint32_t eu = expertUsed_;
-        if (eu == 0) return;
-        // NOTE: named `scr` — the token loop below uses `s` for the token index.
-        DeviceScratch &scr = scratch_;
+        if (eu == 0 || seqLen == 0) return;
         const uint32_t H = expertHM_;
-        const uint32_t seqH = static_cast<uint32_t>(seqLen) * H;
-        const uint32_t gBlocks = (expertType_ == kTypeQ5_0 || expertType_ == kTypeQ8_0)
-                                         ? (H + 31) / 32
-                                         : (H + 255) / 256;
-        const uint32_t dBlocks = (expertType_ == kTypeQ5_0 || expertType_ == kTypeQ8_0)
-                                         ? (expertFF_ + 31) / 32
-                                         : (expertFF_ + 255) / 256;
-        const uint8_t *const *wqTable =
-                reinterpret_cast<const uint8_t *const *>(residentRankWq_);
-        // Lower the per-(token, rank) routed expert ids to their RESIDENT slot
-        // (-1 = non-resident: the CPU callback already filled that down row).
-        std::vector<int32_t> tokSlot(static_cast<size_t>(seqLen) * eu);
+        const uint32_t seqH = seqLen * H;
+        const uint32_t gBlocks = H / 32;
+        const uint32_t dBlocks = expertFF_ / 32;
+
+        auto ensure = [](void **p, uint64_t *bytes, size_t need) -> bool {
+            if (*p != nullptr && *bytes >= need) return true;
+            if (*p != nullptr) cudaFree(*p);
+            *p = nullptr;
+            *bytes = 0;
+            if (cudaMalloc(p, need) != cudaSuccess) {
+                *p = nullptr;
+                return false;
+            }
+            *bytes = need;
+            return true;
+        };
+        const size_t xFloats = static_cast<size_t>(seqLen) * H;
+        const size_t guFloats = static_cast<size_t>(seqLen) * expertFF_;
+        if (!ensure(reinterpret_cast<void **>(&residentGatherX_),
+                    &residentGatherXBytes_, xFloats * sizeof(float)) ||
+            !ensure(reinterpret_cast<void **>(&residentGuA_),
+                    &residentGuABytes_, guFloats * sizeof(float)) ||
+            !ensure(reinterpret_cast<void **>(&residentGuB_),
+                    &residentGuBBytes_, guFloats * sizeof(float)) ||
+            !ensure(reinterpret_cast<void **>(&residentDownRow_),
+                    &residentDownRowBytes_, xFloats * sizeof(float)) ||
+            !ensure(reinterpret_cast<void **>(&residentTokDev_),
+                    &residentTokDevBytes_, sizeof(int32_t) * seqLen) ||
+            !ensure(reinterpret_cast<void **>(&residentRankDev_),
+                    &residentRankDevBytes_, sizeof(int32_t) * seqLen)) {
+            return;
+        }
+
+        // ---- group the routed (token, rank) pairs by resident expert ----
+        std::vector<std::vector<std::pair<uint32_t, uint32_t>>> groups(expertCount_);
         for (uint32_t s = 0; s < seqLen; ++s) {
             const int32_t *row = moeRouterIdxHost_.data() +
                                  static_cast<size_t>(s) * eu;
             for (uint32_t r = 0; r < eu; ++r) {
                 const int32_t e0 = row[r];
-                const uint32_t ue = (e0 >= 0) ? static_cast<uint32_t>(e0) : 0u;
-                tokSlot[static_cast<size_t>(s) * eu + r] =
-                        (e0 >= 0 && ue < expertCount_)
-                                ? residentIdxMap_[L][ue]
-                                : -1;
+                if (e0 < 0 || static_cast<uint32_t>(e0) >= expertCount_)
+                    continue;
+                if (residentIdxMap_[L][e0] < 0) continue;// non-resident: CPU
+                groups[e0].push_back({s, r});
             }
         }
-        // Per token: quantize that token's norm ONCE into q8kN_, then for each
-        // resident rank that routed to a resident slot run the exact same
-        // compact 4-kernel pipeline as the decode path (one activation per
-        // launch set).  The down row is written at [rank][s*H] in the combined
-        // rank-major table; the accumulation kernel later reads all ranks in
-        // the exact reference order.  This is CORRECTNESS-first (the decode
-        // path has the fully-batched version; prefill is bounded by the trunk
-        // GEMMs anyway).
-        // Gate/up are expertType_ (Q8_0 or Q4_K), down is expertDownType_;
-        // the 256-wide Q8_K activation layout for the Q4_K pipeline is
-        // kQ8K_STRIDE vs the 32-wide Q8_32 (kQ8_0x32_STRIDE) for Q8_0.
-        const bool isQ4 = (expertType_ == kTypeQ4K);
-        const uint32_t actStride = isQ4 ? kQ8K_STRIDE : kQ8_0x32_STRIDE;
-        for (uint32_t s = 0; s < seqLen; ++s) {
-            const float *normRow = scr.norm + static_cast<size_t>(s) * H;
-            const uint64_t needN = static_cast<uint64_t>(gBlocks) * actStride;
-            if (q8kN_ == nullptr || q8kNBytes_ < needN) {
-                if (q8kN_) cudaFree(q8kN_);
-                q8kN_ = nullptr;
-                q8kNBytes_ = 0;
-                cudaMalloc(&q8kN_, static_cast<size_t>(needN));
-                q8kNBytes_ = needN;
+        std::vector<int32_t> tokHost, rankHost;
+        for (uint32_t e = 0; e < expertCount_; ++e) {
+            const auto &mem = groups[e];
+            if (mem.empty()) continue;
+            const int32_t slot = residentIdxMap_[L][e];
+            const uint32_t us = static_cast<uint32_t>(slot);
+            // Pad to int8Gemm's m >= 8 floor with duplicates of row 0.
+            const uint32_t cnt = static_cast<uint32_t>(mem.size());
+            const uint32_t n = std::max<uint32_t>(cnt, 8u);
+            tokHost.clear();
+            rankHost.clear();
+            for (uint32_t i = 0; i < n; ++i) {
+                const uint32_t pick = (i < cnt) ? i : 0u;
+                tokHost.push_back(static_cast<int32_t>(mem[pick].first));
+                rankHost.push_back(static_cast<int32_t>(mem[pick].second));
             }
-            if (isQ4) {
-                kQuantizeQ8K<<<gBlocks, 256, 0, g_stream>>>(normRow, q8kN_, H);
-            } else {
-                launchQuantQ8_0x32(normRow, q8kN_, H);
+            cudaMemcpyAsync(residentTokDev_, tokHost.data(),
+                            n * sizeof(int32_t), cudaMemcpyHostToDevice,
+                            g_stream);
+            cudaMemcpyAsync(residentRankDev_, rankHost.data(),
+                            n * sizeof(int32_t), cudaMemcpyHostToDevice,
+                            g_stream);
+            kQ35GatherRows<<<n, 256, 0, g_stream>>>(
+                    scratch_.norm, residentTokDev_, residentGatherX_, H);
+            const bool okGate = int8Gemm(
+                    kTypeQ8_0, residentGateBase_[L][us], residentGatherX_,
+                    residentGuA_, n, expertFF_, H, gBlocks, g_stream);
+            const bool okUp = okGate && int8Gemm(
+                                                kTypeQ8_0, residentUpBase_[L][us], residentGatherX_,
+                                                residentGuB_, n, expertFF_, H, gBlocks, g_stream);
+            if (!okGate || !okUp) continue;// leave the CPU rows as they are
+            kSiluMul<<<(n * expertFF_ + 255) / 256, 256, 0, g_stream>>>(
+                    residentGuA_, residentGuB_, n * expertFF_);
+            if (!int8Gemm(kTypeQ8_0, residentDownBase_[L][us], residentGuA_,
+                          residentDownRow_, n, H, expertFF_, dBlocks,
+                          g_stream)) {
+                continue;
             }
-            // Per resident rank, if token s routed to its slot, compute.
-            for (uint32_t r = 0; r < eu; ++r) {
-                const int32_t slot = tokSlot[static_cast<size_t>(s) * eu + r];
-                if (slot < 0) continue;
-                const uint32_t us = static_cast<uint32_t>(slot);
-                const uint8_t *wq[3] = {residentGateBase_[L][us],
-                                        residentUpBase_[L][us],
-                                        residentDownBase_[L][us]};
-                // ONE-entry wq table (rank j=0 compact) + rankOf [r].
-                const uint8_t *const wqPtr[3] = {wq[0], wq[1], wq[2]};
-                cudaMemcpyAsync(residentRankWq_, wqPtr, 3 * sizeof(uint8_t *),
-                                cudaMemcpyHostToDevice, g_stream);
-                const int32_t rankOfOne[1] = {static_cast<int32_t>(r)};
-                cudaMemcpyAsync(residentRankOf_, rankOfOne, sizeof(int32_t),
-                                cudaMemcpyHostToDevice, g_stream);
-                const uint32_t combinedRows = 2u * expertFF_;
-                if (isQ4) {
-                    kQGemvKxQ8K_BatchGU<kTypeQ4K><<<dim3((combinedRows + 7) / 8, 1),
-                                                    dim3(32, 8), 0, g_stream>>>(
-                            wqTable, q8kN_, scr.moeGateUpP, scr.moeGateUp2P,
-                            expertFF_, gBlocks, expertRowBytesGate_,
-                            combinedRows);
-                } else {
-                    kQGemvQ8_0xQ8K_BatchGU<<<dim3((combinedRows + 7) / 8, 1),
-                                             dim3(32, 8), 0, g_stream>>>(
-                            wqTable, q8kN_, scr.moeGateUpP, scr.moeGateUp2P,
-                            expertFF_, gBlocks, expertRowBytesGate_,
-                            combinedRows);
-                }
-                kSiluMulBatch<<<dim3((expertFF_ + 255) / 256, 1), 256, 0, g_stream>>>(
-                        scr.moeGateUpP, scr.moeGateUp2P, expertFF_, 1);
-                const uint64_t needP = static_cast<uint64_t>(dBlocks) * actStride;
-                if (moeQ8kDownPBytes_ < needP) {
-                    if (moeQ8kDownP_) cudaFree(moeQ8kDownP_);
-                    moeQ8kDownP_ = nullptr;
-                    moeQ8kDownPBytes_ = 0;
-                    cudaMalloc(&moeQ8kDownP_, static_cast<size_t>(needP));
-                    moeQ8kDownPBytes_ = needP;
-                }
-                if (isQ4) {
-                    kQuantizeQ8K_Batch<<<dim3(dBlocks, 1), 256, 0, g_stream>>>(
-                            scr.moeGateUpP, moeQ8kDownP_, expertFF_, 1,
-                            static_cast<uint32_t>(dBlocks * kQ8K_STRIDE));
-                } else {
-                    kQuantizeQ8_0x32_Batch<<<dim3(dBlocks, 1), 32, 0, g_stream>>>(
-                            scr.moeGateUpP, moeQ8kDownP_, expertFF_, 1,
-                            static_cast<uint32_t>(dBlocks * kQ8_0x32_STRIDE));
-                }
-                // The down kernel writes out[rankOf[j]*outStride + row]; pass
-                // the FULL table base + outStride = seqH so the rank row lands
-                // at [r*seqH + row].  The per-token row within the rank slab
-                // is NOT explicit here — this path computes ONE token per
-                // launch set, and the kernel's row index (blockIdx.x*8+ty)
-                // already IS the token's H offset, so out[r*seqH + row] is the
-                // exact token row.  (Passing downRow with outStride=H would
-                // double-add the rank.)
-                // Rank-slab base = downOut + this token's in-rank offset; the
-                // kernel adds rankOf[j]*outStride (= r*seqH) + row, so the row
-                // lands at [r*seqH + s*H + row] — the exact combined-table
-                // slot the rank-order accumulation reads for token s.  Passing
-                // downOut alone with outStride=seqH would write token 0's rows
-                // for EVERY token (later tokens' resident contributions would
-                // be lost from the accumulate).
-                if (isQ4) {
-                    kQGemvKxQ8K_BatchDownR<kTypeQ6K><<<dim3((H + 7) / 8, 1),
-                                                       dim3(32, 8), 0, g_stream>>>(
-                            wqTable, moeQ8kDownP_,
-                            downOut + static_cast<uint64_t>(s) * H,
-                            reinterpret_cast<const int32_t *>(residentRankOf_), H,
-                            dBlocks, expertRowBytesDown_,
-                            static_cast<uint32_t>(dBlocks * kQ8K_STRIDE), seqH);
-                } else {
-                    kQGemvQ8_0xQ8K_BatchDownR<<<dim3((H + 7) / 8, 1), dim3(32, 8),
-                                                0, g_stream>>>(
-                            wqTable, moeQ8kDownP_,
-                            downOut + static_cast<uint64_t>(s) * H,
-                            reinterpret_cast<const int32_t *>(residentRankOf_), H,
-                            dBlocks, expertRowBytesDown_,
-                            static_cast<uint32_t>(dBlocks * kQ8_0x32_STRIDE),
-                            seqH);
-                }
-            }
+            kQ35ScatterExpertRows<<<cnt, 256, 0, g_stream>>>(
+                    residentDownRow_, downOut, residentRankDev_,
+                    residentTokDev_, seqH, H);
         }
     }
 

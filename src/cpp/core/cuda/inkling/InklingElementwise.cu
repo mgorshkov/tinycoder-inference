@@ -1,7 +1,7 @@
 #include "gpu/InklingKernels.hpp"
-#include <cuda_runtime.h>
 #include <cmath>
 #include <cstdint>
+#include <cuda_runtime.h>
 
 namespace tinycoder::gpu {
     namespace {
@@ -202,7 +202,8 @@ namespace tinycoder::gpu {
             a.out[c][i] = c0 - tanhf(fv) * c0 + tanhf(gv) * m0;
         }
 
-        __global__ void clipKernel(float *x, uint32_t len, const float *scale,                                   float threshold) {            const uint32_t r = blockIdx.x;
+        __global__ void clipKernel(float *x, uint32_t len, const float *scale, float threshold) {
+            const uint32_t r = blockIdx.x;
             float *row = x + static_cast<size_t>(r) * len;
             __shared__ float s[256];
             double ss = 0.0;
@@ -289,7 +290,7 @@ namespace tinycoder::gpu {
     void kInklingControlDownFused(const InklingControlArgs &a, void *stream) {
         if (a.nCtl == 0) return;
         controlDownFusedKernel<<<a.nCtl * a.rank, 256, 0,
-                                reinterpret_cast<cudaStream_t>(stream)>>>(a);
+                                 reinterpret_cast<cudaStream_t>(stream)>>>(a);
     }
     void kInklingControlMixFused(const InklingControlArgs &a, void *stream) {
         if (a.nCtl == 0) return;

@@ -24,8 +24,8 @@ SOFTWARE.
 
 #include "MemHints.hpp"
 #include "Model.hpp"
-#include "gpu/InklingGPU.hpp"
 #include "ThreadPool.hpp"
+#include "gpu/InklingGPU.hpp"
 
 #include "EXL3Loader.hpp"
 #include "GGMLDequantize.hpp"

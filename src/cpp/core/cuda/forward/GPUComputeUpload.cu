@@ -34,7 +34,6 @@
 
 #include "EXL3Kernels.hpp"
 #include "GPUComputeInternal.hpp"
-#include "Q4KRequant.hpp"
 
 #include <cublas_v2.h>
 #include <cuda_fp16.h>
@@ -890,82 +889,13 @@ namespace tinycoder::gpu {
                     expertCount_ = geom_.expertCount;
                     expertUsed_ = geom_.expertUsedCount;
                     expertHM_ = geom_.hiddenSize;
-                    // ---- MoE experts: Q8_0 -> Q4_K requant (2026-11-10) --
-                    // A3B `q8_0` is 34.4 GB: 3.34 MB per expert slot x 2
-                    // gate/up + down cannot be cached on 11 GB, so the cache
-                    // build failed and the ENTIRE model ran CPU experts
-                    // (26 tok/s, measured).  Q4_K halves the bytes and lands
-                    // the experts on the grouped int8 prefill path.
-                    static const bool moeQ8Q4K = [] {
-                        const char *e = std::getenv("TINYCODER_MOE_Q8_Q4K");
-                        return e == nullptr || e[0] != '0';
-                    }();
-                    if (moeQ8Q4K && expertCache_[L].gateType == kTypeQ8_0 &&
-                        expertFF_ != 0 && expertHM_ != 0 &&
-                        (expertHM_ & 255u) == 0 && (expertFF_ & 255u) == 0 &&
-                        expertCache_[L].hostGate != nullptr &&
-                        expertCache_[L].hostUp != nullptr &&
-                        expertCache_[L].hostDown != nullptr) {
-                        q4k::AlignedBlob g, u, d;
-                        const bool okAll =
-                                q4k::allocAligned(
-                                        g, q4k::q4kBytes(expertCount_ * expertFF_,
-                                                         expertHM_)) &&
-                                q4k::allocAligned(
-                                        u, q4k::q4kBytes(expertCount_ * expertFF_,
-                                                         expertHM_)) &&
-                                q4k::allocAligned(
-                                        d, q4k::q4kBytes(expertCount_ * expertHM_,
-                                                         expertFF_)) &&
-                                q4k::q8ToQ4kInto(expertCache_[L].hostGate,
-                                                 expertCount_ * expertFF_,
-                                                 expertHM_,
-                                                 const_cast<uint8_t *>(g.data()),
-                                                 32) &&
-                                q4k::q8ToQ4kInto(expertCache_[L].hostUp,
-                                                 expertCount_ * expertFF_,
-                                                 expertHM_,
-                                                 const_cast<uint8_t *>(u.data()),
-                                                 32) &&
-                                q4k::q8ToQ4kInto(expertCache_[L].hostDown,
-                                                 expertCount_ * expertHM_,
-                                                 expertFF_,
-                                                 const_cast<uint8_t *>(d.data()),
-                                                 32);
-                        if (okAll) {
-                            expertCache_[L].hostGate = g.data();
-                            expertCache_[L].hostUp = u.data();
-                            expertCache_[L].hostDown = d.data();
-                            expertRequant_.push_back(std::move(g));
-                            expertRequant_.push_back(std::move(u));
-                            expertRequant_.push_back(std::move(d));
-                            expertCache_[L].gateType = kTypeQ4K;
-                            expertCache_[L].downType = kTypeQ4K;
-                            expertCache_[L].gateRowBytes =
-                                    (expertHM_ / 256u) * 144u;
-                            expertCache_[L].downRowBytes =
-                                    (expertFF_ / 256u) * 144u;
-                            expertHostGate_ = expertCache_[L].hostGate;
-                            expertHostUp_ = expertCache_[L].hostUp;
-                            expertHostDown_ = expertCache_[L].hostDown;
-                            expertType_ = kTypeQ4K;
-                            expertDownType_ = kTypeQ4K;
-                            expertRowBytesGate_ = expertCache_[L].gateRowBytes;
-                            expertRowBytesDown_ = expertCache_[L].downRowBytes;
-                            ++expertRequantLayers_;
-                            if (expertRequantLayers_ == 1)
-                                std::fprintf(stderr,
-                                             "[gpu] MoE experts requantized "
-                                             "Q8_0 -> Q4_K (%.0f MB/layer)\n",
-                                             static_cast<double>(
-                                                     3ull * q4k::q4kBytes(
-                                                                    expertCount_ *
-                                                                            expertFF_,
-                                                                    expertHM_)) /
-
-                                                     1048576.0);
-                        }
-                    }
+                    // ---- MoE experts: keep the checkpoint's own quant type --
+                    // No requantisation.  A Q8_0 expert blob is 3.34 MB per
+                    // slot on Ornith-1.5-35B-A3B (512 x 2048 x 3 x 34/32 B);
+                    // converting it to Q4_K halves the bytes but changes the
+                    // model, and it made a TinyCoder-vs-llama.cpp comparison a
+                    // 4-bit-vs-8-bit one.  The cache, the CPU fallback and the
+                    // A/B baseline now all read the same Q8_0 bytes.
                 }
                 // Shared-expert matrices (gate/up/down quantized; the gate
                 // vector ffn_gate_inp_shexp is F32 [1 x hidden]).

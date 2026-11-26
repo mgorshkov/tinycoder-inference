@@ -38,8 +38,8 @@ SOFTWARE.
 
 #ifdef USE_CUDA
 #include "GPUCompute.hpp"
-#include "gpu/InklingGPU.hpp"
 #include "LMHeadCUDA.hpp"
+#include "gpu/InklingGPU.hpp"
 #endif
 
 namespace tinycoder {

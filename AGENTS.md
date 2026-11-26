@@ -237,7 +237,7 @@ different class of mistake.
 7. **float32 -> float16 must not flush subnormals.** `GGMLDequantize::floatToHalf` shifted the
    mantissa by `(14 - exp)` and then by another 13, so every magnitude below `2^-13` (1.22e-4)
    converted to **exactly zero**. Everything that writes an fp16 scale went through it, and the one
-   that mattered was the GPU path's Q8_0 -> Q4_K expert requantiser (`Q4KRequant.hpp` writes
+   that mattered was the GPU path's (now removed) Q8_0 -> Q4_K expert requantiser (`Q4KRequant.hpp` wrote
    `d = maxScale/63`, `dmin = maxMin/63`): on `Ornith-1.5-35B-A3B-Q8_0` the expert weights are
    small (max |w| ~ 0.06), so `d` is subnormal, became 0, and **every routed expert became an
    all-zero matrix**. Symptom: the model emitted `endahendah...` from the first token, its logits

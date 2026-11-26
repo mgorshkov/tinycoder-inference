@@ -4241,70 +4241,109 @@ namespace tinycoder::simd {
     // previously all 8 experts ran serially on ONE core (~80% utilization).
     // Here each expert matmul (512 rows -> 64 tiles) dispatches across all
     // pool workers.
+
+    // ---- Q8_0 4-row x 2-token tile ---------------------------------------
+    // tinyBLAS_Q0_AVX's AVX2 tile is 4 rows x 2 tokens (VECTOR_REGISTERS==16
+    // selects gemm4xN<2>): 8 accumulators, one weight block loaded once and
+    // reused for BOTH tokens.  That halves the weight loads per MAC versus the
+    // 4-row x 1-token loop and still fits the 16 YMM registers.
+    template<uint32_t RN, uint32_t SN, bool PRECONV = false>
+    static inline void q8DotTile(const uint8_t *const *rowBase,
+                                 const int8_t *const *xqS,
+                                 const float *const *xdS,
+                                 uint32_t blocksPerRow,
+                                 float *const *outPtr,
+                                 const float *const *dRows = nullptr) {
+        static constexpr uint32_t BLOCK_SIZE = 32;
+        static constexpr uint32_t Q8_0_BLOCK_BYTES = 34;
+        __m256 acc[RN][SN];
+        const __m256i one16 = _mm256_set1_epi16(1);
+#pragma GCC unroll 2
+        for (uint32_t t = 0; t < SN; ++t)
+#pragma GCC unroll 4
+            for (uint32_t q = 0; q < RN; ++q)
+                acc[q][t] = _mm256_setzero_ps();
+        for (uint32_t b = 0; b < blocksPerRow; ++b) {
+            __m256i xqb[SN];
+            __m256i xabs[SN];
+#pragma GCC unroll 2
+            for (uint32_t t = 0; t < SN; ++t) {
+                xqb[t] = _mm256_loadu_si256(
+                        reinterpret_cast<const __m256i *>(xqS[t] +
+                                                          b * BLOCK_SIZE));
+                xabs[t] = _mm256_sign_epi8(xqb[t], xqb[t]);
+            }
+#pragma GCC unroll 4
+            for (uint32_t q = 0; q < RN; ++q) {
+                const uint8_t *block =
+                        rowBase[q] +
+                        static_cast<uint64_t>(b) * Q8_0_BLOCK_BYTES;
+                _mm_prefetch(reinterpret_cast<const char *>(
+                                     block + 8 * Q8_0_BLOCK_BYTES),
+                             _MM_HINT_T0);
+                const float d = PRECONV
+                                        ? dRows[q][b]
+                                        : _cvtsh_ss(*reinterpret_cast<
+                                                    const uint16_t *>(block));
+                const __m256i wq = _mm256_loadu_si256(
+                        reinterpret_cast<const __m256i *>(block + 2));
+#pragma GCC unroll 2
+                for (uint32_t t = 0; t < SN; ++t) {
+                    const __m256i wsign = _mm256_sign_epi8(wq, xqb[t]);
+                    const __m256i prod =
+                            _mm256_maddubs_epi16(xabs[t], wsign);
+                    const __m256i sumi = _mm256_madd_epi16(prod, one16);
+                    acc[q][t] = _mm256_fmadd_ps(
+                            _mm256_set1_ps(d * xdS[t][b]),
+                            _mm256_cvtepi32_ps(sumi), acc[q][t]);
+                }
+            }
+        }
+        auto hsum8 = [](__m256 v) -> float {
+            __m128 s = _mm_add_ps(_mm256_castps256_ps128(v),
+                                  _mm256_extractf128_ps(v, 1));
+            s = _mm_hadd_ps(s, s);
+            s = _mm_hadd_ps(s, s);
+            return _mm_cvtss_f32(s);
+        };
+#pragma GCC unroll 2
+        for (uint32_t t = 0; t < SN; ++t)
+#pragma GCC unroll 4
+            for (uint32_t q = 0; q < RN; ++q)
+                outPtr[t][q] = hsum8(acc[q][t]);
+    }
+
     void matMulVecBatchQ8_0_Q8K_AVX2(const uint8_t *W_q8_0, const float *X,
                                      uint32_t seqLen, uint32_t rows,
                                      uint32_t cols, float *out) {
-        static constexpr uint32_t BATCH_SIZE = 8;
+        // llama.cpp's Q8_0 mul_mat shape (ggml_compute_forward_mul_mat):
+        //   * token-outer, row-tile-inner: for one token, dot a tile of rows;
+        //     the next token re-reads that tile from L1/L2.  This keeps the
+        //     working set tiny (one row per block iteration, one token's
+        //     activation = 2 KB) instead of holding 8 token accumulators plus
+        //     8 activation pointers, which spilled and cost ~4x in this loop.
+        //   * one vector accumulator per (row, token) across ALL blocks,
+        //     hsum once (ggml_vec_dot_q8_0_q8_0's `acc = fmadd(d, q, acc)`).
+        //   * activation quantised once per call (phase 1), not per worker.
         static constexpr uint32_t BLOCK_SIZE = 32;
         static constexpr uint32_t Q8_0_BLOCK_BYTES = 34;
-        uint32_t blocksPerRow = (cols + BLOCK_SIZE - 1) / BLOCK_SIZE;
-        uint64_t rowStride = static_cast<uint64_t>(blocksPerRow) * Q8_0_BLOCK_BYTES;
+        static constexpr uint32_t TILE_ROWS = 4;
+        const uint32_t blocksPerRow = (cols + BLOCK_SIZE - 1) / BLOCK_SIZE;
+        const uint64_t rowStride =
+                static_cast<uint64_t>(blocksPerRow) * Q8_0_BLOCK_BYTES;
+        // Token-major activation: xq[s][block][32] is one contiguous 2 KB row.
+        std::vector<float> xd(static_cast<size_t>(seqLen) * blocksPerRow);
+        std::vector<int8_t> xq(static_cast<size_t>(seqLen) * blocksPerRow *
+                               BLOCK_SIZE);
+        const uint32_t numTiles = (rows + TILE_ROWS - 1) / TILE_ROWS;
 
-        auto halfToFloat = [](uint16_t h) -> float {
-            return tinycoder::GGMLDequantize::halfToFloatBranchFree(h);
-        };
-
-        // ---- Per-call activation quantization (2026-09-15) ----
-        // The MoE routed-expert decode path (computeQwen35MoEFromLogits) is the
-        // dominant qwen35moe per-token cost (~150-270 ms/token on the 35B Q8_0
-        // model).  Each of its 24 matmuls/layer (8 experts x gate/up/down) calls
-        // this kernel, and BEFORE this change EVERY tile re-quantized x into
-        // thread_local xq/xd: 64 tiles/matmul x 24 matmuls/layer x 2048 cols of
-        // scalar lrintf sign-fold work = ~10M scalar ops/layer (~150-400 ms/token),
-        // the single largest item in the CPU-expert wall.
-        //
-        // Quantization is a deterministic function of (X, seqLen, cols), so a
-        // worker thread only needs to run it ONCE per kernel call, not once per
-        // tile.  The guard below is a per-call generation counter (incremented
-        // by the CALLING thread before the pool publish, read with acquire):
-        //   * Within one call every tile sees the same gen -> one quantize per
-        //     thread (a 64x reduction on the Q8_0 expert matmuls).
-        //   * Across calls gen advances -> each thread re-quantizes for the new
-        //     activation (a reused scratch vector changes CONTENT between tokens
-        //     at the same address, so a pointer-keyed guard would be wrong).
-        //   * Concurrent nested calls (prefill's parallelFor2D dispatches into
-        //     the pool) each get their own gen; a thread's lambda ALWAYS
-        //     quantizes from its own captured X, so even if gen raced the
-        //     CONTENT stays correct — a stale gen match can only cause a spurious
-        //     re-quantize, never a wrong one.
-        // The quantization bytes are identical to the old per-tile path (same X,
-        // same algorithm), so every dot/accumulation is bit-exact vs the
-        // reference matMulVecRows results.
-        // Counter starts at 1: fetch_add returns the PREVIOUS value, so the
-        // first call sees gen==1 != the initial thread_local lastGen==0, forcing
-        // the first quantize to run (a 0-init counter would collide with
-        // lastGen==0 and skip it, leaving xd/xq unsized -> OOB -> segfault).
-        static std::atomic<uint64_t> g_q80Gen{1};
-        const uint64_t gen = g_q80Gen.fetch_add(1, std::memory_order_acq_rel);
-        const __m256i one16 = _mm256_set1_epi16(1);
-
-        uint32_t numTiles = (rows + BATCH_SIZE - 1) / BATCH_SIZE;
-        ThreadPool::current().parallelForSlab(0, numTiles, [&](uint32_t tile) {
-            uint32_t rowStart = tile * BATCH_SIZE;
-            uint32_t batchSize = std::min(BATCH_SIZE, rows - rowStart);
-
-            // Thread-local, grow-on-demand: x quantization + float accumulators.
-            static thread_local std::vector<float> xd;
-            static thread_local std::vector<int8_t> xq;
-            static thread_local std::vector<float> acc;
-            static thread_local uint64_t lastGen = 0;
-            if (lastGen != gen) {
-                lastGen = gen;
-                xd.resize(static_cast<size_t>(seqLen) * blocksPerRow);
-                xq.resize(static_cast<size_t>(seqLen) * cols);
-                for (uint32_t s = 0; s < seqLen; ++s) {
+        ThreadPool::current().parallelForSlab2(
+                0, seqLen,
+                [&](uint32_t s) {
                     const float *xs = X + static_cast<size_t>(s) * cols;
-                    int8_t *xqs = xq.data() + static_cast<size_t>(s) * cols;
+                    int8_t *xqs = xq.data() +
+                                  static_cast<size_t>(s) * blocksPerRow *
+                                          BLOCK_SIZE;
                     for (uint32_t b = 0; b < blocksPerRow; ++b) {
                         float amax = 0.0f, maxv = 0.0f;
                         for (uint32_t j = 0; j < BLOCK_SIZE; ++j) {
@@ -4327,64 +4366,269 @@ namespace tinycoder::simd {
                         }
                         xd[idx] = 1.0f / iscale;
                     }
-                }
-            }
-
-            // Float per-token, per-block accumulators (unit-test A/B parity and
-            // no int32 overflow: 2048 cols => 64 blocks, int16 maddubs products
-            // are exact per 16-lane group and any int64-wide sum is safe).
-            acc.assign(static_cast<size_t>(batchSize) * seqLen, 0.0f);
-
-            for (uint32_t r = 0; r < batchSize; ++r) {
-                const uint8_t *rowBase =
-                        W_q8_0 + static_cast<uint64_t>(rowStart + r) * rowStride;
-                for (uint32_t b = 0; b < blocksPerRow; ++b) {
-                    const uint8_t *block =
-                            rowBase + static_cast<uint64_t>(b) * Q8_0_BLOCK_BYTES;
-                    const float d = halfToFloat(*(const uint16_t *) (block + 0));
-                    const int8_t *qs = reinterpret_cast<const int8_t *>(block + 2);
-
-                    for (uint32_t s = 0; s < seqLen; ++s) {
-                        const float d8 = xd[s * blocksPerRow + b];
-                        if (d8 == 0.0f) {
-                            continue;
+                },
+                [] {},
+                0, numTiles,
+                [&](uint32_t tile) {
+                    const uint32_t rowStart = tile * TILE_ROWS;
+                    const uint32_t nRows =
+                            std::min(TILE_ROWS, rows - rowStart);
+                    for (uint32_t s0 = 0; s0 < seqLen; s0 += 2) {
+                        const bool two = (s0 + 1 < seqLen);
+                        const int8_t *xqP[2] = {
+                                xq.data() +
+                                        static_cast<size_t>(s0) * blocksPerRow *
+                                                BLOCK_SIZE,
+                                xq.data() +
+                                        static_cast<size_t>(s0 + 1) *
+                                                blocksPerRow * BLOCK_SIZE};
+                        const float *xdP[2] = {
+                                xd.data() + static_cast<size_t>(s0) * blocksPerRow,
+                                xd.data() +
+                                        static_cast<size_t>(s0 + 1) *
+                                                blocksPerRow};
+                        const uint8_t *rowBase[4];
+                        for (uint32_t q = 0; q < nRows; ++q)
+                            rowBase[q] = W_q8_0 +
+                                         static_cast<uint64_t>(rowStart + q) *
+                                                 rowStride;
+                        float *dst = out + static_cast<size_t>(s0) * rows +
+                                     rowStart;
+                        float *outPtr2[2] = {dst, dst + rows};
+                        float *outPtr1[1] = {dst};
+                        if (two) {
+                            switch (nRows) {
+                                case 4:
+                                    q8DotTile<4, 2>(rowBase, xqP, xdP,
+                                                    blocksPerRow, outPtr2);
+                                    break;
+                                case 3:
+                                    q8DotTile<3, 2>(rowBase, xqP, xdP,
+                                                    blocksPerRow, outPtr2);
+                                    break;
+                                case 2:
+                                    q8DotTile<2, 2>(rowBase, xqP, xdP,
+                                                    blocksPerRow, outPtr2);
+                                    break;
+                                default:
+                                    q8DotTile<1, 2>(rowBase, xqP, xdP,
+                                                    blocksPerRow, outPtr2);
+                                    break;
+                            }
+                        } else {
+                            switch (nRows) {
+                                case 4:
+                                    q8DotTile<4, 1>(rowBase, xqP, xdP,
+                                                    blocksPerRow, outPtr1);
+                                    break;
+                                case 3:
+                                    q8DotTile<3, 1>(rowBase, xqP, xdP,
+                                                    blocksPerRow, outPtr1);
+                                    break;
+                                case 2:
+                                    q8DotTile<2, 1>(rowBase, xqP, xdP,
+                                                    blocksPerRow, outPtr1);
+                                    break;
+                                default:
+                                    q8DotTile<1, 1>(rowBase, xqP, xdP,
+                                                    blocksPerRow, outPtr1);
+                                    break;
+                            }
                         }
-                        const __m256i xqb = _mm256_loadu_si256(
-                                (const __m256i *) (xq.data() +
-                                                   static_cast<size_t>(s) * cols +
-                                                   b * BLOCK_SIZE));
-                        const __m256i wq = _mm256_loadu_si256((const __m256i *) qs);
-                        // Both operands are SIGNED int8, so maddubs' unsigned
-                        // slot cannot take xqb directly. The full 32-wide
-                        // integer dot is EXACT — only the fp32 d*d8 scale
-                        // approximates (identical math to vec_dot_q8_0_q8_0).
-                        const __m256i xabs = _mm256_sign_epi8(xqb, xqb);
-                        const __m256i wsign = _mm256_sign_epi8(wq, xqb);
-                        const __m256i prod = _mm256_maddubs_epi16(xabs, wsign);
-                        // Pairwise int16 -> 8 int32 lanes (still exact).
-                        const __m256i sumi = _mm256_madd_epi16(prod, one16);
-                        const float dd8 = d * d8;
-                        __m256 vAcc = _mm256_mul_ps(
-                                _mm256_set1_ps(dd8),
-                                _mm256_cvtepi32_ps(sumi));
-                        // hsum into lane 0, then accumulate (float).
-                        __m128 s128 = _mm_add_ps(_mm256_castps256_ps128(vAcc),
-                                                 _mm256_extractf128_ps(vAcc, 1));
-                        s128 = _mm_hadd_ps(s128, s128);
-                        s128 = _mm_hadd_ps(s128, s128);
-                        acc[static_cast<size_t>(r) * seqLen + s] +=
-                                _mm_cvtss_f32(s128);
+                    }
+                });
+    }
+
+    // ---- Fused Q8_0 expert groups: ONE dispatch per matrix per layer -------
+    // llama.cpp's mul_mat_id is a single op per layer; the previous CPU-expert
+    // path here issued one kernel call per (layer, expert, matrix) — 768
+    // dispatches/layer, each paying the threadpool publish/barrier.  This
+    // kernel takes the whole layer's (group, row-tile) product as its task
+    // axis, so gate/up/down are one dispatch each.
+    bool matMulVecBatchQ8_0Groups_AVX2(
+            const uint8_t *W_q8_0, uint32_t rowsPerExpert, uint64_t rowBytes,
+            const uint32_t *groupExpert, const uint32_t *groupFirst,
+            const uint32_t *groupCount, uint32_t nGroups,
+            const uint32_t *memberPair, const uint32_t *memberXRow,
+            uint32_t xRows, const float *X, uint32_t cols, float *out) {
+        static constexpr uint32_t BLOCK_SIZE = 32;
+        static constexpr uint32_t Q8_0_BLOCK_BYTES = 34;
+        static constexpr uint32_t TILE_ROWS = 4;
+        const uint32_t blocksPerRow = (cols + BLOCK_SIZE - 1) / BLOCK_SIZE;
+        const uint32_t tilesPerExpert =
+                (rowsPerExpert + TILE_ROWS - 1) / TILE_ROWS;
+        const uint32_t numTasks = nGroups * tilesPerExpert;
+        if (numTasks == 0 || xRows == 0) return true;
+
+        std::vector<float> xd(static_cast<size_t>(xRows) * blocksPerRow);
+        std::vector<int8_t> xq(static_cast<size_t>(xRows) * blocksPerRow *
+                               BLOCK_SIZE);
+
+        auto groupsPhase1 = [&](uint32_t m) {
+            const float *xs =
+                    X + static_cast<size_t>(memberXRow[m]) * cols;
+            int8_t *xqs = xq.data() +
+                          static_cast<size_t>(m) * blocksPerRow *
+                                  BLOCK_SIZE;
+            for (uint32_t b = 0; b < blocksPerRow; ++b) {
+                float amax = 0.0f, maxv = 0.0f;
+                for (uint32_t j = 0; j < BLOCK_SIZE; ++j) {
+                    float ax = std::fabs(xs[b * BLOCK_SIZE + j]);
+                    if (ax > amax) {
+                        amax = ax;
+                        maxv = xs[b * BLOCK_SIZE + j];
+                    }
+                }
+                const uint32_t idx = m * blocksPerRow + b;
+                if (amax == 0.0f) {
+                    xd[idx] = 0.0f;
+                    std::memset(xqs + b * BLOCK_SIZE, 0, BLOCK_SIZE);
+                    continue;
+                }
+                const float iscale = -127.0f / maxv;
+                for (uint32_t j = 0; j < BLOCK_SIZE; ++j) {
+                    int v = static_cast<int>(
+                            std::lrintf(iscale * xs[b * BLOCK_SIZE + j]));
+                    xqs[b * BLOCK_SIZE + j] =
+                            static_cast<int8_t>(std::min(127, v));
+                }
+                xd[idx] = 1.0f / iscale;
+            }
+        };
+        auto groupsPhase2 = [&](uint32_t task) {
+            const uint32_t g = task / tilesPerExpert;
+            const uint32_t tile = task % tilesPerExpert;
+            const uint32_t rowStart = tile * TILE_ROWS;
+            const uint32_t nRows =
+                    std::min(TILE_ROWS, rowsPerExpert - rowStart);
+            const uint32_t first = groupFirst[g];
+            const uint32_t count = groupCount[g];
+            const uint8_t *base =
+                    W_q8_0 +
+                    (static_cast<uint64_t>(groupExpert[g]) *
+                             rowsPerExpert +
+                     rowStart) *
+                            rowBytes;
+            const uint8_t *rowBase[4];
+            for (uint32_t q = 0; q < nRows; ++q)
+                rowBase[q] = base + static_cast<uint64_t>(q) * rowBytes;
+            // fp16 -> fp32 weight scales ONCE per tile, not once per
+            // member pass: the conversion (vpxor+vpinsrw+vcvtph2ps)
+            // was 12 of the 100 instructions in the 4x2 inner loop and
+            // is re-done for every token pair otherwise.
+            float dTile[4 * 64];
+            const float *dRows[4];
+            if (blocksPerRow <= 64) {
+                for (uint32_t q = 0; q < nRows; ++q) {
+                    const uint8_t *rb = rowBase[q];
+                    float *dOut = dTile + q * 64;
+                    for (uint32_t b = 0; b < blocksPerRow; ++b) {
+                        dOut[b] = _cvtsh_ss(*reinterpret_cast<
+                                            const uint16_t *>(
+                                rb + static_cast<uint64_t>(b) *
+                                             Q8_0_BLOCK_BYTES));
+                    }
+                    dRows[q] = dOut;
+                }
+            } else {
+                for (uint32_t q = 0; q < nRows; ++q)
+                    dRows[q] = nullptr;
+            }
+            for (uint32_t m = 0; m < count; m += 2) {
+                const uint32_t p0 = memberPair[first + m];
+                const uint32_t x0 = first + m;
+                if (m + 1 < count) {
+                    const uint32_t p1 = memberPair[first + m + 1];
+                    const uint32_t x1 = first + m + 1;
+                    const int8_t *xqP[2] = {
+                            xq.data() +
+                                    static_cast<size_t>(x0) *
+                                            blocksPerRow * BLOCK_SIZE,
+                            xq.data() +
+                                    static_cast<size_t>(x1) *
+                                            blocksPerRow * BLOCK_SIZE};
+                    const float *xdP[2] = {
+                            xd.data() +
+                                    static_cast<size_t>(x0) * blocksPerRow,
+                            xd.data() +
+                                    static_cast<size_t>(x1) * blocksPerRow};
+                    float *outP[2] = {
+                            out + static_cast<size_t>(p0) * rowsPerExpert +
+                                    rowStart,
+                            out + static_cast<size_t>(p1) * rowsPerExpert +
+                                    rowStart};
+                    switch (nRows) {
+                        case 4:
+                            q8DotTile<4, 2, true>(rowBase, xqP, xdP,
+                                                  blocksPerRow, outP, dRows);
+                            break;
+                        case 3:
+                            q8DotTile<3, 2, true>(rowBase, xqP, xdP,
+                                                  blocksPerRow, outP, dRows);
+                            break;
+                        case 2:
+                            q8DotTile<2, 2, true>(rowBase, xqP, xdP,
+                                                  blocksPerRow, outP, dRows);
+                            break;
+                        default:
+                            q8DotTile<1, 2, true>(rowBase, xqP, xdP,
+                                                  blocksPerRow, outP, dRows);
+                            break;
+                    }
+                } else {
+                    const int8_t *xqP[1] = {
+                            xq.data() +
+                            static_cast<size_t>(x0) * blocksPerRow *
+                                    BLOCK_SIZE};
+                    const float *xdP[1] = {
+                            xd.data() +
+                            static_cast<size_t>(x0) * blocksPerRow};
+                    float *outP[1] = {
+                            out + static_cast<size_t>(p0) * rowsPerExpert +
+                            rowStart};
+                    switch (nRows) {
+                        case 4:
+                            q8DotTile<4, 1, true>(rowBase, xqP, xdP,
+                                                  blocksPerRow, outP, dRows);
+                            break;
+                        case 3:
+                            q8DotTile<3, 1, true>(rowBase, xqP, xdP,
+                                                  blocksPerRow, outP, dRows);
+                            break;
+                        case 2:
+                            q8DotTile<2, 1, true>(rowBase, xqP, xdP,
+                                                  blocksPerRow, outP, dRows);
+                            break;
+                        default:
+                            q8DotTile<1, 1, true>(rowBase, xqP, xdP,
+                                                  blocksPerRow, outP, dRows);
+                            break;
                     }
                 }
             }
-
-            for (uint32_t r = 0; r < batchSize; ++r) {
-                for (uint32_t s = 0; s < seqLen; ++s) {
-                    out[static_cast<size_t>(s) * rows + rowStart + r] =
-                            acc[static_cast<size_t>(r) * seqLen + s];
-                }
-            }
-        });
+        };
+        if (nGroups > 32) {
+            // Prefill: router group sizes vary; a static task-count split puts
+            // the big groups on single workers.  Steal tasks dynamically.
+            // One shared-atomic fetch per chunk of tiles.  At chunk 1 the
+            // stealing atomic on a single cache line serialised the workers and
+            // the kernel stopped scaling past ~18 threads, which is the range
+            // where llama.cpp keeps scaling to 32.  TINYCODER_MOE_STEAL_CHUNK
+            // overrides the default for A/B without a rebuild.
+            static const uint32_t stealChunk = [] {
+                const char *e = std::getenv("TINYCODER_MOE_STEAL_CHUNK");
+                const long v = e ? std::strtol(e, nullptr, 10) : 0;
+                return static_cast<uint32_t>(v > 0 ? v : 12);
+            }();
+            ThreadPool::current().parallelForSteal2(
+                    0, xRows, 4, groupsPhase1, [] {}, 0, numTasks,
+                    stealChunk, groupsPhase2);
+        } else {
+            // Decode: eight tiny groups; the static slab is cheaper.
+            ThreadPool::current().parallelForSlab2(
+                    0, xRows, groupsPhase1, [] {}, 0, numTasks, groupsPhase2);
+        }
+        return true;
     }
 
     // ---- AVX2 register-tiled batch GEMM for a single Q6_K matrix over a batch ----
@@ -6616,8 +6860,13 @@ namespace tinycoder::simd {
                 return false;
         }
 #else
-        (void) type; (void) data; (void) x; (void) seqLen; (void) rows;
-        (void) cols; (void) out;
+        (void) type;
+        (void) data;
+        (void) x;
+        (void) seqLen;
+        (void) rows;
+        (void) cols;
+        (void) out;
         return false;
 #endif
     }

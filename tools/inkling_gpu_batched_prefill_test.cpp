@@ -138,7 +138,8 @@ namespace {
         return got == want;
     }
 
-    bool readF32(const std::string &path, std::vector<float> &out, size_t want) {        FILE *f = std::fopen(path.c_str(), "rb");
+    bool readF32(const std::string &path, std::vector<float> &out, size_t want) {
+        FILE *f = std::fopen(path.c_str(), "rb");
         if (f == nullptr) return false;
         out.resize(want);
         const size_t got = std::fread(out.data(), sizeof(float), want, f);
@@ -197,21 +198,36 @@ namespace {
     }
     uint32_t gemvBlockBytes(uint32_t type) {
         switch (type) {
-            case 0: return 128;
-            case 8: return 34;
-            case 12: return 144;
-            case 13: return 176;
-            case 14: return 210;
-            case 16: return 66;
-            case 17: return 74;
-            case 18: return 98;
-            case 19: return 50;
-            case 22: return 82;
-            case 23: return 136;
-            case 30: return 64;
-            case 40: return 36;
-            case 42: return 18;
-            default: return 0;
+            case 0:
+                return 128;
+            case 8:
+                return 34;
+            case 12:
+                return 144;
+            case 13:
+                return 176;
+            case 14:
+                return 210;
+            case 16:
+                return 66;
+            case 17:
+                return 74;
+            case 18:
+                return 98;
+            case 19:
+                return 50;
+            case 22:
+                return 82;
+            case 23:
+                return 136;
+            case 30:
+                return 64;
+            case 40:
+                return 36;
+            case 42:
+                return 18;
+            default:
+                return 0;
         }
     }
     bool runGemvParity(const char *modelPath) {
@@ -267,12 +283,23 @@ namespace {
             cudaDeviceSynchronize();
             cudaMemcpy(ref.data(), dRef, ref.size() * sizeof(float),
                        cudaMemcpyDeviceToHost);
-            cudaMemcpy(bat.data(), dBat, bat.size() * sizeof(float),
-                       cudaMemcpyDeviceToHost);
             double fMax = 0.0, fRef = 0.0;
-            for (size_t i = 0; i < ref.size(); ++i) {
-                fMax = std::max(fMax, double(std::fabs(bat[i] - ref[i])));
-                fRef = std::max(fRef, double(std::fabs(ref[i])));
+            if (fOk) {
+                cudaMemcpy(bat.data(), dBat, bat.size() * sizeof(float),
+                           cudaMemcpyDeviceToHost);
+                for (size_t i = 0; i < ref.size(); ++i) {
+                    fMax = std::max(fMax, double(std::fabs(bat[i] - ref[i])));
+                    fRef = std::max(fRef, double(std::fabs(ref[i])));
+                }
+            } else {
+                // A refused launch would leave dBat untouched; comparing it
+                // against the per-token reference would report a number that
+                // describes nothing.  Fail loudly instead.
+                std::fprintf(stderr,
+                             "[gemv-parity] %s %s: batched GEMV launch refused\n",
+                             c.name, c.tensor);
+                fMax = 1.0;
+                pass = false;
             }
 
             // int8: an 8-token slice vs eight 1-token calls, only for the types
@@ -364,13 +391,13 @@ namespace {
                     eSlice = 0.0;
                     for (size_t i = 0; i < plain4.size(); ++i)
                         eSlice = std::max(eSlice, double(std::fabs(
-                                                        plain4[i] - int8one[i])));
+                                                          plain4[i] - int8one[i])));
                     // plain 4-slice vs 4 x expert-1: the number that decides
                     // whether the per-expert slice is bit-identical.
                     eExpert = 0.0;
                     for (size_t i = 0; i < plain4.size(); ++i)
                         eExpert = std::max(eExpert, double(std::fabs(
-                                                         plain4[i] - expert1[i])));
+                                                            plain4[i] - expert1[i])));
                 } else {
                     cudaGetLastError();
                 }
@@ -402,7 +429,7 @@ namespace {
         return pass;
     }
 
-} // namespace
+}// namespace
 int main(int argc, char **argv) {
     const char *modelPath =
             argc > 1 && argv[1][0] != '-'
@@ -422,15 +449,24 @@ int main(int argc, char **argv) {
     for (int i = 1; i < argc; ++i) {
         auto next = [&]() -> const char * { return i + 1 < argc ? argv[++i] : ""; };
         if (std::strcmp(argv[i], "--m") == 0) promptLen = std::atoi(next());
-        else if (std::strcmp(argv[i], "--bench") == 0) benchLen = std::atoi(next());
-        else if (std::strcmp(argv[i], "--reps") == 0) reps = std::atoi(next());
-        else if (std::strcmp(argv[i], "--dump") == 0) dumpDir = next();
-        else if (std::strcmp(argv[i], "--dump-logits") == 0) logitsDir = next();
-        else if (std::strcmp(argv[i], "--no-bench") == 0) bench = false;
-        else if (std::strcmp(argv[i], "--gemv-parity") == 0) gemvParity = true;
-        else if (std::strcmp(argv[i], "--both-token") == 0) bothToken = true;
-        else if (std::strcmp(argv[i], "--batched-only") == 0) batchedOnly = true;
-        else if (std::strcmp(argv[i], "--repeat") == 0) repeat = std::atoi(next());
+        else if (std::strcmp(argv[i], "--bench") == 0)
+            benchLen = std::atoi(next());
+        else if (std::strcmp(argv[i], "--reps") == 0)
+            reps = std::atoi(next());
+        else if (std::strcmp(argv[i], "--dump") == 0)
+            dumpDir = next();
+        else if (std::strcmp(argv[i], "--dump-logits") == 0)
+            logitsDir = next();
+        else if (std::strcmp(argv[i], "--no-bench") == 0)
+            bench = false;
+        else if (std::strcmp(argv[i], "--gemv-parity") == 0)
+            gemvParity = true;
+        else if (std::strcmp(argv[i], "--both-token") == 0)
+            bothToken = true;
+        else if (std::strcmp(argv[i], "--batched-only") == 0)
+            batchedOnly = true;
+        else if (std::strcmp(argv[i], "--repeat") == 0)
+            repeat = std::atoi(next());
     }
     if (promptLen < 1 || promptLen > 512) {
         std::fprintf(stderr, "[batched-prefill] --m must be 1..512 "
@@ -482,10 +518,12 @@ int main(int argc, char **argv) {
                          int32_t nTokens) -> Run {
         Run r;
         if (batched) setenv("TINYCODER_INKLING_BATCHED", nTokens == 1 ? "2" : "1", 1);
-        else setenv("TINYCODER_INKLING_BATCHED", "0", 1);
+        else
+            setenv("TINYCODER_INKLING_BATCHED", "0", 1);
         if (!dumpDir.empty()) setenv("TINYCODER_INKLING_BATCHED_DUMP",
                                      dumpDir.c_str(), 1);
-        else unsetenv("TINYCODER_INKLING_BATCHED_DUMP");
+        else
+            unsetenv("TINYCODER_INKLING_BATCHED_DUMP");
         engine.clearKVCache();
         const std::vector<int32_t> toks(prompt.begin(), prompt.begin() + nTokens);
         std::vector<float> logits(
@@ -532,8 +570,9 @@ int main(int argc, char **argv) {
 
     // ---- stage parity + logits parity ---------------------------------------
     if (!batchedOnly)
-    std::printf("[batched-prefill] --- parity: %d-token prompt, token-major vs "
-                "batched ---\n", promptLen);
+        std::printf("[batched-prefill] --- parity: %d-token prompt, token-major vs "
+                    "batched ---\n",
+                    promptLen);
     // Reference first (it also writes the tm-* dumps), then the batched run.
     if (batchedOnly) {
         const Run b = run(true, true, promptLen);
@@ -541,80 +580,81 @@ int main(int argc, char **argv) {
         writePrompt();
         writeLogits("bt-logits", b);
     } else {
-    Run ref = run(false, true, promptLen);
-    if (!ref.ok) return 3;
-    Run bat = run(!bothToken, true, promptLen);
-    if (!bat.ok) return 3;
-    writePrompt();
-    writeLogits("tm-logits", ref);
-    writeLogits("bt-logits", bat);
-    // --repeat: the same comparison several times in one process.  A race shows
-    // up as different answers for identical work in one process; a deterministic
-    // defect gives the same answer every time.
-    for (int32_t r = 1; r < repeat; ++r) {
-        const Run b2 = run(!bothToken, true, promptLen);
-        if (!b2.ok) return 3;
-        double worst = 1.0;
+        Run ref = run(false, true, promptLen);
+        if (!ref.ok) return 3;
+        Run bat = run(!bothToken, true, promptLen);
+        if (!bat.ok) return 3;
+        writePrompt();
+        writeLogits("tm-logits", ref);
+        writeLogits("bt-logits", bat);
+        // --repeat: the same comparison several times in one process.  A race shows
+        // up as different answers for identical work in one process; a deterministic
+        // defect gives the same answer every time.
+        for (int32_t r = 1; r < repeat; ++r) {
+            const Run b2 = run(!bothToken, true, promptLen);
+            if (!b2.ok) return 3;
+            double worst = 1.0;
+            int32_t worstPos = 0;
+            for (int32_t s = 0; s < promptLen; ++s) {
+                const double c = cosine(ref.logits.data() + static_cast<size_t>(s) * vocab,
+                                        b2.logits.data() + static_cast<size_t>(s) * vocab,
+                                        vocab);
+                if (c < worst) {
+                    worst = c;
+                    worstPos = s;
+                }
+            }
+            std::printf("[batched-prefill] repeat %d: min cosine %.8f at pos %d\n", r,
+                        worst, worstPos);
+        }
+        double minCos = 1.0;
         int32_t worstPos = 0;
+        int32_t top1Mismatch = 0, setMismatch = 0;
+        double maxBand = 0.0;
         for (int32_t s = 0; s < promptLen; ++s) {
-            const double c = cosine(ref.logits.data() + static_cast<size_t>(s) * vocab,
-                                    b2.logits.data() + static_cast<size_t>(s) * vocab,
-                                    vocab);
-            if (c < worst) {
-                worst = c;
+            const float *a = ref.logits.data() + static_cast<size_t>(s) * vocab;
+            const float *b = bat.logits.data() + static_cast<size_t>(s) * vocab;
+            const std::vector<Top> ta = topK(a, vocab, 5);
+            const std::vector<Top> tb = topK(b, vocab, 5);
+            const double c = cosine(a, b, vocab);
+            if (c < minCos) {
+                minCos = c;
                 worstPos = s;
             }
+            bool sameTop1 = ta[0].id == tb[0].id;
+            std::vector<int32_t> ia, ib;
+            for (const auto &x: ta) ia.push_back(x.id);
+            for (const auto &x: tb) ib.push_back(x.id);
+            std::sort(ia.begin(), ia.end());
+            std::sort(ib.begin(), ib.end());
+            const bool sameSet = ia == ib;
+            if (!sameTop1) ++top1Mismatch;
+            if (!sameSet) ++setMismatch;
+            float band = 0.0f;
+            for (int32_t id: ia)
+                band = std::max(band, std::fabs(b[id] - a[id]));
+            maxBand = std::max(maxBand, double(band));
+            std::printf("  pos %2d: token-major top-1 %6d (%.4f)  batched top-1 "
+                        "%6d (%.4f)  %s  top5 %s  cos %.8f  max|d| %.5f\n",
+                        s, ta[0].id, ta[0].logit, tb[0].id, tb[0].logit,
+                        sameTop1 ? "MATCH" : "DIFF ", sameSet ? "MATCH" : "DIFF ",
+                        c, band);
         }
-        std::printf("[batched-prefill] repeat %d: min cosine %.8f at pos %d\n", r,
-                    worst, worstPos);
-    }
-    double minCos = 1.0;
-    int32_t worstPos = 0;
-    int32_t top1Mismatch = 0, setMismatch = 0;
-    double maxBand = 0.0;
-    for (int32_t s = 0; s < promptLen; ++s) {
-        const float *a = ref.logits.data() + static_cast<size_t>(s) * vocab;
-        const float *b = bat.logits.data() + static_cast<size_t>(s) * vocab;
-        const std::vector<Top> ta = topK(a, vocab, 5);
-        const std::vector<Top> tb = topK(b, vocab, 5);
-        const double c = cosine(a, b, vocab);
-        if (c < minCos) {
-            minCos = c;
-            worstPos = s;
-        }
-        bool sameTop1 = ta[0].id == tb[0].id;
-        std::vector<int32_t> ia, ib;
-        for (const auto &x: ta) ia.push_back(x.id);
-        for (const auto &x: tb) ib.push_back(x.id);
-        std::sort(ia.begin(), ia.end());
-        std::sort(ib.begin(), ib.end());
-        const bool sameSet = ia == ib;
-        if (!sameTop1) ++top1Mismatch;
-        if (!sameSet) ++setMismatch;
-        float band = 0.0f;
-        for (int32_t id: ia)
-            band = std::max(band, std::fabs(b[id] - a[id]));
-        maxBand = std::max(maxBand, double(band));
-        std::printf("  pos %2d: token-major top-1 %6d (%.4f)  batched top-1 "
-                    "%6d (%.4f)  %s  top5 %s  cos %.8f  max|d| %.5f\n",
-                    s, ta[0].id, ta[0].logit, tb[0].id, tb[0].logit,
-                    sameTop1 ? "MATCH" : "DIFF ", sameSet ? "MATCH" : "DIFF ",
-                    c, band);
-    }
-    const bool parityOk = top1Mismatch == 0 && setMismatch == 0 &&
-                          minCos >= 0.9999;
-    std::printf("[batched-prefill] parity: top-1 %s (%d mismatches), top-5 set %s "
-                "(%d), min cosine %.8f at pos %d, max|d| %.5f -> %s\n",
-                top1Mismatch == 0 ? "MATCH" : "MISMATCH", top1Mismatch,
-                setMismatch == 0 ? "MATCH" : "MISMATCH", setMismatch, minCos,
-                worstPos, maxBand, parityOk ? "PASS" : "FAIL");
-    pass = pass && parityOk;
+        const bool parityOk = top1Mismatch == 0 && setMismatch == 0 &&
+                              minCos >= 0.9999;
+        std::printf("[batched-prefill] parity: top-1 %s (%d mismatches), top-5 set %s "
+                    "(%d), min cosine %.8f at pos %d, max|d| %.5f -> %s\n",
+                    top1Mismatch == 0 ? "MATCH" : "MISMATCH", top1Mismatch,
+                    setMismatch == 0 ? "MATCH" : "MISMATCH", setMismatch, minCos,
+                    worstPos, maxBand, parityOk ? "PASS" : "FAIL");
+        pass = pass && parityOk;
     }
 
     // ---- per-stage cosines (optional) --------------------------------------
     if (!dumpDir.empty()) {
         std::printf("[batched-prefill] --- stage parity (cosine per token, "
-                    "dump dir %s) ---\n", dumpDir.c_str());
+                    "dump dir %s) ---\n",
+                    dumpDir.c_str());
         // Prelude: one file per token from the reference, one batch file.
         std::vector<float> bp;
         const bool haveBatchPrelude =
@@ -632,7 +672,8 @@ int main(int argc, char **argv) {
                                      "-prelude.f32",
                              tp, cfg.hiddenSize)) {
                     std::printf("[batched-prefill] prelude: reference dump for "
-                                "token %d missing\n", s);
+                                "token %d missing\n",
+                                s);
                     pass = false;
                     break;
                 }
@@ -647,7 +688,8 @@ int main(int argc, char **argv) {
                 }
             }
             std::printf("[batched-prefill] prelude hidden state: min cosine "
-                        "%.8f (token %d) -> %s\n", preludeMin, preludeWorst,
+                        "%.8f (token %d) -> %s\n",
+                        preludeMin, preludeWorst,
                         preludeMin >= 0.9999 ? "PASS" : "FAIL");
             pass = pass && preludeMin >= 0.9999;
         }
@@ -713,7 +755,8 @@ int main(int argc, char **argv) {
                     stageCount, stageMin, stageWorst, stageWorstTok,
                     stageCount > 0 && stageMin >= 0.9999 ? "PASS" : "FAIL");
         std::printf("[batched-prefill] router ids: %d mismatched (token,slot,u) "
-                    "entries\n", idxMismatch);
+                    "entries\n",
+                    idxMismatch);
         if (stageCount == 0) {
             std::printf("[batched-prefill] no per-block dumps found\n");
             pass = false;
@@ -756,11 +799,13 @@ int main(int argc, char **argv) {
         ppBatch = benchLen / ((sumB / reps) / 1000.0);
         if (batchedOnly)
             std::printf("[batched-prefill] pp%d: batched %.2f tok/s (best %.1f "
-                        "ms)\n", benchLen, ppBatch, bestB);
+                        "ms)\n",
+                        benchLen, ppBatch, bestB);
         else
             std::printf("[batched-prefill] pp%d: token-major %.2f tok/s (best "
                         "%.1f ms), batched %.2f tok/s (best %.1f ms), speedup "
-                        "%.2fx\n", benchLen, ppToken, bestT, ppBatch, bestB,
+                        "%.2fx\n",
+                        benchLen, ppToken, bestT, ppBatch, bestB,
                         bestT / bestB);
     }
 

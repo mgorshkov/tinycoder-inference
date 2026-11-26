@@ -72,12 +72,12 @@
 namespace tinycoder::gpu {
     namespace {
 
-        constexpr int kMTile = 16;         // token rows in one tile
-        constexpr int kNTile = 128;        // output columns in one tile
-        constexpr int kWarps = 4;          // one warp per 32 output columns
-        constexpr int kNPerWarp = 32;      // 4 x n8 per warp
-        constexpr int kKBlock = 64;        // one Q2_0 block
-        constexpr int kAStride = 20;       // ints per 64-k row
+        constexpr int kMTile = 16;   // token rows in one tile
+        constexpr int kNTile = 128;  // output columns in one tile
+        constexpr int kWarps = 4;    // one warp per 32 output columns
+        constexpr int kNPerWarp = 32;// 4 x n8 per warp
+        constexpr int kKBlock = 64;  // one Q2_0 block
+        constexpr int kAStride = 20; // ints per 64-k row
         constexpr int kBStride = 20;
 
         struct Q8Pack {
@@ -187,105 +187,105 @@ namespace tinycoder::gpu {
             // 16-row MMA tiles.  The mean group is 8 tokens, so this is one
             // iteration and the expert's weights are decoded exactly once.
             for (uint32_t s0 = 0; s0 < static_cast<uint32_t>(cnt); s0 += kMTile) {
-            const uint32_t rowsLive =
-                    static_cast<uint32_t>(cnt) - s0 < kMTile
-                            ? static_cast<uint32_t>(cnt) - s0
-                            : kMTile;
-            const bool twoHalves = rowsLive > 8;
-            float acc[4][4] = {};
+                const uint32_t rowsLive =
+                        static_cast<uint32_t>(cnt) - s0 < kMTile
+                                ? static_cast<uint32_t>(cnt) - s0
+                                : kMTile;
+                const bool twoHalves = rowsLive > 8;
+                float acc[4][4] = {};
 
-            for (uint32_t kb = 0; kb < kbCount; ++kb) {
-                __syncthreads();
-                if (tid < kMTile) {
-                    const uint32_t r = tid;
-                    const int *src = reinterpret_cast<const int *>(
-                            aqr + static_cast<size_t>(s0 + r) * cols + kb * kKBlock);
-                    int *dst = sA + r * kAStride;
+                for (uint32_t kb = 0; kb < kbCount; ++kb) {
+                    __syncthreads();
+                    if (tid < kMTile) {
+                        const uint32_t r = tid;
+                        const int *src = reinterpret_cast<const int *>(
+                                aqr + static_cast<size_t>(s0 + r) * cols + kb * kKBlock);
+                        int *dst = sA + r * kAStride;
 #pragma unroll
-                    for (int j = 0; j < 16; ++j) dst[j] = src[j];
-                    dst[16] = __float_as_int(adr[static_cast<size_t>(s0 + r) * (cols / 32u) + 2u * kb]);
-                    dst[17] = __float_as_int(adr[static_cast<size_t>(s0 + r) * (cols / 32u) + 2u * kb + 1u]);
-                }
-
-                {
-                    const uint32_t n = tid; // 0..127
-                    int *dst = sB + n * kBStride;
-                    uint32_t v[16];
-                    float d = 0.0f;
-                    if (n0 + n < rows) {
-                        const uint8_t *blk = reinterpret_cast<const uint8_t *>(
-                                wr + (static_cast<size_t>(n0 + n) * kbCount + kb) * 18u);
-                        d = __half2float(*reinterpret_cast<const __half *>(blk));
-                        const uint8_t *qs = blk + 2;
-#pragma unroll
-                        for (int j = 0; j < 16; ++j) v[j] = q2Decode4(qs[j]);
-                    } else {
-#pragma unroll
-                        for (int j = 0; j < 16; ++j) v[j] = 0u;
+                        for (int j = 0; j < 16; ++j) dst[j] = src[j];
+                        dst[16] = __float_as_int(adr[static_cast<size_t>(s0 + r) * (cols / 32u) + 2u * kb]);
+                        dst[17] = __float_as_int(adr[static_cast<size_t>(s0 + r) * (cols / 32u) + 2u * kb + 1u]);
                     }
-#pragma unroll
-                    for (int j = 0; j < 16; ++j) dst[j] = static_cast<int>(v[j]);
-                    dst[16] = __float_as_int(d);
-                    dst[17] = __float_as_int(d);
-                }
-                __syncthreads();
 
-                const uint32_t i0 = lane / 4u;        // 0..7
-                const uint32_t j0 = (lane % 4u) * 2u; // 0..7
-                for (int ks = 0; ks < 2; ++ks) {
-                    tc_mma::tile<16, 8, int> A;
-                    tc_mma::load_ldmatrix(A, sA + ks * 8, kAStride);
-                    const float a0 = __int_as_float(sA[i0 * kAStride + 16 + ks]);
-                    const float a1 = __int_as_float(sA[(i0 + 8u) * kAStride + 16 + ks]);
-                    for (int t = 0; t < 4; ++t) {
-                        const int bRow = static_cast<int>(warp) * kNPerWarp + t * 8;
-                        tc_mma::tile<8, 8, int> B;
-                        // load_generic, not load_ldmatrix: the mma B fragment is
-                        // column-major (n,k) and the x2 ldmatrix layout does not
-                        // produce it.  The generic int8 kernel makes the same
-                        // choice on this path ("faster than load_ldmatrix").
-                        tc_mma::load_generic(
-                                B, sB + bRow * kBStride + ks * 8, kBStride);
-                        tc_mma::tile<16, 8, int> C;
-                        if (twoHalves)
-                            tc_mma::mma(C, A, B);
-                        else
-                            mmaFirstHalf(C, A, B);
-                        const float b0 = __int_as_float(
-                                sB[(bRow + static_cast<int>(j0)) * kBStride + 16 + ks]);
-                        const float b1 = __int_as_float(
-                                sB[(bRow + static_cast<int>(j0) + 1) * kBStride + 16 + ks]);
-                        acc[t][0] += a0 * b0 * static_cast<float>(C.x[0]);
-                        acc[t][1] += a0 * b1 * static_cast<float>(C.x[1]);
-                        if (twoHalves) {
-                            acc[t][2] += a1 * b0 * static_cast<float>(C.x[2]);
-                            acc[t][3] += a1 * b1 * static_cast<float>(C.x[3]);
+                    {
+                        const uint32_t n = tid;// 0..127
+                        int *dst = sB + n * kBStride;
+                        uint32_t v[16];
+                        float d = 0.0f;
+                        if (n0 + n < rows) {
+                            const uint8_t *blk = reinterpret_cast<const uint8_t *>(
+                                    wr + (static_cast<size_t>(n0 + n) * kbCount + kb) * 18u);
+                            d = __half2float(*reinterpret_cast<const __half *>(blk));
+                            const uint8_t *qs = blk + 2;
+#pragma unroll
+                            for (int j = 0; j < 16; ++j) v[j] = q2Decode4(qs[j]);
+                        } else {
+#pragma unroll
+                            for (int j = 0; j < 16; ++j) v[j] = 0u;
+                        }
+#pragma unroll
+                        for (int j = 0; j < 16; ++j) dst[j] = static_cast<int>(v[j]);
+                        dst[16] = __float_as_int(d);
+                        dst[17] = __float_as_int(d);
+                    }
+                    __syncthreads();
+
+                    const uint32_t i0 = lane / 4u;       // 0..7
+                    const uint32_t j0 = (lane % 4u) * 2u;// 0..7
+                    for (int ks = 0; ks < 2; ++ks) {
+                        tc_mma::tile<16, 8, int> A;
+                        tc_mma::load_ldmatrix(A, sA + ks * 8, kAStride);
+                        const float a0 = __int_as_float(sA[i0 * kAStride + 16 + ks]);
+                        const float a1 = __int_as_float(sA[(i0 + 8u) * kAStride + 16 + ks]);
+                        for (int t = 0; t < 4; ++t) {
+                            const int bRow = static_cast<int>(warp) * kNPerWarp + t * 8;
+                            tc_mma::tile<8, 8, int> B;
+                            // load_generic, not load_ldmatrix: the mma B fragment is
+                            // column-major (n,k) and the x2 ldmatrix layout does not
+                            // produce it.  The generic int8 kernel makes the same
+                            // choice on this path ("faster than load_ldmatrix").
+                            tc_mma::load_generic(
+                                    B, sB + bRow * kBStride + ks * 8, kBStride);
+                            tc_mma::tile<16, 8, int> C;
+                            if (twoHalves)
+                                tc_mma::mma(C, A, B);
+                            else
+                                mmaFirstHalf(C, A, B);
+                            const float b0 = __int_as_float(
+                                    sB[(bRow + static_cast<int>(j0)) * kBStride + 16 + ks]);
+                            const float b1 = __int_as_float(
+                                    sB[(bRow + static_cast<int>(j0) + 1) * kBStride + 16 + ks]);
+                            acc[t][0] += a0 * b0 * static_cast<float>(C.x[0]);
+                            acc[t][1] += a0 * b1 * static_cast<float>(C.x[1]);
+                            if (twoHalves) {
+                                acc[t][2] += a1 * b0 * static_cast<float>(C.x[2]);
+                                acc[t][3] += a1 * b1 * static_cast<float>(C.x[3]);
+                            }
                         }
                     }
                 }
-            }
 
-            const uint32_t i0 = lane / 4u;
-            const uint32_t j0 = (lane % 4u) * 2u;
-            for (int t = 0; t < 4; ++t) {
-                const uint32_t col = n0 + warp * kNPerWarp + t * 8 + j0;
-                if (i0 < rowsLive && col < rows) {
-                    outr[static_cast<size_t>(s0 + i0) * rows + col] =
-                            acc[t][0];
-                    if (col + 1 < rows)
-                        outr[static_cast<size_t>(s0 + i0) * rows + col + 1] =
-                                acc[t][1];
-                }
-                if (twoHalves && i0 + 8u < rowsLive) {
-                    if (col < rows) {
-                        outr[static_cast<size_t>(s0 + i0 + 8u) * rows + col] =
-                                acc[t][2];
+                const uint32_t i0 = lane / 4u;
+                const uint32_t j0 = (lane % 4u) * 2u;
+                for (int t = 0; t < 4; ++t) {
+                    const uint32_t col = n0 + warp * kNPerWarp + t * 8 + j0;
+                    if (i0 < rowsLive && col < rows) {
+                        outr[static_cast<size_t>(s0 + i0) * rows + col] =
+                                acc[t][0];
                         if (col + 1 < rows)
-                            outr[static_cast<size_t>(s0 + i0 + 8u) * rows + col + 1] =
-                                    acc[t][3];
+                            outr[static_cast<size_t>(s0 + i0) * rows + col + 1] =
+                                    acc[t][1];
+                    }
+                    if (twoHalves && i0 + 8u < rowsLive) {
+                        if (col < rows) {
+                            outr[static_cast<size_t>(s0 + i0 + 8u) * rows + col] =
+                                    acc[t][2];
+                            if (col + 1 < rows)
+                                outr[static_cast<size_t>(s0 + i0 + 8u) * rows + col + 1] =
+                                        acc[t][3];
+                        }
                     }
                 }
-            }
             }// s0 tile
         }
 
@@ -345,98 +345,98 @@ namespace tinycoder::gpu {
             // The [128][cols] slab above is resident for every live-row tile, so
             // a group of up to 128 tokens still streams its weights once.
             for (uint32_t s0 = 0; s0 < static_cast<uint32_t>(cnt); s0 += kMTile) {
-            const uint32_t rowsLive =
-                    static_cast<uint32_t>(cnt) - s0 < kMTile
-                            ? static_cast<uint32_t>(cnt) - s0
-                            : kMTile;
-            const bool twoHalves = rowsLive > 8;
-            float acc[4][4] = {};
+                const uint32_t rowsLive =
+                        static_cast<uint32_t>(cnt) - s0 < kMTile
+                                ? static_cast<uint32_t>(cnt) - s0
+                                : kMTile;
+                const bool twoHalves = rowsLive > 8;
+                float acc[4][4] = {};
 
-            for (uint32_t kb = 0; kb < kbCount; ++kb) {
-                __syncthreads();
-                if (tid < kMTile) {
-                    const uint32_t r = tid;
-                    const int *src = reinterpret_cast<const int *>(
-                            aqr + static_cast<size_t>(s0 + r) * cols + kb * kKBlock);
-                    int *dst = sA + r * kAStride;
+                for (uint32_t kb = 0; kb < kbCount; ++kb) {
+                    __syncthreads();
+                    if (tid < kMTile) {
+                        const uint32_t r = tid;
+                        const int *src = reinterpret_cast<const int *>(
+                                aqr + static_cast<size_t>(s0 + r) * cols + kb * kKBlock);
+                        int *dst = sA + r * kAStride;
 #pragma unroll
-                    for (int j = 0; j < 16; ++j) dst[j] = src[j];
-                    dst[16] = __float_as_int(adr[static_cast<size_t>(s0 + r) * (cols / 32u) + 2u * kb]);
-                    dst[17] = __float_as_int(adr[static_cast<size_t>(s0 + r) * (cols / 32u) + 2u * kb + 1u]);
-                }
-
-                {
-                    const uint32_t n = tid;
-                    int *dst = sB + n * kBStride;
-                    uint32_t v[16];
-                    float d = 0.0f;
-                    if (n < nRows) {
-                        const uint8_t *blk = reinterpret_cast<const uint8_t *>(sW) +
-                                             static_cast<size_t>(n) * rowStride +
-                                             static_cast<size_t>(kb) * 18u;
-                        d = __half2float(*reinterpret_cast<const __half *>(blk));
-                        const uint8_t *qs = blk + 2;
-#pragma unroll
-                        for (int j = 0; j < 16; ++j) v[j] = q2Decode4(qs[j]);
-                    } else {
-#pragma unroll
-                        for (int j = 0; j < 16; ++j) v[j] = 0u;
+                        for (int j = 0; j < 16; ++j) dst[j] = src[j];
+                        dst[16] = __float_as_int(adr[static_cast<size_t>(s0 + r) * (cols / 32u) + 2u * kb]);
+                        dst[17] = __float_as_int(adr[static_cast<size_t>(s0 + r) * (cols / 32u) + 2u * kb + 1u]);
                     }
-#pragma unroll
-                    for (int j = 0; j < 16; ++j) dst[j] = static_cast<int>(v[j]);
-                    dst[16] = __float_as_int(d);
-                    dst[17] = __float_as_int(d);
-                }
-                __syncthreads();
 
-                const uint32_t i0 = lane / 4u;
-                const uint32_t j0 = (lane % 4u) * 2u;
-                for (int ks = 0; ks < 2; ++ks) {
-                    tc_mma::tile<16, 8, int> A;
-                    tc_mma::load_ldmatrix(A, sA + ks * 8, kAStride);
-                    const float a0 = __int_as_float(sA[i0 * kAStride + 16 + ks]);
-                    const float a1 = __int_as_float(sA[(i0 + 8u) * kAStride + 16 + ks]);
-                    for (int t = 0; t < 4; ++t) {
-                        const int bRow = static_cast<int>(warp) * kNPerWarp + t * 8;
-                        tc_mma::tile<8, 8, int> B;
-                        tc_mma::load_generic(
-                                B, sB + bRow * kBStride + ks * 8, kBStride);
-                        tc_mma::tile<16, 8, int> C;
-                        if (twoHalves)
-                            tc_mma::mma(C, A, B);
-                        else
-                            mmaFirstHalf(C, A, B);
-                        const float b0 = __int_as_float(
-                                sB[(bRow + static_cast<int>(j0)) * kBStride + 16 + ks]);
-                        const float b1 = __int_as_float(
-                                sB[(bRow + static_cast<int>(j0) + 1) * kBStride + 16 + ks]);
-                        acc[t][0] += a0 * b0 * static_cast<float>(C.x[0]);
-                        acc[t][1] += a0 * b1 * static_cast<float>(C.x[1]);
-                        if (twoHalves) {
-                            acc[t][2] += a1 * b0 * static_cast<float>(C.x[2]);
-                            acc[t][3] += a1 * b1 * static_cast<float>(C.x[3]);
+                    {
+                        const uint32_t n = tid;
+                        int *dst = sB + n * kBStride;
+                        uint32_t v[16];
+                        float d = 0.0f;
+                        if (n < nRows) {
+                            const uint8_t *blk = reinterpret_cast<const uint8_t *>(sW) +
+                                                 static_cast<size_t>(n) * rowStride +
+                                                 static_cast<size_t>(kb) * 18u;
+                            d = __half2float(*reinterpret_cast<const __half *>(blk));
+                            const uint8_t *qs = blk + 2;
+#pragma unroll
+                            for (int j = 0; j < 16; ++j) v[j] = q2Decode4(qs[j]);
+                        } else {
+#pragma unroll
+                            for (int j = 0; j < 16; ++j) v[j] = 0u;
+                        }
+#pragma unroll
+                        for (int j = 0; j < 16; ++j) dst[j] = static_cast<int>(v[j]);
+                        dst[16] = __float_as_int(d);
+                        dst[17] = __float_as_int(d);
+                    }
+                    __syncthreads();
+
+                    const uint32_t i0 = lane / 4u;
+                    const uint32_t j0 = (lane % 4u) * 2u;
+                    for (int ks = 0; ks < 2; ++ks) {
+                        tc_mma::tile<16, 8, int> A;
+                        tc_mma::load_ldmatrix(A, sA + ks * 8, kAStride);
+                        const float a0 = __int_as_float(sA[i0 * kAStride + 16 + ks]);
+                        const float a1 = __int_as_float(sA[(i0 + 8u) * kAStride + 16 + ks]);
+                        for (int t = 0; t < 4; ++t) {
+                            const int bRow = static_cast<int>(warp) * kNPerWarp + t * 8;
+                            tc_mma::tile<8, 8, int> B;
+                            tc_mma::load_generic(
+                                    B, sB + bRow * kBStride + ks * 8, kBStride);
+                            tc_mma::tile<16, 8, int> C;
+                            if (twoHalves)
+                                tc_mma::mma(C, A, B);
+                            else
+                                mmaFirstHalf(C, A, B);
+                            const float b0 = __int_as_float(
+                                    sB[(bRow + static_cast<int>(j0)) * kBStride + 16 + ks]);
+                            const float b1 = __int_as_float(
+                                    sB[(bRow + static_cast<int>(j0) + 1) * kBStride + 16 + ks]);
+                            acc[t][0] += a0 * b0 * static_cast<float>(C.x[0]);
+                            acc[t][1] += a0 * b1 * static_cast<float>(C.x[1]);
+                            if (twoHalves) {
+                                acc[t][2] += a1 * b0 * static_cast<float>(C.x[2]);
+                                acc[t][3] += a1 * b1 * static_cast<float>(C.x[3]);
+                            }
                         }
                     }
                 }
-            }
 
-            const uint32_t i0 = lane / 4u;
-            const uint32_t j0 = (lane % 4u) * 2u;
-            for (int t = 0; t < 4; ++t) {
-                const uint32_t col = n0 + warp * kNPerWarp + t * 8 + j0;
-                if (i0 < rowsLive && col < rows) {
-                    outr[static_cast<size_t>(s0 + i0) * rows + col] = acc[t][0];
-                    if (col + 1 < rows)
-                        outr[static_cast<size_t>(s0 + i0) * rows + col + 1] = acc[t][1];
-                }
-                if (twoHalves && i0 + 8u < rowsLive) {
-                    if (col < rows) {
-                        outr[static_cast<size_t>(s0 + i0 + 8u) * rows + col] = acc[t][2];
+                const uint32_t i0 = lane / 4u;
+                const uint32_t j0 = (lane % 4u) * 2u;
+                for (int t = 0; t < 4; ++t) {
+                    const uint32_t col = n0 + warp * kNPerWarp + t * 8 + j0;
+                    if (i0 < rowsLive && col < rows) {
+                        outr[static_cast<size_t>(s0 + i0) * rows + col] = acc[t][0];
                         if (col + 1 < rows)
-                            outr[static_cast<size_t>(s0 + i0 + 8u) * rows + col + 1] = acc[t][3];
+                            outr[static_cast<size_t>(s0 + i0) * rows + col + 1] = acc[t][1];
+                    }
+                    if (twoHalves && i0 + 8u < rowsLive) {
+                        if (col < rows) {
+                            outr[static_cast<size_t>(s0 + i0 + 8u) * rows + col] = acc[t][2];
+                            if (col + 1 < rows)
+                                outr[static_cast<size_t>(s0 + i0 + 8u) * rows + col + 1] = acc[t][3];
+                        }
                     }
                 }
-            }
             }// s0 tile
         }
 

@@ -780,7 +780,11 @@ namespace tinycoder {
         // the same disjoint slab rows and reduced in the exact rank order
         // below, so no accumulation order changes.
         const size_t slabRows = static_cast<size_t>(seqLen) * eu;
-        std::vector<float> partial(static_cast<size_t>(slabRows) * hiddenSize, 0.0f);
+        // A thread_local buffer here would be captured by reference by the
+        // parallel reduce below; a worker resolving the reference against its
+        // OWN thread_local instance sees an empty vector (observed as a
+        // segfault in the kernel phase 1 lambda).  Keep this one plain.
+        std::vector<float> partial(static_cast<size_t>(slabRows) * hiddenSize);
 
         // Group the (s, r) selections by expert id.  O(eu * seqLen) per layer.
         // Decode (seqLen == 1) yields eu single-member groups; prefill yields
@@ -893,113 +897,227 @@ namespace tinycoder {
             return true;
         };
 
-        for (uint32_t ue = 0; ue < expertCount; ++ue) {
-            const auto &members = expertGroups[ue];
-            const uint32_t grpCount = static_cast<uint32_t>(members.size());
-            if (grpCount == 0) continue;
-
-            const uint32_t gRows0 = ue * expertFF;
-            const uint32_t dRows0 = ue * hiddenSize;
-
-            if (canBatch) {
-                // Gather the group's x rows (contiguous [grpCount][hiddenSize]).
-                // Stream from ffnNorm (read-only) into the reusable scratch.
-                for (uint32_t m = 0; m < grpCount; ++m) {
-                    const uint32_t s = members[m].first;
-                    const uint32_t r = members[m].second;
-                    grpS[m] = s;
-                    grpR[m] = r;
-                    std::memcpy(grpX.data() + static_cast<size_t>(m) * hiddenSize,
-                                ffnNorm + static_cast<size_t>(s) * hiddenSize,
-                                hiddenSize * sizeof(float));
-                }
-
-                const uint8_t *gateRows, *upRows, *downRows;
-                if (fused) {
-                    // Fused [exp*ff*2, hidden]: gate half then up half, both
-                    // inside the same matrix (rows e*ff*2 .. e*ff*2 + 2*ff).
-                    const uint64_t gBpr = rowBytes(gateM);
-                    gateRows = gateM.data.data() +
-                               static_cast<uint64_t>(gRows0) * 2 * gBpr;
-                    upRows = gateRows + static_cast<uint64_t>(expertFF) * gBpr;
-                } else {
-                    // Separate gate/up matrices, same row base.
-                    gateRows = gateM.data.data() +
-                               static_cast<uint64_t>(gRows0) * rowBytes(gateM);
-                    upRows = upM->data.data() +
-                             static_cast<uint64_t>(gRows0) * rowBytes(*upM);
-                }
-                downRows = w.ffnDownExpsMoe.data.data() +
-                           static_cast<uint64_t>(dRows0) *
-                                   rowBytes(w.ffnDownExpsMoe);
-
-                const double tB0 = cpuProf ? cpuNow() : 0.0;
-                if (routeBatch(grpCount, gateRows, upRows, downRows)) {
-                    if (cpuProf) tGemm += cpuNow() - tB0;
-                    const double tS0 = cpuProf ? cpuNow() : 0.0;
-                    // Scatter the weighted partials into the disjoint slab
-                    // rows (bit-identical wg * down per (s, r)).
-                    for (uint32_t m = 0; m < grpCount; ++m) {
-                        const uint32_t s = grpS[m];
-                        const uint32_t r = grpR[m];
-                        const float wg =
-                                expertWgt[static_cast<size_t>(s) * eu + r];
-                        const float *src =
-                                grpD.data() + static_cast<size_t>(m) * hiddenSize;
-                        float *dst = partial.data() +
-                                     (static_cast<size_t>(s) * eu + r) * hiddenSize;
-                        for (uint32_t i = 0; i < hiddenSize; ++i) {
-                            dst[i] = wg * src[i];
-                        }
-                    }
-                    if (cpuProf) tScatter += cpuNow() - tS0;
-                    continue;
+        // ---- Fused per-layer dispatch (llama.cpp mul_mat_id shape) --------
+        // ONE kernel dispatch for gate, one for up and one for down, over the
+        // whole layer's (expert group, row tile) product, instead of one
+        // dispatch per expert group (256 of each per layer).
+        bool fusedDone = false;
+        // One op per layer: gate/up/down are one dispatch each for the whole
+        // layer (llama.cpp's mul_mat_id shape) instead of 24 (decode) or 768
+        // (prefill).  The groups kernel steals tasks when nGroups > 32:
+        // router group sizes vary and a static split leaves the big groups on
+        // one worker (pp512 46 -> 86 with stealing).
+        if (!forceScalarPath() && !fused &&
+            gateM.type == GGML_TYPE_Q8_0 &&
+            upType == GGML_TYPE_Q8_0 &&
+            w.ffnDownExpsMoe.type == GGML_TYPE_Q8_0) {
+            static thread_local std::vector<uint32_t> gExpert, gFirst, gCount,
+                    memberPair, memberXRow;
+            gExpert.clear();
+            gFirst.clear();
+            gCount.clear();
+            memberPair.clear();
+            memberXRow.clear();
+            gExpert.reserve(expertCount);
+            gFirst.reserve(expertCount);
+            gCount.reserve(expertCount);
+            memberPair.reserve(static_cast<size_t>(seqLen) * eu);
+            memberXRow.reserve(static_cast<size_t>(seqLen) * eu);
+            for (uint32_t e = 0; e < expertCount; ++e) {
+                const auto &mem = expertGroups[e];
+                if (mem.empty()) continue;
+                gExpert.push_back(e);
+                gFirst.push_back(static_cast<uint32_t>(memberPair.size()));
+                gCount.push_back(static_cast<uint32_t>(mem.size()));
+                for (const auto &pr: mem) {
+                    memberPair.push_back(pr.first * eu + pr.second);
+                    memberXRow.push_back(pr.first);
                 }
             }
-
-            // Fallback (non-AVX2 host / forceScalar / non-batchable layout):
-            // the exact per-member single-token math (identical results).  The
-            // fused row base is e*ff*2 (gate half then up half) — same as the
-            // reference computeQwen35MoE.
-            std::vector<float> g(expertFF), u(expertFF), d(hiddenSize);
-            for (uint32_t m = 0; m < grpCount; ++m) {
-                const uint32_t s = members[m].first;
-                const uint32_t r = members[m].second;
-                const float wg = expertWgt[static_cast<size_t>(s) * eu + r];
-                const float *x = ffnNorm + static_cast<size_t>(s) * hiddenSize;
-                if (fused) {
-                    gateM.matMulVecRows(x, gRows0 * 2, expertFF, g.data());
-                    gateM.matMulVecRows(x, gRows0 * 2 + expertFF, expertFF,
-                                        u.data());
-                } else {
-                    gateM.matMulVecRows(x, gRows0, expertFF, g.data());
-                    upM->matMulVecRows(x, gRows0, expertFF, u.data());
+            const uint32_t nGroups = static_cast<uint32_t>(gExpert.size());
+            const uint32_t nPairs = static_cast<uint32_t>(memberPair.size());
+            if (nGroups != 0 &&
+                nPairs == static_cast<uint32_t>(seqLen) * eu) {
+                static thread_local std::vector<float> gateBuf, upBuf;
+                gateBuf.resize(static_cast<size_t>(nPairs) * expertFF);
+                upBuf.resize(static_cast<size_t>(nPairs) * expertFF);
+                const uint64_t gRB = rowBytes(gateM);
+                const uint64_t uRB = rowBytes(*upM);
+                const uint64_t dRB = rowBytes(w.ffnDownExpsMoe);
+                bool ok = matMulVecBatchQ8_0Groups_SIMD(
+                        gateM.data.data(), expertFF, gRB, gExpert.data(),
+                        gFirst.data(), gCount.data(), nGroups,
+                        memberPair.data(), memberXRow.data(), nPairs, ffnNorm,
+                        hiddenSize, gateBuf.data());
+                if (ok)
+                    ok = matMulVecBatchQ8_0Groups_SIMD(
+                            upM->data.data(), expertFF, uRB, gExpert.data(),
+                            gFirst.data(), gCount.data(), nGroups,
+                            memberPair.data(), memberXRow.data(), nPairs,
+                            ffnNorm, hiddenSize, upBuf.data());
+                if (ok) {
+                    // Capture the DATA POINTERS, not the thread_local vector
+                    // objects: a worker resolving a thread_local reference
+                    // against its own (never resized) instance reads a null
+                    // buffer.
+                    float *const gBase = gateBuf.data();
+                    const float *const uBase = upBuf.data();
+                    ThreadPool::current().parallelForSlab(
+                            0, nPairs, [&, gBase, uBase](uint32_t p) {
+                                float *g = gBase +
+                                           static_cast<size_t>(p) * expertFF;
+                                const float *u = uBase +
+                                                 static_cast<size_t>(p) *
+                                                         expertFF;
+                                for (uint32_t i = 0; i < expertFF; ++i)
+                                    g[i] = (g[i] /
+                                            (1.0f + std::exp(-g[i]))) *
+                                           u[i];
+                            });
+                    ok = matMulVecBatchQ8_0Groups_SIMD(
+                            w.ffnDownExpsMoe.data.data(), hiddenSize, dRB,
+                            gExpert.data(), gFirst.data(), gCount.data(),
+                            nGroups, memberPair.data(), memberPair.data(),
+                            nPairs, gateBuf.data(), expertFF,
+                            partial.data());
                 }
-                for (uint32_t i = 0; i < expertFF; ++i) {
-                    g[i] = (g[i] / (1.0f + std::exp(-g[i]))) * u[i];
-                }
-                w.ffnDownExpsMoe.matMulVecRows(g.data(), dRows0, hiddenSize,
-                                               d.data());
-                float *dst = partial.data() +
-                             (static_cast<size_t>(s) * eu + r) * hiddenSize;
-                for (uint32_t i = 0; i < hiddenSize; ++i) {
-                    dst[i] = wg * d[i];
+                if (ok) {
+                    // The routing weight is applied inside the reduction
+                    // below (per (s, rank), where the pair index is exact), so
+                    // the separate nPairs x hidden scaling pass over 33 MB per
+                    // layer is not needed: it was 2.6 GB of read+write traffic
+                    // per prefill.
+                    fusedDone = true;
                 }
             }
         }
 
+        if (!fusedDone) {
+            for (uint32_t ue = 0; ue < expertCount; ++ue) {
+                const auto &members = expertGroups[ue];
+                const uint32_t grpCount = static_cast<uint32_t>(members.size());
+                if (grpCount == 0) continue;
+
+                const uint32_t gRows0 = ue * expertFF;
+                const uint32_t dRows0 = ue * hiddenSize;
+
+                if (canBatch) {
+                    // Gather the group's x rows (contiguous [grpCount][hiddenSize]).
+                    // Stream from ffnNorm (read-only) into the reusable scratch.
+                    for (uint32_t m = 0; m < grpCount; ++m) {
+                        const uint32_t s = members[m].first;
+                        const uint32_t r = members[m].second;
+                        grpS[m] = s;
+                        grpR[m] = r;
+                        std::memcpy(grpX.data() + static_cast<size_t>(m) * hiddenSize,
+                                    ffnNorm + static_cast<size_t>(s) * hiddenSize,
+                                    hiddenSize * sizeof(float));
+                    }
+
+                    const uint8_t *gateRows, *upRows, *downRows;
+                    if (fused) {
+                        // Fused [exp*ff*2, hidden]: gate half then up half, both
+                        // inside the same matrix (rows e*ff*2 .. e*ff*2 + 2*ff).
+                        const uint64_t gBpr = rowBytes(gateM);
+                        gateRows = gateM.data.data() +
+                                   static_cast<uint64_t>(gRows0) * 2 * gBpr;
+                        upRows = gateRows + static_cast<uint64_t>(expertFF) * gBpr;
+                    } else {
+                        // Separate gate/up matrices, same row base.
+                        gateRows = gateM.data.data() +
+                                   static_cast<uint64_t>(gRows0) * rowBytes(gateM);
+                        upRows = upM->data.data() +
+                                 static_cast<uint64_t>(gRows0) * rowBytes(*upM);
+                    }
+                    downRows = w.ffnDownExpsMoe.data.data() +
+                               static_cast<uint64_t>(dRows0) *
+                                       rowBytes(w.ffnDownExpsMoe);
+
+                    const double tB0 = cpuProf ? cpuNow() : 0.0;
+                    if (routeBatch(grpCount, gateRows, upRows, downRows)) {
+                        if (cpuProf) tGemm += cpuNow() - tB0;
+                        const double tS0 = cpuProf ? cpuNow() : 0.0;
+                        // Scatter the weighted partials into the disjoint slab
+                        // rows (bit-identical wg * down per (s, r)).
+                        for (uint32_t m = 0; m < grpCount; ++m) {
+                            const uint32_t s = grpS[m];
+                            const uint32_t r = grpR[m];
+                            const float wg =
+                                    expertWgt[static_cast<size_t>(s) * eu + r];
+                            const float *src =
+                                    grpD.data() + static_cast<size_t>(m) * hiddenSize;
+                            float *dst = partial.data() +
+                                         (static_cast<size_t>(s) * eu + r) * hiddenSize;
+                            for (uint32_t i = 0; i < hiddenSize; ++i) {
+                                dst[i] = wg * src[i];
+                            }
+                        }
+                        if (cpuProf) tScatter += cpuNow() - tS0;
+                        continue;
+                    }
+                }
+
+                // Fallback (non-AVX2 host / forceScalar / non-batchable layout):
+                // the exact per-member single-token math (identical results).  The
+                // fused row base is e*ff*2 (gate half then up half) — same as the
+                // reference computeQwen35MoE.
+                std::vector<float> g(expertFF), u(expertFF), d(hiddenSize);
+                for (uint32_t m = 0; m < grpCount; ++m) {
+                    const uint32_t s = members[m].first;
+                    const uint32_t r = members[m].second;
+                    const float wg = expertWgt[static_cast<size_t>(s) * eu + r];
+                    const float *x = ffnNorm + static_cast<size_t>(s) * hiddenSize;
+                    if (fused) {
+                        gateM.matMulVecRows(x, gRows0 * 2, expertFF, g.data());
+                        gateM.matMulVecRows(x, gRows0 * 2 + expertFF, expertFF,
+                                            u.data());
+                    } else {
+                        gateM.matMulVecRows(x, gRows0, expertFF, g.data());
+                        upM->matMulVecRows(x, gRows0, expertFF, u.data());
+                    }
+                    for (uint32_t i = 0; i < expertFF; ++i) {
+                        g[i] = (g[i] / (1.0f + std::exp(-g[i]))) * u[i];
+                    }
+                    w.ffnDownExpsMoe.matMulVecRows(g.data(), dRows0, hiddenSize,
+                                                   d.data());
+                    float *dst = partial.data() +
+                                 (static_cast<size_t>(s) * eu + r) * hiddenSize;
+                    for (uint32_t i = 0; i < hiddenSize; ++i) {
+                        dst[i] = wg * d[i];
+                    }
+                }
+            }
+        }
         // Reduce the per-(s, r) partials into ffnOut in rank order (matches the
         // reference accumulation: rank 0 first ... rank eu-1 last).
         std::fill(ffnOut, ffnOut + static_cast<size_t>(seqLen) * hiddenSize, 0.0f);
-        for (uint32_t s = 0; s < seqLen; ++s) {
+        auto reduceToken = [&](uint32_t s) {
             float *o = ffnOut + static_cast<size_t>(s) * hiddenSize;
             for (uint32_t r = 0; r < eu; ++r) {
-                const float *src = partial.data() +
-                                   (static_cast<size_t>(s) * eu + r) * hiddenSize;
-                for (uint32_t i = 0; i < hiddenSize; ++i) {
-                    o[i] += src[i];
+                const size_t p = static_cast<size_t>(s) * eu + r;
+                const float *src = partial.data() + p * hiddenSize;
+                if (fusedDone) {
+                    // Fused partials are unweighted (down kernel output).
+                    const float wg = expertWgt[p];
+                    for (uint32_t i = 0; i < hiddenSize; ++i) {
+                        o[i] += wg * src[i];
+                    }
+                } else {
+                    // Per-group path already scaled its partials.
+                    for (uint32_t i = 0; i < hiddenSize; ++i) {
+                        o[i] += src[i];
+                    }
                 }
             }
+        };
+        if (seqLen > 1) {
+            // This reduction is independent per token; it was the third-largest
+            // prefill item (29 ms/layer at seq=512) because the serial loop is
+            // latency-bound.  Rank order is preserved WITHIN each token, which
+            // is the reference accumulation order.
+            ThreadPool::current().parallelForSlab(0, seqLen, reduceToken);
+        } else {
+            reduceToken(0);
         }
         if (cpuProf) {
             const double total = cpuNow() - tR0;

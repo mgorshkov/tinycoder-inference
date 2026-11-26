@@ -24,7 +24,7 @@ MODEL="${1:?usage: $0 <checkpoint> [llama extra args...]}"
 shift || true
 LLAMA_ARGS=("$@")
 
-BENCH="$ROOT/build-1.0/benchmarks/tinycoder_bench"
+BENCH="${TINYCODER_BENCH:-$ROOT/build/benchmarks/tinycoder_bench}"
 LLAMA_BENCH="${LLAMA_BENCH:-${LLAMA_DIR}/build-cuda/bin/llama-bench}"
 LLAMA_LIB="${LLAMA_LIB:-${LLAMA_DIR}/build-cuda/bin}"
 PAIRS="${PAIRS:-3}"
@@ -79,7 +79,10 @@ def tiny(path):
     out = {'pp512': [], 'tg128': []}
     # "tg128 | 36 threads | 93.14 +/- 0.00 tok/s | ... || pp512 | 2777.3 +/- 0.0 tok/s | ..."
     for line in open(path, errors='ignore'):
-        for key, val in re.findall(r'\b(pp512|tg128) \|[^|]*\| ([\d.]+) tok/s', line):
+        # "tg128 | 36 threads | 13.74 +/- 0.00 tok/s | ...": the MEAN is the
+        # number before "+/-"; the bare "([\d.]+) tok/s" form matched nothing
+        # (or the +/- stdev) and silently produced 0 runs.
+        for key, val in re.findall(r'\b(pp512|tg128) \| (?:[^|]*\| )?([\d.]+) \+/-', line):
             out[key].append(float(val))
     return out
 

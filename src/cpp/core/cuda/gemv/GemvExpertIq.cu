@@ -161,26 +161,26 @@ namespace {
 // Host launchers.  The names match the DECL_GEMV_EXPERT / int8GemvExpert
 // dispatch in gemm/GemmDispatch.cu; grid and block are the expert shape.
 
-#define GEMV_EXPERT_IQ_ENTRY(tag, block_q_t, qk_val, qi_val, vdr_val, vec_dot)   \
-    extern "C" __global__ void gemvExpert##tag##F32(                            \
-            const void *__restrict__ vx, const void *__restrict__ vy,           \
-            float *__restrict__ dst, const int ncols_x, const int nrows_x,      \
-            const int stride_col_y, const int *__restrict__ rowIdx,             \
-            const int rowsPer) {                                                \
-        gemvExpertIqCore<qk_val, qi_val, block_q_t, vdr_val, vec_dot>(          \
-                vx, (const block_q8_1 *) vy, dst, ncols_x, nrows_x,             \
-                stride_col_y, rowIdx, rowsPer);                                 \
-    }                                                                           \
-    extern "C" void gemvLaunchExpert##tag(                                      \
-            const void *vx, const void *vy, void *dst, int ncols_x,             \
-            int nrows_x, int stride_col_y, const int *rowIdx, int rowsPer,      \
-            void *stream) {                                                     \
-        dim3 grid((unsigned int) nrows_x, 1, 1);                                \
-        dim3 block(WARP_SIZE, 4, 1);                                            \
-        gemvExpert##tag##F32<<<grid, block, 0,                                  \
-                               static_cast<cudaStream_t>(stream)>>>(            \
-                vx, vy, (float *) dst, ncols_x, nrows_x, stride_col_y, rowIdx,  \
-                rowsPer);                                                       \
+#define GEMV_EXPERT_IQ_ENTRY(tag, block_q_t, qk_val, qi_val, vdr_val, vec_dot) \
+    extern "C" __global__ void gemvExpert##tag##F32(                           \
+            const void *__restrict__ vx, const void *__restrict__ vy,          \
+            float *__restrict__ dst, const int ncols_x, const int nrows_x,     \
+            const int stride_col_y, const int *__restrict__ rowIdx,            \
+            const int rowsPer) {                                               \
+        gemvExpertIqCore<qk_val, qi_val, block_q_t, vdr_val, vec_dot>(         \
+                vx, (const block_q8_1 *) vy, dst, ncols_x, nrows_x,            \
+                stride_col_y, rowIdx, rowsPer);                                \
+    }                                                                          \
+    extern "C" void gemvLaunchExpert##tag(                                     \
+            const void *vx, const void *vy, void *dst, int ncols_x,            \
+            int nrows_x, int stride_col_y, const int *rowIdx, int rowsPer,     \
+            void *stream) {                                                    \
+        dim3 grid((unsigned int) nrows_x, 1, 1);                               \
+        dim3 block(WARP_SIZE, 4, 1);                                           \
+        gemvExpert##tag##F32<<<grid, block, 0,                                 \
+                               static_cast<cudaStream_t>(stream)>>>(           \
+                vx, vy, (float *) dst, ncols_x, nrows_x, stride_col_y, rowIdx, \
+                rowsPer);                                                      \
     }
 
 // IQ2_XXS: QR2_XXS = 4, QI2_XXS = 16, VDR = 2 (same shape as IQ2_XS).
@@ -194,7 +194,7 @@ GEMV_EXPERT_IQ_ENTRY(IQ1S, block_iq1_s, QK_K, QI1_S, VDR_IQ1_S_Q8_1_GEMV,
 // already have their own one-row kernels in Gemv.cu, so only the 4-row entries
 // are added for them here -- the one-row symbols would collide.
 
-#define GEMV_EXPERT4_IQ_ENTRY(tag, block_q_t, qk_val, qi_val, vdr_val, vec_dot)  \
+#define GEMV_EXPERT4_IQ_ENTRY(tag, block_q_t, qk_val, qi_val, vdr_val, vec_dot) \
     extern "C" __global__ void gemvExpert4##tag##F32(                           \
             const void *__restrict__ vx, const void *__restrict__ vy,           \
             float *__restrict__ dst, const int ncols_x, const int nrows_x,      \

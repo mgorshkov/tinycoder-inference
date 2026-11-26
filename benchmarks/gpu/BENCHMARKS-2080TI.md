@@ -24,7 +24,7 @@ with the old and new path in the same binary.
 | [Ternary-Bonsai-2-27B `pq2_0` (Prism)](https://huggingface.co/prism-ml/Ternary-Bonsai-2-27B-gguf/resolve/main/Ternary-Bonsai-2-27B-PQ2_0.gguf) | 6.7 GB | full offload | **880.6 tok/s** | **51.73 tok/s** | PrismML llama.cpp (fork) | 878.5 tok/s | 50.36 tok/s |
 | [Ternary-Bonsai-2-27B `ptq1_0` (Prism)](https://huggingface.co/prism-ml/Ternary-Bonsai-2-27B-gguf/resolve/main/Ternary-Bonsai-2-27B-PTQ1_0.gguf) | 5.5 GB | full offload | **880.7 tok/s** | 51.73 tok/s | PrismML llama.cpp (fork) | 848.1 tok/s | **65.29 tok/s** |
 | [Ornith-1.5-9B `q4_k_m`](https://huggingface.co/bartowski/Ornith-1.5-9B-GGUF/resolve/main/Ornith-1.5-9B-Q4_K_M.gguf) | 5.9 GB | full offload | 2,575.7 tok/s | **85.8 tok/s** | llama.cpp | **2,652.0 tok/s** | 84.2 tok/s |
-| [Ornith-1.5-35B-A3B `q8_0` → `q4_k` experts](https://huggingface.co/AtomicChat/Ornith-1.5-35B-A3B-GGUF/resolve/main/Ornith-1.5-35B-A3B-Q8_0.gguf) | 34.4 GB | **hybrid only** (experts in RAM, layer arena) | **133.4 tok/s** | **24.10 tok/s** | llama.cpp `-ncmoe 99` | 132.2 tok/s | 17.1 tok/s |
+| [Ornith-1.5-35B-A3B `q8_0` (native, staged FFNs)](https://huggingface.co/AtomicChat/Ornith-1.5-35B-A3B-GGUF/resolve/main/Ornith-1.5-35B-A3B-Q8_0.gguf) | 34.4 GB | **hybrid** (Q8_0 experts in RAM; per-layer CPU/GPU split) | **141.2 tok/s** | **22.5 tok/s** | llama.cpp `-ncmoe 99` | 140.5 tok/s | 21.9 tok/s |
 | [Inkling-2-Mini `iq2_xxs`](https://huggingface.co/unsloth/Inkling-2-Mini-GGUF/resolve/main/Inkling-2-Mini-UD-IQ2_XXS.gguf) | 8.5 GB | full offload | **1200.0 tok/s** | **47.0 tok/s** | llama.cpp CUDA (`-ngl 99`, ctx 2048) | 883.6 tok/s | 44.3 tok/s |
 | [Qwen3.8-27B EXL3 `1.60bpw`](https://huggingface.co/turboderp/Qwen3.8-27B-exl3/tree/SC_1.60bpw_H3) | 8.6 GB | full offload | **725.8 tok/s** | **29.83 tok/s** | exllamav3 1.6.6 | 716.8 tok/s | 23.67 tok/s |
 
@@ -35,10 +35,27 @@ three pairs, spread (max - min)/2. The 27B EXL3 TinyCoder cells were re-checked 
 way (three serial runs: pp512 725.1 +/- 1.3, tg128 29.79 +/- 0.04) and unchanged.
 
 The Ornith-1.5-35B-A3B row describes **one configuration only**: the hybrid mode in which
-the expert FFNs live in system RAM and both columns run the same expert-offload mode
-(`-ncmoe 99` on the llama.cpp side). It is not a statement about the model on a fully
-GPU-resident path, and it must not be compared against one; at 34.4 GB the model does not
-fit on this card, so no fully resident number exists for it here.
+the routed expert FFNs are split per layer between the CPU (streaming the checkpoint's native
+**Q8_0** bytes from system RAM) and the GPU (a pinned, per-layer staged slice), and both columns
+use the same expert-offload mode (`-ncmoe 99` on the llama.cpp side).
+Neither side requantises: native Q8_0 expert blobs run CPU FFNs by default (the
+device LRU cache does not support the 3.34 MB Q8_0 slot; it remains the default for
+K-quant experts). The CPU path is llama.cpp-shaped: a Q8_0 GEMV with one
+accumulator per (row, token), a 4-row x 2-token tile, F16C scales, and one fused
+dispatch per matrix for the whole layer (work-stealing over the expert-group x
+row-tile axis for prefill; a static split for decode). It is not a statement about the model on a fully
+GPU-resident path, and it must not be compared against one; at 34.4 GB the model
+does not fit on this card, so no fully resident number exists for it here.
+
+The row is the **staged split**, which is the default: each layer's first 68% of experts are
+mirrored into pinned host memory at load, copied per layer over PCIe on a second stream, and
+multiplied by the int8 tensor-core GEMM, while the CPU streams the remaining 32% of that layer's
+experts from RAM at the same time. The two channels run concurrently, so the row is 141.2 tok/s
+instead of the 126.3 tok/s the CPU-only path gives on the same tree (decode is unaffected, because
+the split is prefill-only: the shared arena holds the layer most recently staged). The fraction is a
+measured optimum, not a tuned constant: 0.50 gives 115.1, 0.65 gives 140.5, 0.68 gives 141.2, 0.80
+gives 136.2, 1.00 gives 113.2. It costs about 23 GB of pinned host RAM and 1.1 GB of VRAM, so a host-RAM guard declines it (falling back to the 126.3 tok/s CPU path) when that memory is not available;
+`TINYCODER_MOE_STAGE=0` disables it and `TINYCODER_MOE_STAGE=<f>` sets another fraction.
 
 ## How the exllamav3 EXL3 baseline was measured
 

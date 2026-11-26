@@ -185,9 +185,9 @@ void gemvLaunchQuantizeQ8F32(const void *x, void *vy, int kx,
                              void *stream);
 // Expert-indexed Q8_1 GEMV: rowsPer*nUsed rows in one launch, weight rows
 // reached through a device-side expert index (routed MoE, no host sync).
-#define DECL_GEMV_EXPERT(tag)                                                 \
-    void gemvLaunchExpert##tag(const void *vx, const void *vy, void *dst,     \
-                               int ncols_x, int nrows_x, int stride_col_y,    \
+#define DECL_GEMV_EXPERT(tag)                                              \
+    void gemvLaunchExpert##tag(const void *vx, const void *vy, void *dst,  \
+                               int ncols_x, int nrows_x, int stride_col_y, \
                                const int *rowIdx, int rowsPer, void *stream);
 DECL_GEMV_EXPERT(Q4K)
 DECL_GEMV_EXPERT(Q5K)
@@ -204,9 +204,9 @@ DECL_GEMV_EXPERT(IQ2XXS)
 DECL_GEMV_EXPERT(IQ1S)
 // Four-rows-per-warp variants of the same expert entries (decode gate/up):
 // one warp per four rows, shared Q8_1 activation row, no stride_col_y.
-#define DECL_GEMV_EXPERT4(tag)                                                \
-    void gemvLaunchExpert4##tag(const void *vx, const void *vy, void *dst,    \
-                                int ncols_x, int nrows_x, const int *rowIdx,  \
+#define DECL_GEMV_EXPERT4(tag)                                               \
+    void gemvLaunchExpert4##tag(const void *vx, const void *vy, void *dst,   \
+                                int ncols_x, int nrows_x, const int *rowIdx, \
                                 int rowsPer, void *stream);
 DECL_GEMV_EXPERT4(IQ2XXS)
 DECL_GEMV_EXPERT4(IQ2XS)
@@ -383,69 +383,69 @@ namespace tinycoder::gpu {
             return setSmemAttrImpl(int8GemmStreamKQ6KTile32, bytes);
         }
 
-    namespace {
-        // ---------------------------------------------------------------------
-        // Fallback accounting for the int8 GEMM.
-        //
-        // `int8Gemm` returning false means the caller silently runs the integer
-        // `kQGemmKxQ8K` kernel instead: correct, several times slower on a
-        // prefill, and invisible in every number the engine reports.  That is
-        // how a missing Q6_K launch branch survived here -- the only symptom
-        // was one stderr line per call, and nothing read it.
-        //
-        // Only the *unexpected* failures are reported: the early "not my shape"
-        // returns (small batch, unaligned cols, unsupported type) are the
-        // dispatch doing its job, and logging them would fire on every decode
-        // step.  Each distinct (reason, type, shape) warns once; a single total
-        // line is printed at exit so a benchmark cannot end without the reader
-        // learning that some fraction of the prefill never reached the tensor
-        // cores.
-        struct Int8Fallback {
-            const char *reason;
-            int type;
-            uint32_t rows, cols, seqLen;
-        };
-        std::mutex &fallbackMutex() {
-            static std::mutex m;
-            return m;
-        }
-        std::vector<Int8Fallback> &fallbackSeen() {
-            static std::vector<Int8Fallback> v;
-            return v;
-        }
-        unsigned long &fallbackCount() {
-            static unsigned long n = 0;
-            return n;
-        }
-
-        void printFallbackTotal() {
-            const unsigned long n = fallbackCount();
-            if (n == 0) return;
-            std::fprintf(stderr,
-                         "[int8] %lu int8-GEMM call(s) fell back to the integer kernel "
-                         "(%zu distinct shape(s) reported above); prefill did not use the "
-                         "tensor cores for those\n",
-                         n, fallbackSeen().size());
-        }
-
-        void noteInt8Fallback(const char *reason, int type, uint32_t rows,
-                              uint32_t cols, uint32_t seqLen) {
-            std::lock_guard<std::mutex> lock(fallbackMutex());
-            ++fallbackCount();
-            for (const auto &f: fallbackSeen()) {
-                if (f.reason == reason && f.type == type && f.rows == rows &&
-                    f.cols == cols && f.seqLen == seqLen) {
-                    return;
-                }
+        namespace {
+            // ---------------------------------------------------------------------
+            // Fallback accounting for the int8 GEMM.
+            //
+            // `int8Gemm` returning false means the caller silently runs the integer
+            // `kQGemmKxQ8K` kernel instead: correct, several times slower on a
+            // prefill, and invisible in every number the engine reports.  That is
+            // how a missing Q6_K launch branch survived here -- the only symptom
+            // was one stderr line per call, and nothing read it.
+            //
+            // Only the *unexpected* failures are reported: the early "not my shape"
+            // returns (small batch, unaligned cols, unsupported type) are the
+            // dispatch doing its job, and logging them would fire on every decode
+            // step.  Each distinct (reason, type, shape) warns once; a single total
+            // line is printed at exit so a benchmark cannot end without the reader
+            // learning that some fraction of the prefill never reached the tensor
+            // cores.
+            struct Int8Fallback {
+                const char *reason;
+                int type;
+                uint32_t rows, cols, seqLen;
+            };
+            std::mutex &fallbackMutex() {
+                static std::mutex m;
+                return m;
             }
-            if (fallbackSeen().empty()) std::atexit(printFallbackTotal);
-            fallbackSeen().push_back({reason, type, rows, cols, seqLen});
-            std::fprintf(stderr,
-                         "[int8] fallback: %s (type=%d k=%u n=%u m=%u) -- this shape now "
-                         "runs the integer kernel, not the tensor cores\n",
-                         reason, type, cols, rows, seqLen);
-        }
-    }// namespace
+            std::vector<Int8Fallback> &fallbackSeen() {
+                static std::vector<Int8Fallback> v;
+                return v;
+            }
+            unsigned long &fallbackCount() {
+                static unsigned long n = 0;
+                return n;
+            }
+
+            void printFallbackTotal() {
+                const unsigned long n = fallbackCount();
+                if (n == 0) return;
+                std::fprintf(stderr,
+                             "[int8] %lu int8-GEMM call(s) fell back to the integer kernel "
+                             "(%zu distinct shape(s) reported above); prefill did not use the "
+                             "tensor cores for those\n",
+                             n, fallbackSeen().size());
+            }
+
+            void noteInt8Fallback(const char *reason, int type, uint32_t rows,
+                                  uint32_t cols, uint32_t seqLen) {
+                std::lock_guard<std::mutex> lock(fallbackMutex());
+                ++fallbackCount();
+                for (const auto &f: fallbackSeen()) {
+                    if (f.reason == reason && f.type == type && f.rows == rows &&
+                        f.cols == cols && f.seqLen == seqLen) {
+                        return;
+                    }
+                }
+                if (fallbackSeen().empty()) std::atexit(printFallbackTotal);
+                fallbackSeen().push_back({reason, type, rows, cols, seqLen});
+                std::fprintf(stderr,
+                             "[int8] fallback: %s (type=%d k=%u n=%u m=%u) -- this shape now "
+                             "runs the integer kernel, not the tensor cores\n",
+                             reason, type, cols, rows, seqLen);
+            }
+        }// namespace
 
         // Q6_K on the int8 tensor path: on by default (it agrees with the fp64
         // reference on real weights to 3.4e-4, tools/int8_gemm_parity) and off

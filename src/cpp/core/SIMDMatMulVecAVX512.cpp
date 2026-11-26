@@ -541,5 +541,423 @@ namespace tinycoder::simd {
                 tinycoder::GGMLDequantize::dequantizeIQ1_SBlock);
     }
 
+    // ---- AVX-512 Q8_0 batch GEMM (qwen35moe routed experts) ----
+    // Same contract and block math as matMulVecBatchQ8_0_Q8K_AVX2: out[s*rows +
+    // row] = sum_k X[s*cols + k] * W[row*cols + k], with each token's activation
+    // quantised to Q8_0 once (two-phase dispatch, rows split across the pool)
+    // and every 32-weight block's exact int8 dot scaled by d * d8.
+    //
+    // The 512-bit part is the byte work only: two consecutive 32-weight blocks
+    // share one 64-byte activation load, one sign fold and one
+    // _mm512_maddubs_epi16 + _mm512_madd_epi16.  The low and high 256-bit
+    // halves of the result are exactly the two blocks' int32 sums, and each is
+    // scaled and reduced with the same _mm256_mul_ps(d*d8, cvt) + hsum sequence
+    // the AVX2 kernel uses, in block order.  The FP accumulation order is
+    // therefore identical and this kernel is bit-exact with the AVX2 one.
+    // ---- AVX-512 Q8_0 4-row x 2-token tile -------------------------------
+    // Same tile as the AVX2 4x2 kernel (tinyBLAS_Q0_AVX's AVX2 choice), with
+    // the 512-bit op covering TWO 32-weight blocks of a token: xq is
+    // token-major, so bytes [b*32, b*32+64) are blocks b and b+1.  The low and
+    // high 256-bit halves are accumulated into the same (row, token)
+    // accumulator in block order, so batch and sequential stay bit-identical
+    // to each other and to the AVX2 kernel.
+    template<uint32_t RN, uint32_t SN>
+    static inline void q8DotTile512(const uint8_t *const *rowBase,
+                                    const int8_t *const *xqS,
+                                    const float *const *xdS,
+                                    uint32_t blocksPerRow,
+                                    float *const *outPtr) {
+        static constexpr uint32_t BLOCK_SIZE = 32;
+        static constexpr uint32_t Q8_0_BLOCK_BYTES = 34;
+        __m256 acc[RN][SN];
+        const __m256i one16 = _mm256_set1_epi16(1);
+        const __m512i one16_512 = _mm512_set1_epi16(1);
+#pragma GCC unroll 2
+        for (uint32_t t = 0; t < SN; ++t)
+#pragma GCC unroll 4
+            for (uint32_t q = 0; q < RN; ++q)
+                acc[q][t] = _mm256_setzero_ps();
+        uint32_t b = 0;
+        for (; b + 2u <= blocksPerRow; b += 2u) {
+            __m512i xabs[SN];
+            __mmask64 neg[SN];
+#pragma GCC unroll 2
+            for (uint32_t t = 0; t < SN; ++t) {
+                const __m512i xqb = _mm512_loadu_si512(
+                        reinterpret_cast<const void *>(xqS[t] +
+                                                       b * BLOCK_SIZE));
+                xabs[t] = _mm512_abs_epi8(xqb);
+                neg[t] = _mm512_movepi8_mask(xqb);
+            }
+#pragma GCC unroll 4
+            for (uint32_t q = 0; q < RN; ++q) {
+                const uint8_t *blk0 =
+                        rowBase[q] +
+                        static_cast<uint64_t>(b) * Q8_0_BLOCK_BYTES;
+                const uint8_t *blk1 = blk0 + Q8_0_BLOCK_BYTES;
+                const float d0 = _cvtsh_ss(
+                        *reinterpret_cast<const uint16_t *>(blk0));
+                const float d1 = _cvtsh_ss(
+                        *reinterpret_cast<const uint16_t *>(blk1));
+                const __m256i w0 = _mm256_loadu_si256(
+                        reinterpret_cast<const __m256i *>(blk0 + 2));
+                const __m256i w1 = _mm256_loadu_si256(
+                        reinterpret_cast<const __m256i *>(blk1 + 2));
+                const __m512i wq = _mm512_inserti64x4(
+                        _mm512_castsi256_si512(w0), w1, 1);
+#pragma GCC unroll 2
+                for (uint32_t t = 0; t < SN; ++t) {
+                    const __m512i wsign = _mm512_mask_sub_epi8(
+                            wq, neg[t], _mm512_setzero_si512(), wq);
+                    const __m512i prod =
+                            _mm512_maddubs_epi16(xabs[t], wsign);
+                    const __m512i sumi =
+                            _mm512_madd_epi16(prod, one16_512);
+                    acc[q][t] = _mm256_fmadd_ps(
+                            _mm256_set1_ps(d0 * xdS[t][b]),
+                            _mm256_cvtepi32_ps(
+                                    _mm512_castsi512_si256(sumi)),
+                            acc[q][t]);
+                    acc[q][t] = _mm256_fmadd_ps(
+                            _mm256_set1_ps(d1 * xdS[t][b + 1]),
+                            _mm256_cvtepi32_ps(
+                                    _mm512_extracti64x4_epi64(sumi, 1)),
+                            acc[q][t]);
+                }
+            }
+        }
+        for (; b < blocksPerRow; ++b) {
+            __m256i xqb[SN];
+            __m256i xabs[SN];
+#pragma GCC unroll 2
+            for (uint32_t t = 0; t < SN; ++t) {
+                xqb[t] = _mm256_loadu_si256(
+                        reinterpret_cast<const __m256i *>(xqS[t] +
+                                                          b * BLOCK_SIZE));
+                xabs[t] = _mm256_sign_epi8(xqb[t], xqb[t]);
+            }
+#pragma GCC unroll 4
+            for (uint32_t q = 0; q < RN; ++q) {
+                const uint8_t *block =
+                        rowBase[q] +
+                        static_cast<uint64_t>(b) * Q8_0_BLOCK_BYTES;
+                const float d = _cvtsh_ss(
+                        *reinterpret_cast<const uint16_t *>(block));
+                const __m256i wq = _mm256_loadu_si256(
+                        reinterpret_cast<const __m256i *>(block + 2));
+#pragma GCC unroll 2
+                for (uint32_t t = 0; t < SN; ++t) {
+                    const __m256i wsign = _mm256_sign_epi8(wq, xqb[t]);
+                    const __m256i prod =
+                            _mm256_maddubs_epi16(xabs[t], wsign);
+                    const __m256i sumi = _mm256_madd_epi16(prod, one16);
+                    acc[q][t] = _mm256_fmadd_ps(
+                            _mm256_set1_ps(d * xdS[t][b]),
+                            _mm256_cvtepi32_ps(sumi), acc[q][t]);
+                }
+            }
+        }
+        auto hsum8 = [](__m256 v) -> float {
+            __m128 s = _mm_add_ps(_mm256_castps256_ps128(v),
+                                  _mm256_extractf128_ps(v, 1));
+            s = _mm_hadd_ps(s, s);
+            s = _mm_hadd_ps(s, s);
+            return _mm_cvtss_f32(s);
+        };
+#pragma GCC unroll 2
+        for (uint32_t t = 0; t < SN; ++t)
+#pragma GCC unroll 4
+            for (uint32_t q = 0; q < RN; ++q)
+                outPtr[t][q] = hsum8(acc[q][t]);
+    }
+
+    void matMulVecBatchQ8_0_Q8K_AVX512(const uint8_t *W_q8_0, const float *X,
+                                       uint32_t seqLen, uint32_t rows,
+                                       uint32_t cols, float *out) {
+        // Same llama.cpp-shaped loop as the AVX2 kernel: token-outer,
+        // row-tile-inner, one accumulator per (row, token), hsum once.  The
+        // 512-bit op covers TWO consecutive 32-weight blocks of the same
+        // token (xq is token-major, so 64 bytes are contiguous); the low/high
+        // 256-bit halves are fmadd'ed into the row's accumulator in block
+        // order, which keeps it bit-exact with the AVX2 kernel.
+        static constexpr uint32_t BLOCK_SIZE = 32;
+        static constexpr uint32_t Q8_0_BLOCK_BYTES = 34;
+        static constexpr uint32_t TILE_ROWS = 4;
+        static constexpr uint32_t ROW_GROUP = 4;
+        const uint32_t blocksPerRow = (cols + BLOCK_SIZE - 1) / BLOCK_SIZE;
+        const uint64_t rowStride =
+                static_cast<uint64_t>(blocksPerRow) * Q8_0_BLOCK_BYTES;
+        auto halfToFloat = [](uint16_t h) -> float {
+            return _cvtsh_ss(h);
+        };
+        auto hsum8 = [](__m256 v) -> float {
+            __m128 s = _mm_add_ps(_mm256_castps256_ps128(v),
+                                  _mm256_extractf128_ps(v, 1));
+            s = _mm_hadd_ps(s, s);
+            s = _mm_hadd_ps(s, s);
+            return _mm_cvtss_f32(s);
+        };
+
+        std::vector<float> xd(static_cast<size_t>(seqLen) * blocksPerRow);
+        std::vector<int8_t> xq(static_cast<size_t>(seqLen) * blocksPerRow *
+                               BLOCK_SIZE);
+        const __m256i one16 = _mm256_set1_epi16(1);
+        const __m512i one16_512 = _mm512_set1_epi16(1);
+        const uint32_t numTiles = (rows + TILE_ROWS - 1) / TILE_ROWS;
+
+        ThreadPool::current().parallelForSlab2(
+                0, seqLen,
+                [&](uint32_t s) {
+                    const float *xs = X + static_cast<size_t>(s) * cols;
+                    int8_t *xqs = xq.data() +
+                                  static_cast<size_t>(s) * blocksPerRow *
+                                          BLOCK_SIZE;
+                    for (uint32_t b = 0; b < blocksPerRow; ++b) {
+                        float amax = 0.0f, maxv = 0.0f;
+                        for (uint32_t j = 0; j < BLOCK_SIZE; ++j) {
+                            float ax = std::fabs(xs[b * BLOCK_SIZE + j]);
+                            if (ax > amax) {
+                                amax = ax;
+                                maxv = xs[b * BLOCK_SIZE + j];
+                            }
+                        }
+                        const uint32_t idx = s * blocksPerRow + b;
+                        if (amax == 0.0f) {
+                            xd[idx] = 0.0f;
+                            std::memset(xqs + b * BLOCK_SIZE, 0, BLOCK_SIZE);
+                            continue;
+                        }
+                        const float iscale = -127.0f / maxv;
+                        for (uint32_t j = 0; j < BLOCK_SIZE; ++j) {
+                            int v = static_cast<int>(std::lrintf(iscale * xs[b * BLOCK_SIZE + j]));
+                            xqs[b * BLOCK_SIZE + j] = static_cast<int8_t>(std::min(127, v));
+                        }
+                        xd[idx] = 1.0f / iscale;
+                    }
+                },
+                [] {},
+                0, numTiles,
+                [&](uint32_t tile) {
+                    const uint32_t rowStart = tile * TILE_ROWS;
+                    const uint32_t nRows =
+                            std::min(TILE_ROWS, rows - rowStart);
+                    for (uint32_t s0 = 0; s0 < seqLen; s0 += 2) {
+                        const bool two = (s0 + 1 < seqLen);
+                        const int8_t *xqP[2] = {
+                                xq.data() +
+                                        static_cast<size_t>(s0) * blocksPerRow *
+                                                BLOCK_SIZE,
+                                xq.data() +
+                                        static_cast<size_t>(s0 + 1) *
+                                                blocksPerRow * BLOCK_SIZE};
+                        const float *xdP[2] = {
+                                xd.data() + static_cast<size_t>(s0) * blocksPerRow,
+                                xd.data() +
+                                        static_cast<size_t>(s0 + 1) *
+                                                blocksPerRow};
+                        const uint8_t *rowBase[4];
+                        for (uint32_t q = 0; q < nRows; ++q)
+                            rowBase[q] = W_q8_0 +
+                                         static_cast<uint64_t>(rowStart + q) *
+                                                 rowStride;
+                        float *dst = out + static_cast<size_t>(s0) * rows +
+                                     rowStart;
+                        float *outPtr2[2] = {dst, dst + rows};
+                        float *outPtr1[1] = {dst};
+                        if (two) {
+                            switch (nRows) {
+                                case 4:
+                                    q8DotTile512<4, 2>(rowBase, xqP, xdP,
+                                                       blocksPerRow, outPtr2);
+                                    break;
+                                case 3:
+                                    q8DotTile512<3, 2>(rowBase, xqP, xdP,
+                                                       blocksPerRow, outPtr2);
+                                    break;
+                                case 2:
+                                    q8DotTile512<2, 2>(rowBase, xqP, xdP,
+                                                       blocksPerRow, outPtr2);
+                                    break;
+                                default:
+                                    q8DotTile512<1, 2>(rowBase, xqP, xdP,
+                                                       blocksPerRow, outPtr2);
+                                    break;
+                            }
+                        } else {
+                            switch (nRows) {
+                                case 4:
+                                    q8DotTile512<4, 1>(rowBase, xqP, xdP,
+                                                       blocksPerRow, outPtr1);
+                                    break;
+                                case 3:
+                                    q8DotTile512<3, 1>(rowBase, xqP, xdP,
+                                                       blocksPerRow, outPtr1);
+                                    break;
+                                case 2:
+                                    q8DotTile512<2, 1>(rowBase, xqP, xdP,
+                                                       blocksPerRow, outPtr1);
+                                    break;
+                                default:
+                                    q8DotTile512<1, 1>(rowBase, xqP, xdP,
+                                                       blocksPerRow, outPtr1);
+                                    break;
+                            }
+                        }
+                    }
+                });
+    }
+
+    // ---- Fused Q8_0 expert groups (AVX-512 counterpart) -------------------
+    // Same one-op-per-layer shape as the AVX2 kernel; the 4x2 tile uses the
+    // 512-bit two-block op inside q8DotTile512.
+    bool matMulVecBatchQ8_0Groups_AVX512(
+            const uint8_t *W_q8_0, uint32_t rowsPerExpert, uint64_t rowBytes,
+            const uint32_t *groupExpert, const uint32_t *groupFirst,
+            const uint32_t *groupCount, uint32_t nGroups,
+            const uint32_t *memberPair, const uint32_t *memberXRow,
+            uint32_t xRows, const float *X, uint32_t cols, float *out) {
+        static constexpr uint32_t BLOCK_SIZE = 32;
+        static constexpr uint32_t TILE_ROWS = 4;
+        const uint32_t blocksPerRow = (cols + BLOCK_SIZE - 1) / BLOCK_SIZE;
+        const uint32_t tilesPerExpert =
+                (rowsPerExpert + TILE_ROWS - 1) / TILE_ROWS;
+        const uint32_t numTasks = nGroups * tilesPerExpert;
+        if (numTasks == 0 || xRows == 0) return true;
+
+        std::vector<float> xd(static_cast<size_t>(xRows) * blocksPerRow);
+        std::vector<int8_t> xq(static_cast<size_t>(xRows) * blocksPerRow *
+                               BLOCK_SIZE);
+        auto groupsPhase1 = [&](uint32_t m) {
+            const float *xs =
+                    X + static_cast<size_t>(memberXRow[m]) * cols;
+            int8_t *xqs = xq.data() +
+                          static_cast<size_t>(m) * blocksPerRow *
+                                  BLOCK_SIZE;
+            for (uint32_t b = 0; b < blocksPerRow; ++b) {
+                float amax = 0.0f, maxv = 0.0f;
+                for (uint32_t j = 0; j < BLOCK_SIZE; ++j) {
+                    float ax = std::fabs(xs[b * BLOCK_SIZE + j]);
+                    if (ax > amax) {
+                        amax = ax;
+                        maxv = xs[b * BLOCK_SIZE + j];
+                    }
+                }
+                const uint32_t idx = m * blocksPerRow + b;
+                if (amax == 0.0f) {
+                    xd[idx] = 0.0f;
+                    std::memset(xqs + b * BLOCK_SIZE, 0, BLOCK_SIZE);
+                    continue;
+                }
+                const float iscale = -127.0f / maxv;
+                for (uint32_t j = 0; j < BLOCK_SIZE; ++j) {
+                    int v = static_cast<int>(
+                            std::lrintf(iscale * xs[b * BLOCK_SIZE + j]));
+                    xqs[b * BLOCK_SIZE + j] =
+                            static_cast<int8_t>(std::min(127, v));
+                }
+                xd[idx] = 1.0f / iscale;
+            }
+        };
+        auto groupsPhase2 = [&](uint32_t task) {
+            const uint32_t g = task / tilesPerExpert;
+            const uint32_t tile = task % tilesPerExpert;
+            const uint32_t rowStart = tile * TILE_ROWS;
+            const uint32_t nRows =
+                    std::min(TILE_ROWS, rowsPerExpert - rowStart);
+            const uint32_t first = groupFirst[g];
+            const uint32_t count = groupCount[g];
+            const uint8_t *base =
+                    W_q8_0 +
+                    (static_cast<uint64_t>(groupExpert[g]) *
+                             rowsPerExpert +
+                     rowStart) *
+                            rowBytes;
+            const uint8_t *rowBase[4];
+            for (uint32_t q = 0; q < nRows; ++q)
+                rowBase[q] = base + static_cast<uint64_t>(q) * rowBytes;
+            for (uint32_t m = 0; m < count; m += 2) {
+                const uint32_t p0 = memberPair[first + m];
+                const uint32_t x0 = first + m;
+                if (m + 1 < count) {
+                    const uint32_t p1 = memberPair[first + m + 1];
+                    const uint32_t x1 = first + m + 1;
+                    const int8_t *xqP[2] = {
+                            xq.data() +
+                                    static_cast<size_t>(x0) *
+                                            blocksPerRow * BLOCK_SIZE,
+                            xq.data() +
+                                    static_cast<size_t>(x1) *
+                                            blocksPerRow * BLOCK_SIZE};
+                    const float *xdP[2] = {
+                            xd.data() +
+                                    static_cast<size_t>(x0) * blocksPerRow,
+                            xd.data() +
+                                    static_cast<size_t>(x1) * blocksPerRow};
+                    float *outP[2] = {
+                            out + static_cast<size_t>(p0) * rowsPerExpert +
+                                    rowStart,
+                            out + static_cast<size_t>(p1) * rowsPerExpert +
+                                    rowStart};
+                    switch (nRows) {
+                        case 4:
+                            q8DotTile512<4, 2>(rowBase, xqP, xdP,
+                                               blocksPerRow, outP);
+                            break;
+                        case 3:
+                            q8DotTile512<3, 2>(rowBase, xqP, xdP,
+                                               blocksPerRow, outP);
+                            break;
+                        case 2:
+                            q8DotTile512<2, 2>(rowBase, xqP, xdP,
+                                               blocksPerRow, outP);
+                            break;
+                        default:
+                            q8DotTile512<1, 2>(rowBase, xqP, xdP,
+                                               blocksPerRow, outP);
+                            break;
+                    }
+                } else {
+                    const int8_t *xqP[1] = {
+                            xq.data() +
+                            static_cast<size_t>(x0) * blocksPerRow *
+                                    BLOCK_SIZE};
+                    const float *xdP[1] = {
+                            xd.data() +
+                            static_cast<size_t>(x0) * blocksPerRow};
+                    float *outP[1] = {
+                            out + static_cast<size_t>(p0) * rowsPerExpert +
+                            rowStart};
+                    switch (nRows) {
+                        case 4:
+                            q8DotTile512<4, 1>(rowBase, xqP, xdP,
+                                               blocksPerRow, outP);
+                            break;
+                        case 3:
+                            q8DotTile512<3, 1>(rowBase, xqP, xdP,
+                                               blocksPerRow, outP);
+                            break;
+                        case 2:
+                            q8DotTile512<2, 1>(rowBase, xqP, xdP,
+                                               blocksPerRow, outP);
+                            break;
+                        default:
+                            q8DotTile512<1, 1>(rowBase, xqP, xdP,
+                                               blocksPerRow, outP);
+                            break;
+                    }
+                }
+            }
+        };
+        if (nGroups > 32) {
+            ThreadPool::current().parallelForSteal2(
+                    0, xRows, 4, groupsPhase1, [] {}, 0, numTasks, 1,
+                    groupsPhase2);
+        } else {
+            ThreadPool::current().parallelForSlab2(
+                    0, xRows, groupsPhase1, [] {}, 0, numTasks, groupsPhase2);
+        }
+        return true;
+    }
+
 }// namespace tinycoder::simd
 #endif// __AVX512F__ && __FMA__

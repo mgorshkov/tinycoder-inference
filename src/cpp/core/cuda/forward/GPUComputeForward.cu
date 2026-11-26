@@ -807,7 +807,10 @@ namespace tinycoder::gpu {
         // Recorded with NO host syncs; all deltas are computed ONCE after the
         // final cudaStreamSynchronize(g_stream) (the true completion point),
         // so this probe adds zero extra syncs to the critical path.
-        std::vector<std::array<cudaEvent_t, 3>> phaseEv;
+        // 4 slots: 0 layer start, 3 end of attention, 1 post-trunk+D2H+shexp,
+        // 2 post-rank.  Slot 3 splits attention from the trunk tail so the
+        // trunk's 42 ms/layer can be attributed.
+        std::vector<std::array<cudaEvent_t, 4>> phaseEv;
         if (phaseProf) {
             // Sizing by nGpu (the loop caps at nGpu && nRealLayers, so the
             // worst case is nGpu entries; MTP layers are never executed).
@@ -994,8 +997,8 @@ namespace tinycoder::gpu {
             if (trunkGemm && seqLen > 1 && nRows >= trunkGemmMin &&
                 (nCols & 511) == 0 &&
                 (m.type == kTypeQ4K || m.type == kTypeQ6K ||
-                 m.type == kTypeIQ2S || m.type == kTypeIQ3_XXS ||
-                 m.type == kTypeIQ2XS)) {
+                 m.type == kTypeQ8_0 || m.type == kTypeIQ2S ||
+                 m.type == kTypeIQ3_XXS || m.type == kTypeIQ2XS)) {
                 if (int8Gemm(static_cast<int>(m.type), m.q, x, y, seqLen,
                              nRows, nCols, m.blocksPerRow,
                              reinterpret_cast<void *>(g_stream))) {
@@ -1429,6 +1432,7 @@ namespace tinycoder::gpu {
                                  h0[7], std::sqrt(hsum));
                 }
             }
+            phaseMark(L, 3);// ev3: end of attention (before the FFN norm)
             kRMSNormRow<<<seqLen, 1024, 1024 * sizeof(float), g_stream>>>(
                     s.hidden, s.norm, w.postAttnNorm, H, seqLen, 1e-6f);
 
@@ -1623,8 +1627,31 @@ namespace tinycoder::gpu {
                 // resident dispatch to decode keeps prefill on the proven
                 // grouped path and delivers the decode speedup (7.58 vs
                 // 7.23 tg tok/s).  The resident arenas stay uploaded either way.
+                // Prefill now dispatches too: scheduleResidentExpertsBatch is
+                // one batched launch per kernel for the whole layer (per-job
+                // activation + token tables), so the resident slice of the
+                // expert bytes leaves the CPU stream instead of being re-done
+                // on the host.  TINYCODER_MOE_RESIDENT_PREFILL=0 keeps the old
+                // decode-only behaviour.
+                // Default OFF: measured 2026-11-27, the resident kernels are
+                // warp GEMVs (~5-10 GFLOPS) and moving even 10% of the expert
+                // bytes onto them costs more than the CPU stream saves
+                // (pp512 126.7 -> 64.4).  Opt in for A/B only; a tiled int8
+                // GEMM on the GPU would be needed to make the split pay.
+                static const bool residentPrefillEnv = [] {
+                    const char *e = std::getenv("TINYCODER_MOE_RESIDENT_PREFILL");
+                    return e != nullptr && e[0] != '\0' && e[0] != '0';
+                }();
+                // Staged mode always dispatches at prefill (that is its point).
+                const bool residentPrefill = residentPrefillEnv || stageActive();
+                // Staged mode is PREFILL-ONLY: the shared arena holds the
+                // experts of the layer most recently staged, so using it at
+                // decode would give every layer the last layer's weights.
+                const bool stagingHere = stageActive() && seqLen > 1;
                 const bool residentOn =
-                        residentEnabled_ && residentActive_ && seqLen == 1 &&
+                        residentEnabled_ && residentActive_ &&
+                        (stageActive() ? stagingHere
+                                       : (seqLen == 1 || residentPrefill)) &&
                         (std::getenv("TINYCODER_MOE_FALLBACK") == nullptr) &&
                         L < kResidentLayers && moeResidentCount_[L] > 0;
                 if (residentOn) {
@@ -1731,6 +1758,22 @@ namespace tinycoder::gpu {
                         routerDone = true;
                     }
                 }
+                // Staged split: enqueue this layer's expert staging BEFORE the
+                // CPU callback so the PCIe copy overlaps the CPU's DRAM stream.
+                if (stageActive() && seqLen > 1) {
+                    // Prefetch the NEXT layer while this one computes; the next
+                    // iteration waits for its own copy (stageWait).
+                    const uint32_t nGpuL = geom_.numGpuLayers
+                                                   ? geom_.numGpuLayers
+                                                   : geom_.numLayers;
+                    // Two-deep: layer 0 primes the pipeline, then each layer
+                    // stages exactly the ONE layer one step ahead (a deeper
+                    // pipeline that re-staged L+1 and L+2 on every layer
+                    // collided on buffer indices and was 7x slower).
+                    if (L == 0) stageResidentExperts(0);
+                    if (L + 1 < nGpuL) stageResidentExperts(L + 1);
+                    stageWait(L);
+                }
                 if (routerDone) {
                     // routing tables already in the host mirrors
                 } else if (moeTr) {
@@ -1804,6 +1847,9 @@ namespace tinycoder::gpu {
                     } else {
                         scheduleResidentExpertsBatch(L, moeDownTable_, seqLen);
                     }
+                    // The arena's kernels are enqueued: mark the buffer free
+                    // for the copy that will refill it two layers from now.
+                    if (stageActive()) stageRelease(L);
                     // 5d) Accumulate in exact rank order over the COMBINED
                     // table: out[s] += wgt[s][r] * down[r][s] via the strict
                     // mul-then-add kernel (per-rank, rank-ascending — the CPU
@@ -2288,8 +2334,7 @@ namespace tinycoder::gpu {
                                 }
                                 cudaError_t eP = cudaHostRegister(
                                         pp, static_cast<size_t>(slotBytesB),
-                                        cudaHostRegisterMapped |
-                                                cudaHostRegisterPortable);
+                                        cudaHostRegisterPortable);
                                 if (eP != cudaSuccess) {
                                     std::free(pp);
                                     errMsg = std::string(
@@ -2468,7 +2513,7 @@ namespace tinycoder::gpu {
                                 dim3((combinedRows + 7) / 8, eu), dim3(32, 8), 0,
                                 g_stream>>>(wqTable, q8kN_, s.moeGateUpP,
                                             s.moeGateUp2P, expertFF, gBlocks,
-                                            layGateRowBytes(L), combinedRows);
+                                            layGateRowBytes(L), combinedRows, nullptr);
                         kSiluMulBatch<<<dim3((expertFF + 255) / 256, eu), 256, 0,
                                         g_stream>>>(s.moeGateUpP, s.moeGateUp2P,
                                                     expertFF, eu);
@@ -2920,18 +2965,21 @@ namespace tinycoder::gpu {
                 } else {
                     // ---- Option B (no expert cache): the callback ran the
                     // full routed experts into moeFfnOutHost_; H2D the output.
-                    // Reached when the expert cache was NOT built (disabled via
-                    // TINYCODER_MOE_CACHE=0, build OOM'd, or
-                    // TINYCODER_MOE_FALLBACK=1).  Cache-mode is the qwen35moe
-                    // DEFAULT (2026-09-17).
-                    if (!moeFallbackWarned) {
+                    // Reached when the expert cache was NOT built: the hybrid
+                    // DEFAULT since 2026-11-26 (native-quant CPU experts, like
+                    // llama.cpp -ncmoe), or TINYCODER_MOE_CACHE=0, an unsupported
+                    // Q8_0 slot, an OOM, or TINYCODER_MOE_FALLBACK=1.
+                    // The line is printed once per process, not per forward.
+                    static bool moeFallbackPrinted = false;
+                    if (!moeFallbackPrinted) {
                         std::fprintf(stderr,
                                      "[gpu] L=%u: CPU-expert hybrid (GPU "
                                      "trunk + CPU experts; expert cache off — "
-                                     "TINYCODER_MOE_CACHE=0 or fallback)\n",
+                                     "TINYCODER_MOE_CACHE=1 enables it)\n",
                                      L);
-                        moeFallbackWarned = true;
+                        moeFallbackPrinted = true;
                     }
+                    moeFallbackWarned = true;
                     // on g_stream and sync so kAddScaled sees the copy.
                     cudaMemcpyAsync(s.moeExpertOut, moeFfnOutHost_[buf].data(),
                                     normBytes, cudaMemcpyHostToDevice, g_stream);
@@ -3288,13 +3336,17 @@ namespace tinycoder::gpu {
         //                    (router + fills + sync waits + enqueue) -- the
         //                    CPU/GPU overlap lever.
         if (phaseProf && !phaseEv.empty()) {
-            double devTrunk = 0.0, devRank = 0.0;
+            double devTrunk = 0.0, devRank = 0.0, devAttn = 0.0, devTail = 0.0;
             for (size_t li = 0; li < phaseEv.size(); ++li) {
-                float t0 = 0.0f, t1 = 0.0f;
+                float t0 = 0.0f, t1 = 0.0f, ta = 0.0f, tt = 0.0f;
                 cudaEventElapsedTime(&t0, phaseEv[li][0], phaseEv[li][1]);
                 cudaEventElapsedTime(&t1, phaseEv[li][1], phaseEv[li][2]);
+                cudaEventElapsedTime(&ta, phaseEv[li][0], phaseEv[li][3]);
+                cudaEventElapsedTime(&tt, phaseEv[li][3], phaseEv[li][1]);
                 devTrunk += t0;
                 devRank += t1;
+                devAttn += ta;
+                devTail += tt;
             }
             float devMs2 = 0.0f;
             if (moeEvStart_ && moeEvEnd_) {
@@ -3309,7 +3361,8 @@ namespace tinycoder::gpu {
                          "[phase] wall=%.1f dev=%.1f hostBubble=%.1f "
                          "devTrunk=%.1f(%u L) devRank=%.1f(%u L) devOther=%.1f "
                          "perLayerTrunk=%.2f perLayerRank=%.2f "
-                         "perLayerBubble=%.2f\n",
+                         "perLayerBubble=%.2f\n"
+                         "[phase] devAttn=%.1f(%.2f/L) devTrunkTail=%.1f(%.2f/L)\n",
                          wallMs, static_cast<double>(devMs2),
                          wallMs - static_cast<double>(devMs2), devTrunk,
                          static_cast<unsigned>(phaseEv.size()), devRank,
@@ -3317,7 +3370,11 @@ namespace tinycoder::gpu {
                          devTrunk / static_cast<double>(phaseEv.size()),
                          devRank / static_cast<double>(phaseEv.size()),
                          (wallMs - static_cast<double>(devMs2)) /
-                                 static_cast<double>(phaseEv.size()));
+                                 static_cast<double>(phaseEv.size()),
+                         devAttn,
+                         devAttn / static_cast<double>(phaseEv.size()),
+                         devTail,
+                         devTail / static_cast<double>(phaseEv.size()));
             // LM-head device span: devOther / (the final sync is not on the
             // timeline) approximates the finalNorm + LM-head GEMV + D2H.
         }
@@ -5468,6 +5525,23 @@ namespace tinycoder::gpu {
         }
         if (residentRankWq_) {
             cudaFree(residentRankWq_);
+            if (residentJobXq_) cudaFree(residentJobXq_);
+            if (residentJobTok_) cudaFree(residentJobTok_);
+            if (residentJobGuP_) cudaFree(residentJobGuP_);
+            if (residentJobGu2P_) cudaFree(residentJobGu2P_);
+            if (residentJobDownP_) cudaFree(residentJobDownP_);
+            if (q8kAll_) cudaFree(q8kAll_);
+            for (uint32_t b = 0; b < kStageBufs; ++b) {
+                if (stageArena_[b]) cudaFree(stageArena_[b]);
+            }
+            if (stageCopyStream_) cudaStreamDestroy(stageCopyStream_);
+            if (stagePinned_) cudaFreeHost(stagePinned_);
+            if (residentGatherX_) cudaFree(residentGatherX_);
+            if (residentGuA_) cudaFree(residentGuA_);
+            if (residentGuB_) cudaFree(residentGuB_);
+            if (residentDownRow_) cudaFree(residentDownRow_);
+            if (residentTokDev_) cudaFree(residentTokDev_);
+            if (residentRankDev_) cudaFree(residentRankDev_);
             residentRankWq_ = nullptr;
         }
         residentRankWqBytes_ = 0;

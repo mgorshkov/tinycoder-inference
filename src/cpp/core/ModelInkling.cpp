@@ -234,7 +234,7 @@ namespace tinycoder {
         const uint32_t core = config_.loopEnd - config_.loopStart;
         const uint32_t blockSize = config_.attnResBlockSize;
         const uint32_t vocab = config_.vocabSizeUnpadded ? config_.vocabSizeUnpadded
-                                                          : config_.vocabSize;
+                                                         : config_.vocabSize;
         const float qkScale = 1.0f / std::sqrt(float(headDim));
         const uint32_t group = nHeads / nKvHeads;
         const uint32_t seqLen = static_cast<uint32_t>(tokens.size());
@@ -250,8 +250,8 @@ namespace tinycoder {
         if (inklingConvState_.size() != slots) {
             inklingConvState_.assign(
                     slots, std::vector<float>(
-                                    static_cast<size_t>(histLen) * sconvChannels,
-                                    0.0f));
+                                   static_cast<size_t>(histLen) * sconvChannels,
+                                   0.0f));
         }
 
         // Per-call scratch (reused across tokens).
@@ -359,7 +359,10 @@ namespace tinycoder {
                     std::snprintf(path, sizeof(path), "%s/emb-%u.f32", dd,
                                   static_cast<unsigned>(token));
                     FILE *f = std::fopen(path, "wb");
-                    if (f) { std::fwrite(x.data(), sizeof(float), hidden, f); std::fclose(f); }
+                    if (f) {
+                        std::fwrite(x.data(), sizeof(float), hidden, f);
+                        std::fclose(f);
+                    }
                 }
             }
 
@@ -385,7 +388,10 @@ namespace tinycoder {
                     char path[1024];
                     std::snprintf(path, sizeof(path), "%s/%s-%u.f32", dd, tag, slot);
                     FILE *f = std::fopen(path, "wb");
-                    if (f) { std::fwrite(p, sizeof(float), n, f); std::fclose(f); }
+                    if (f) {
+                        std::fwrite(p, sizeof(float), n, f);
+                        std::fclose(f);
+                    }
                 }
             };
 
@@ -642,8 +648,8 @@ namespace tinycoder {
                 for (uint32_t e = 0; e < nExperts; ++e) {
                     probs[e] = sigmoidf_(router[e]);
                     const float bias = e < ink.expertProbsBias.size()
-                                                ? ink.expertProbsBias.data()[e]
-                                                : 0.0f;
+                                               ? ink.expertProbsBias.data()[e]
+                                               : 0.0f;
                     selection[e] = probs[e] + bias;
                     scored[e] = {selection[e], e};
                 }
@@ -724,7 +730,10 @@ namespace tinycoder {
                     char path[1024];
                     std::snprintf(path, sizeof(path), "%s/l_out-%u.f32", dd, slot);
                     FILE *f = std::fopen(path, "wb");
-                    if (f) { std::fwrite(x.data(), sizeof(float), hidden, f); std::fclose(f); }
+                    if (f) {
+                        std::fwrite(x.data(), sizeof(float), hidden, f);
+                        std::fclose(f);
+                    }
                 }
             };
 

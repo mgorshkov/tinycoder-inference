@@ -264,6 +264,12 @@ namespace tinycoder::simd {
     void matMulVecBatchQ8_0_Q8K_AVX2(const uint8_t *W_q8_0, const float *X,
                                      uint32_t seqLen, uint32_t rows,
                                      uint32_t cols, float *out);
+    bool matMulVecBatchQ8_0Groups_AVX2(
+            const uint8_t *W_q8_0, uint32_t rowsPerExpert, uint64_t rowBytes,
+            const uint32_t *groupExpert, const uint32_t *groupFirst,
+            const uint32_t *groupCount, uint32_t nGroups,
+            const uint32_t *memberPair, const uint32_t *memberXRow,
+            uint32_t xRows, const float *X, uint32_t cols, float *out);
 
     // Register-tiled batch GEMM for a single COMPACT (raw GGUF) Q2_K weight
     // matrix over a batch of tokens. Used for the separate LM head after the
@@ -332,6 +338,22 @@ namespace tinycoder::simd {
     float dotProductQ2_K_PrePacked_Q8_AVX512(const uint8_t *prepackedBlock,
                                              const Q8KBlock *q8);
     float dotProductQ8K_Q8K_AVX512(const Q8KBlock *x, const Q8KBlock *w);
+
+    // Register-tiled Q8_0 batch GEMM (AVX-512 counterpart of
+    // matMulVecBatchQ8_0_Q8K_AVX2): same Q8_0 block math, same per-block
+    // accumulation order, so it is bit-exact with the AVX2 kernel.  Two
+    // consecutive 32-weight blocks share one 64-byte load and one set of
+    // byte/sign/maddubs ops; each block's 8 int32 lanes still get their own
+    // d*d8 float multiply and hsum in block order.
+    void matMulVecBatchQ8_0_Q8K_AVX512(const uint8_t *W_q8_0, const float *X,
+                                       uint32_t seqLen, uint32_t rows,
+                                       uint32_t cols, float *out);
+    bool matMulVecBatchQ8_0Groups_AVX512(
+            const uint8_t *W_q8_0, uint32_t rowsPerExpert, uint64_t rowBytes,
+            const uint32_t *groupExpert, const uint32_t *groupFirst,
+            const uint32_t *groupCount, uint32_t nGroups,
+            const uint32_t *memberPair, const uint32_t *memberXRow,
+            uint32_t xRows, const float *X, uint32_t cols, float *out);
 
 #endif// __AVX512F__ && __FMA__
 

@@ -1049,23 +1049,50 @@ namespace tinycoder {
                         // TINYCODER_MOE_FALLBACK=1 forces the CPU expert path
                         // even with the cache built.
                         //
-                        // DEFAULT: ON (2026-11-04, second measurement).  The
-                        // 2026-09 default was on, then the 2026-11 CPU-expert
-                        // pass measured the LRU cache at 7.3 tok/s vs 14.0 and
-                        // made it opt-in -- but that was with the in-tree
-                        // quantized GEMV.  With the the int8 tensor-core GEMV port the
-                        // cached experts' GPU GEMVs run at ~500 GB/s again:
-                        // Ornith-1.5-35B-Q4_K_M pp512/tg128 = **37.3 tok/s**
-                        // decode / 40.9 pp128 (vs 15.3 CPU experts), i.e. above
-                        // the int8 tensor-core 30.4.  TINYCODER_MOE_CACHE=0 restores the
-                        // grouped-batch CPU-expert path (Option B).
+                        // DEFAULT (2026-11-26): the device cache for K-quant /
+                        // I-quant experts, CPU experts for native Q8_0 blobs.
+                        //   * Q8_0 experts are exactly the checkpoint llama.cpp
+                        //     runs with `-ncmoe 99`: the FFNs belong on the CPU
+                        //     in RAM in the checkpoint's own 8-bit weights.  The
+                        //     old Q8_0 -> Q4_K requantiser (which made the
+                        //     published row 4-bit against llama.cpp's 8-bit) is
+                        //     removed, and the device cache cannot take a
+                        //     3.34 MB Q8_0 slot (every staged fill faults inside
+                        //     cuMemcpyHtoDAsync; buildExpertCache refuses it).
+                        //   * K-quant / I-quant experts are already native and
+                        //     the same quant on both sides; the LRU cache is
+                        //     faster there (Q4_K_M 35B short decode 46.4 vs
+                        //     24.5 tok/s) and stays the default.  Q8_0 slots are
+                        //     skipped by type, not because CPU is the only mode
+                        //     ever wanted.
+                        // TINYCODER_MOE_CACHE=0 forces CPU experts for every
+                        // type; =1 requests the cache (still refused for Q8_0).
+                        //
+                        // Full offload (the whole model, experts included, fit
+                        // the card) is a different mode and still uploads every
+                        // expert matrix to the device.
                         const char *moeCacheEnv =
                                 std::getenv("TINYCODER_MOE_CACHE");
+                        const bool q8Experts =
+                                !m.layers_.empty() &&
+                                m.layers_[0].ffnGateExps.type == GGML_TYPE_Q8_0;
                         const bool moeCache =
-                                moeCacheEnv == nullptr || moeCacheEnv[0] == '\0' ||
-                                moeCacheEnv[0] != '0';
+                                !q8Experts &&
+                                (moeCacheEnv == nullptr ||
+                                 moeCacheEnv[0] == '\0' ||
+                                 moeCacheEnv[0] != '0');
+                        if (q8Experts && (moeCacheEnv == nullptr ||
+                                          moeCacheEnv[0] == '\0')) {
+                            std::fprintf(stderr,
+                                         "[gpu] qwen35moe hybrid: native Q8_0 "
+                                         "experts run on the CPU (llama.cpp "
+                                         "-ncmoe placement; the device cache "
+                                         "does not support 3.34 MB slots)\n");
+                        }
+                        bool cacheOk = false;
                         if (moeCache) {
-                            if (!gpu_.buildExpertCache(err)) {
+                            cacheOk = gpu_.buildExpertCache(err);
+                            if (!cacheOk) {
                                 std::fprintf(stderr,
                                              "[gpu] qwen35moe expert cache "
                                              "build failed: %s\n",
@@ -1076,8 +1103,8 @@ namespace tinycoder {
                         std::fprintf(stderr,
                                      "[gpu] qwen35moe hybrid upload OK (GPU "
                                      "trunk + CPU experts%s)\n",
-                                     moeCache ? ", experts cached on GPU (default)"
-                                              : "");
+                                     cacheOk ? ", experts cached on GPU"
+                                             : "");
                         // ---- Option D (static resident-expert offload) ----
                         // TINYCODER_MOE_RESIDENT=1: after the hybrid upload
                         // succeeded, run the profiling pass + build the static
@@ -1142,12 +1169,94 @@ namespace tinycoder {
         // is armed), so it uses the pure-CPU forward path.
         void buildResidentExpertPolicy(Model &m, std::string &err) {
             if (m.config_.architecture != ARCH_QWEN35MOE) return;
-            // Only when explicitly requested (Option D opt-in).
-            const char *opt = std::getenv("TINYCODER_MOE_RESIDENT");
-            if (opt == nullptr || opt[0] == '\0' || opt[0] == '0') return;
             const uint32_t numLayers = m.config_.numLayers;
             const uint32_t expertCount = m.config_.expertCount;
             if (numLayers == 0 || expertCount == 0) return;
+            // ---- Staged resident split (route 2, TINYCODER_MOE_STAGE=f) ----
+            // Stage the first f*expertCount experts of every layer into ONE
+            // shared VRAM arena (contiguous H2D per layer) and let the CPU
+            // compute the rest from DRAM at the same time.  Balanced at
+            // f ~ 0.48: 16.4 GB over PCIe at 8.8 GB/s against 17.8 GB from
+            // DRAM at 9.5 GB/s, ~1.9 s prefill.
+            {
+                const char *st = std::getenv("TINYCODER_MOE_STAGE");
+                // NOTE: compare the PARSED value, not st[0] — "0.5" starts
+                // with '0' and a first-character test silently disabled every
+                // fractional fraction (measured: all f fell through to the
+                // resident profiling path).
+                // DEFAULT ON at the measured optimum (0.68): +12% prefill over
+                // the pure CPU path (126 -> 141 pp512) with decode unchanged.
+                // TINYCODER_MOE_STAGE=0 turns it off; any other value sets the
+                // fraction.  A host-RAM guard below declines it when the pinned
+                // mirror would not fit comfortably.
+                // ON by default at the measured optimum: 126.3 -> 141.2
+                // pp512 with decode unchanged, text gate PASS and moe_parity
+                // 13/13.  TINYCODER_MOE_STAGE=0 disables, any other value
+                // sets the fraction; the host-RAM guard below can decline it.
+                double stageFrac = 0.68;
+                if (st != nullptr) {
+                    const double parsed = std::atof(st);
+                    stageFrac = (parsed > 0.0) ? parsed : 0.0;
+                }
+                if (stageFrac > 0.0) {
+                    double f = stageFrac;
+                    if (!(f > 0.0 && f <= 1.0)) f = 0.68;
+                    const uint32_t S = std::max<uint32_t>(
+                            1u, static_cast<uint32_t>(std::llround(f * expertCount)));
+                    // Host-RAM guard: the pinned mirror is
+                    // nGpu x S x (2*gateSlice + downSlice) bytes.  Decline the
+                    // mode (instead of thrashing) when available RAM is not at
+                    // least 1.5x that plus 8 GB.
+                    {
+                        const long pages = sysconf(_SC_AVPHYS_PAGES);
+                        const long psize = sysconf(_SC_PAGESIZE);
+                        const double availGb = (pages > 0 && psize > 0)
+                                                       ? static_cast<double>(pages) * psize / 1e9
+                                                       : 0.0;
+                        const double needGb =
+                                (static_cast<double>(numLayers) * S * 3.4e6) / 1e9;
+                        if (availGb > 0.0 && availGb < needGb * 1.5 + 8.0) {
+                            std::fprintf(stderr,
+                                         "[stage] declined: needs ~%.0f GB pinned, "
+                                         "%.0f GB available\n",
+                                         needGb, availGb);
+                            m.moeUsageCounts_.clear();
+                            return;
+                        }
+                    }
+                    std::string berr;
+                    if (!gpu_.buildStagedArena(S, berr)) {
+                        std::fprintf(stderr, "[stage] %s\n", berr.c_str());
+                        m.moeUsageCounts_.clear();
+                        return;
+                    }
+                    gpu_.residentEnabled_ = true;
+                    const uint32_t maskWords = (expertCount + 63u) / 64u;
+                    // The mask vector is only sized later in the profiling
+                    // path; sizing it here is required (the unsized version
+                    // wrote out of bounds and crashed).
+                    m.moeResidentMask_.assign(
+                            numLayers, std::vector<uint64_t>(maskWords, 0));
+                    for (uint32_t L = 0; L < numLayers; ++L) {
+                        m.moeResidentMask_[L].assign(maskWords, 0);
+                        for (uint32_t e = 0; e < S && e < expertCount; ++e) {
+                            m.moeResidentMask_[L][e / 64u] |=
+                                    (uint64_t(1) << (e % 64u));
+                        }
+                    }
+                    std::fprintf(stderr,
+                                 "[stage] %u/%u experts per layer staged "
+                                 "(f=%.2f, %.0f MB arena); CPU streams the rest\n",
+                                 S, expertCount, f,
+                                 static_cast<double>(S) * 3342336.0 / (1024.0 * 1024.0));
+                    m.moeUsageCounts_.clear();
+                    return;
+                }
+            }
+            // The resident-arena (Option D) path stays strictly opt-in; the
+            // staged split above is independent of it and is on by default.
+            const char *opt = std::getenv("TINYCODER_MOE_RESIDENT");
+            if (opt == nullptr || opt[0] == '\0' || opt[0] == '0') return;
             // ---- Type gate (2026-09-17): Option D is Q8_0-expert-only.
             // The Q4_K/Q6_K resident kernels are bit-exact (verified by
             // GPUCpuCompareTest.Q4K_Q6KKernelParityWithCPU), but measured on

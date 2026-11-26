@@ -128,6 +128,13 @@ namespace tinycoder::gpu {
 
 
     namespace {
+        // DEPENDENCY ORDER, NOT ALPHABETICAL.  These are text fragments included into
+        // one anonymous namespace: each relies on declarations the earlier ones
+        // contribute (GpuCommon defines the shared helpers/macros the rest use,
+        // GpuGemvIQInt8 defines kDequantF16 that GpuGemmDispatch launches).  Sorting
+        // this list alphabetically breaks the build, so the block is fenced from
+        // clang-format, which otherwise re-sorts includes.
+        // clang-format off
 #include "gpu/GpuCommon.hpp"
 #include "gpu/GpuElementwiseKernels.hpp"
 #include "gpu/GpuAttentionKernels.hpp"
@@ -142,6 +149,7 @@ namespace tinycoder::gpu {
 #include "gpu/GpuGemvIQInt8.hpp"
 #include "gpu/GpuGemmDispatch.hpp"
 #include "gpu/GpuQwen35Kernels.hpp"
+        // clang-format on
     }// namespace
 
 

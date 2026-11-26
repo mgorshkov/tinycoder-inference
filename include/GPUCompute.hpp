@@ -28,7 +28,6 @@ SOFTWARE.
 #include <functional>
 
 #include "IModelLoader.hpp"
-#include "Q4KRequant.hpp"
 #include <string>
 #include <vector>
 
@@ -485,7 +484,7 @@ namespace tinycoder::gpu {
         static constexpr uint32_t kResidentLayers = 128;
         // Max resident experts per layer (upper bound for the static policy;
         // the runtime budget is set by the adapter from free VRAM).
-        static constexpr uint32_t kResidentMaxExperts = 64;
+        static constexpr uint32_t kResidentMaxExperts = 256;
         // Per-layer resident policy: [layer] = vector of expert ids, sorted by
         // usage descending (the first residentMaxPerLayer_ are resident).
         std::vector<std::vector<uint32_t>> moeResidentIds_;
@@ -507,6 +506,11 @@ namespace tinycoder::gpu {
         // policy + recorded hybrid geometry, then H2D the resident experts'
         // packed gate/up/down slices ONCE (public: the adapter calls this from
         // buildResidentExpertPolicy after setResidentPolicy).
+        bool buildStagedArena(uint32_t expertsPerLayer, std::string &errMsg);
+        void stageResidentExperts(uint32_t L);
+        void stageWait(uint32_t L);
+        void stageRelease(uint32_t L);
+        bool stageActive() const { return stageExperts_ != 0; }
         bool buildResidentArenas(std::string &errMsg);
         // The adapter's callback reads the host norm/weight mirrors.
         std::vector<float> moeWgtHost_;
@@ -786,11 +790,6 @@ namespace tinycoder::gpu {
         uint32_t expertHM_ = 0;// hidden size
         // Host pointers of the FULL packed expert matrices (hybrid mode keeps
         // them off-device; the cache H2Ds slices from these).
-        // Host-resident Q4_K copies of requantised Q8_0 expert blobs (see
-        // TINYCODER_MOE_Q8_Q4K).  One entry per (layer, gate/up/down); the
-        // per-layer ExpertSlot points into these and the arena pins them.
-        std::vector<q4k::AlignedBlob> expertRequant_;
-        uint32_t expertRequantLayers_ = 0;
         const uint8_t *expertHostGate_ = nullptr;
         const uint8_t *expertHostUp_ = nullptr;
         const uint8_t *expertHostDown_ = nullptr;
@@ -840,6 +839,66 @@ namespace tinycoder::gpu {
         // overwrite the CPU-filled slots of the combined down table.
         int32_t *residentRankOf_ = nullptr;
         uint64_t residentRankOfBytes_ = 0;
+        // Batched PREFILL resident dispatch (2026-11-27): one launch per kernel
+        // for the whole layer.  Jobs are (token, rank) pairs of resident
+        // experts, so each job needs its own quantised activation row
+        // (residentJobXq_), its own target token in the rank-major combined
+        // table (residentJobTok_), and per-job gate/up/down scratch.
+        void **residentJobXq_ = nullptr;
+        uint64_t residentJobXqBytes_ = 0;
+        uint32_t *residentJobTok_ = nullptr;
+        uint64_t residentJobTokBytes_ = 0;
+        float *residentJobGuP_ = nullptr;
+        uint64_t residentJobGuPBytes_ = 0;
+        float *residentJobGu2P_ = nullptr;
+        uint64_t residentJobGu2PBytes_ = 0;
+        uint8_t *residentJobDownP_ = nullptr;
+        uint64_t residentJobDownPBytes_ = 0;
+        uint8_t *q8kAll_ = nullptr;// [kTokBlock][gBlocks][stride]
+        uint64_t q8kAllBytes_ = 0;
+        // Tiled-GEMM resident prefill scratch: gathered token rows + the gate,
+        // up and down results for ONE expert's token group, and the device
+        // token/rank index arrays used by the gather and scatter kernels.
+        float *residentGatherX_ = nullptr;
+        uint64_t residentGatherXBytes_ = 0;
+        float *residentGuA_ = nullptr;
+        uint64_t residentGuABytes_ = 0;
+        float *residentGuB_ = nullptr;
+        uint64_t residentGuBBytes_ = 0;
+        float *residentDownRow_ = nullptr;
+        uint64_t residentDownRowBytes_ = 0;
+        int32_t *residentTokDev_ = nullptr;
+        uint64_t residentTokDevBytes_ = 0;
+        int32_t *residentRankDev_ = nullptr;
+        uint64_t residentRankDevBytes_ = 0;
+        // ---- Staged resident split (route 2) ------------------------------
+        // ONE arena reused by every layer (matrix-major: [gates][ups][downs])
+        // instead of per-layer arenas, filled per layer by contiguous H2D
+        // copies of the first stageExperts_ experts.  The CPU computes the
+        // rest from DRAM at the same time, so the two streams run
+        // concurrently, which is the whole point.
+        // Double-buffered: layer L computes from arena[L%2] while layer L+1 is
+        // copied into arena[(L+1)%2] on stageCopyStream_, so the PCIe transfer
+        // overlaps GPU compute instead of following it.
+        // Three buffers, not two: the per-layer copy (58 ms at f=0.68) is
+        // longer than one layer's CPU+compute (65 ms), so a 2-deep pipeline
+        // exposes ~25 ms of copy per layer.  Three stages let the copy for
+        // L+2 be in flight while L computes.
+        static constexpr uint32_t kStageBufs = 2;
+        uint8_t *stageArena_[kStageBufs] = {nullptr, nullptr};
+        uint64_t stageArenaBytes_ = 0;
+        cudaStream_t stageCopyStream_ = nullptr;
+        cudaEvent_t stageCopyDone_[kStageBufs] = {nullptr, nullptr};
+        cudaEvent_t stageCompDone_[kStageBufs] = {nullptr, nullptr};
+        uint32_t stageExperts_ = 0;
+        // Pinned host mirror of every layer's staged slice, filled once at
+        // load.  A cudaMemcpyAsync from PAGEABLE memory is not asynchronous
+        // (the driver bounces it through a staging buffer and the call
+        // serialises: measured 6.98 s for a 17 GB prefill copy against the
+        // CPU's 1.8 s, i.e. no overlap).  From pinned memory the copy really
+        // does overlap the CPU callback.
+        uint8_t *stagePinned_ = nullptr;
+        uint64_t stagePinnedBytes_ = 0;
         // Device mirror of the per-rank weights for resident ranks only
         // (write the full router table; the kernel indexes resident ranks).
         float *residentWgt_ = nullptr;
